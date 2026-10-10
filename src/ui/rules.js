@@ -66,8 +66,15 @@ export function humanDuration(ms) {
  * 早就干完、结论一直没被消费的小助手会**把自己的报警器一直按住**（实测：终检小助手干了
  * 7 分 13 秒就结束，之后 3 小时 34 分钟零事件零新文件，界面一声不吭；它自己在名单里明明
  * 写着「可继续 · 当前未运行」）。所以这一路读的是 `subagentActiveSince`——**自称在跑的那
- * 些小助手里，最老的一次动静是什么时候**（宿主侧字段走 `indexRunningSubagentActivity`，
- * 与 `indexSubagentDescendants` 同口径聚合）。它自称在跑、却已经到门槛，就算不再算"在推进"。
+ * 些小助手里，最新的一次动静是什么时候**（宿主侧字段走 `indexRunningSubagentActivity`，
+ * 与 `indexSubagentDescendants` 同口径聚合）。**任一路在门槛内动过就算在推进**，全都到门槛
+ * 才算"没有人在写"。
+ *
+ * ⚠️ 这一路的聚合口径 2026-10-06 由**取 min**改成**取 max**（票 `walkthrough-2026-10/01`，
+ * 依据是宿主会话日志实测）：取 min 时「一群小助手里最老的那个还没动静」被当成全都没动静，
+ * 于是有一路 **3 秒前刚写过**、屏上仍喊「7 分钟没动静」（那一屏同时还写着「4 个小助手在跑」）。
+ * 这一格要问的是**"还有没有人在写"**，不是"最老的那个歇了多久"——前者才是它服务的判断。
+ * ⚠️ 改这条口径**不动**取不到时的方向（见下面那条）：拿不到证据仍然照旧算"在推进"。
  *
  * 取数方向上两路刻意**相反**，别改错：
  *   · 小助手数取不到 → 按 0 算，**宁可报警**（旧实现拉取失败保留旧值，一旦它参与抑制就是
@@ -87,9 +94,11 @@ export function deriveStallJudgment(input) {
 	const idleMs = at === null ? 0 : Math.max(0, clock - at);
 	const subagentsRunning =
 		Number.isSafeInteger(subagentRunningCount) && subagentRunningCount > 0;
-	// 自称在跑的小助手里最老的那次动静（取不到 = 不知道，维持原判据）。
+	// 自称在跑的小助手里最新的一次动静（取不到 = 不知道，维持原判据）。
 	const activeSince =
 		Number.isFinite(subagentActiveSince) && subagentActiveSince > 0 ? subagentActiveSince : null;
+	// 口径：**任一路在门槛内动过**就算在推进（聚合层取的是最新那次动静的口径，见
+	// `indexRunningSubagentActivity`）——不是"最老的那一路还没歇够"。
 	const progressing =
 		subagentsRunning &&
 		(activeSince === null || clock - activeSince < STALL_THRESHOLD_MS);
@@ -173,8 +182,15 @@ export function indexSubagentDescendants(summaries) {
  * 原来的三路——**宁可维持现状，也不用一个猜出来的时刻去翻案**（见 `deriveStallJudgment`
  * 里两路取数方向为什么相反）。
  *
+ * ⚠️ **同一个祖先名下取的是最新的一次动静（取 max），不是最老的**——2026-10-06 改，
+ * 票 `walkthrough-2026-10/01`。取 min 时「最老的那个还没动静 ＝ 全都没动静」，
+ * 而走查那一屏的事实是：四个执笔小助手，分别 7.0 分／6.4 分／1.5 分／**3 秒**前写过自己的
+ * 日志，屏上却喊「7 分钟没动静了」（同一屏还写着「4 个小助手在跑」）。
+ * **这一格要回答的是"还有没有人在写"**，所以任一路在门槛内动过就够；取 min 是把这个问句
+ * 换成了"最老的那一路歇了多久"，于是最忙的时候最容易误报。
+ *
  * @param {Record<string, { id?: string, parentId?: string, origin?: string, running?: boolean, updatedAt?: number }>} summaries
- * @returns {Map<string, number>} 祖先 id → 它名下「自称在跑」的后代里**最老**的那次动静时刻
+ * @returns {Map<string, number>} 祖先 id → 它名下「自称在跑」的后代里**最新**的那次动静时刻
  */
 export function indexRunningSubagentActivity(summaries) {
 	const indexed = new Map();
@@ -191,8 +207,10 @@ export function indexRunningSubagentActivity(summaries) {
 		) {
 			seen.add(current.id);
 			const known = indexed.get(current.parentId);
-			// 取 min：一群小助手里**最老**的那个才是这件事的上限（最老的还没动静 = 全都没动静）。
-			if (known === undefined || since < known) indexed.set(current.parentId, since);
+			// 取 max：**只要还有一路在写，这一屏就没停**（票 walkthrough-2026-10/01）。
+			// 取 min 时最老的那一路会替全屏发言——「有人歇了 7 分钟」被说成「都没动静」，
+			// 而同一刻别人正在猛写。这一格问的是"还有没有人在写"。
+			if (known === undefined || since > known) indexed.set(current.parentId, since);
 			current = summaries[current.parentId];
 		}
 	}
@@ -277,14 +295,19 @@ export function chapterBadge(
 			: auditStale
 				? { icon: "⚠️", text: "轮到你 · 还没审过", tone: "#bf8700" }
 				: { icon: "🛡️", text: "已完成 · 审过", tone: "#1a7f37" };
-	// 票 22：新鲜度先于任何「说它完了」的来源（交工事件 / AI 自报 done / 有检查记录这一事实）。
-	// 后三者说的是**过去某一刻**发生过什么，这一条说的是**此刻这份正文**有没有被审过。
-	if (auditStale && (doneSet.has(row.n) || pipelineStage === "done" || row.audited === true)) {
+	// 票 22：新鲜度先于任何「说它完了」的来源（交工事件 / 有检查记录这一事实）。
+	// 后两者说的是**过去某一刻**发生过什么，这一条说的是**此刻这份正文**有没有被审过。
+	if (auditStale && (doneSet.has(row.n) || row.audited === true)) {
 		return settled();
 	}
 	if (doneSet.has(row.n)) return settled();
-	// AI 自报 `done` 是「我刚才到哪了」，与账本上的交工事件同属「说它完了」那一族，先于认领。
-	if (pipelineStage === "done") return settled();
+	// ⚠️ 票 `premature-announce/04`（2026-10-10 裁决）：**「已完成 · 审过」只认机器事实**——就是上面
+	// 那一支（账本里机器记下的章级交工；过目闸门与「已完成 X/Y 章」用的是同一份判据）。此前 **AI 自报**
+	// `chapterPipeline.stage === 'done'` 也能单独说出这句话，而服务端只校验那个枚举、**不验产物**
+	// ⇒「自报 done 而这一章其实还没交工」时，徽章替机器说了一句它没说过的话（「早宣告」在宣告面上的第三处）。
+	// ⇒ 自报 `done` 现在**只**撑得起「轮到你」那一支（有未处置意见／正文还没被审过）；
+	// 其余情况落回认领那一支：有人认领说「我正在做」，没人认领整颗不出声。⛔ 自报不是结论。
+	if (pipelineStage === "done" && (hasReview || auditStale)) return settled();
 	// 票 20：**只有被认领的章才说「我正在做」**。工序取自 AI 自报的流水线阶段；
 	// 说不出是哪一道工序（没上报 / 不认识的态）就只说状态词那半截，**不猜**。
 	if (claimed) {
@@ -349,9 +372,16 @@ export function deriveDoneSet(events, goldChapter) {
 	return set;
 }
 
-// 段落级意见（带 kind）在章节卡上的三个说法。gold-table 的正文标记区另有一份（它不在本票开口内）；
-// 两处说的都是同一件事，改一处要一起想——见 `.scratch/dead-gates/issues/10-章节卡已处置与翻案.md`。
-const REVIEW_KIND_TEXT = {
+/**
+ * 段落级意见（带 kind）在界面上的**唯一一份正名**（票 02）。
+ *
+ * 出口只有这一处：章节卡的 `reviewText` 与谈判桌意见单（`gold-table.js`）同取这一份。
+ * 此前谈判桌的正文标记区另抄了一份**逐字相同**的，票 02 已收编——意见 kind 词一处，改措辞防漂移
+ * （与 `REVIEW_REVOKED_TEXT` 同一条路：跨域协作只走 public exports，见 `AGENTS.md`「Frontend layout」）。
+ * ⚠️ `replay-list.js` 的 `goldOpinionVerbs` 是**第三份短动词版**，措辞与这两份**有意不同**，不并入这里。
+ * （它随票 `depth-review-2026-10/09` 的回放域搬迁从 `event-cards.js` 到了 `replay-list.js`。）
+ */
+export const REVIEW_KIND_TEXT = {
 	dislike: "😕 不喜欢这种写法",
 	drop: "🗑 这类内容不需要",
 	change: "✏️ 要改成",
@@ -508,6 +538,60 @@ export function pickComposerAnchorTop(chain) {
 	const card = above.find((box) => isRoundedOpaqueBox(box));
 	const anchor = card ?? above[0];
 	return anchor === undefined ? null : anchor.top;
+}
+
+// ── 谁够格当「作曲家」：候选判据（票 walkthrough-2026-10/10）────────────────────────
+//
+// 病（真机复现，2026-10-05）：终检认可那一屏，工作台**根容器被压成 207px**、整块内容区被裁掉，
+// 用户看到的正是「一条进度条 ＋ 六个阶段格 ＋ 一条广告 ＋ 空白」（与 2026-09-26 走查 P55 同形）。
+//
+// 机制不在渲染里，在 `measure()` 挑「作曲家」的那两行上：它遍历
+// `textarea, input, [role=textbox], [contenteditable=true]`，只要求 **`r.bottom > vh - 160`**
+// ——这条判据**不要求那个元素在视口里**。终检认可卡是全书最高的一张卡（自查报告可达 1400px＋），
+// 它自己那个「不满意意见」输入框一旦**没被自动带进视野**（旧 bundle／竞态那一帧），
+// 它的 bottom 就落在视口下方（真机实测 1625 > 1297），于是它**比真正的作曲家更靠下**、
+// 被挑成锚点；`pickComposerAnchorTop` 取到的「输入区容器 top」＝**那张卡自己的 top**（283），
+// 于是 `usable = 283 - 76 = 207 > 200` ⇒ `rootH = 207px` ⇒ 工作台塌成一条。
+//
+// 两刀都要（各自堵一条路，两条都喂进下面这个纯函数，不在接线处另写一份）：
+//   ① **工作台自己的输入不算作曲家**——判据要的是宿主那张作曲家卡，工作台里的意见框／笔记框
+//      天然「在根容器里面」，`root.contains(el)` 一句话就把它们整族排除；
+//   ② **必须在视口里**（`bottom <= viewportHeight`）——把①放宽一点也够今天这一屏，但「视口下面
+//      一千像素处有个输入框」在任何宿主布局下都不该当锚点，两刀都写下来才不用赌下一屏。
+//
+// ⚠️ **它不是「谁最靠下」那半条**：挑最大 bottom 仍归调用方（那是「遍历里挑一个」的机械动作）。
+
+/** 「接近视口底部」那条带子的高度（px）；与判据①合起来＝「贴着底部的、看得见的输入」。 */
+const COMPOSER_BOTTOM_BAND = 160;
+
+/**
+ * 这一枚输入元素**够不够格当宿主的作曲家**（`measure()` 挑底边锚点时的唯一候选判据）。
+ *
+ * @param {{ top?: unknown, bottom?: unknown, width?: unknown, height?: unknown, insideWorkbench?: unknown } | null | undefined} box
+ *   一枚候选的盒子（视口坐标）＋「它在不在工作台根容器里面」
+ * @param {{ rootTop?: unknown, viewportHeight?: unknown } | null | undefined} frame
+ *   工作台根容器的 top 与视口高度（两个都是从同一帧里量出来的读数）
+ * @returns {boolean} true ＝ 够格（调用方再在够格的里面挑 bottom 最大的那个）
+ */
+export function isComposerCandidate(box, frame) {
+	const b = box ?? {};
+	const f = frame ?? {};
+	const top = Number(b.top);
+	const bottom = Number(b.bottom);
+	const width = Number(b.width);
+	const height = Number(b.height);
+	const rootTop = Number(f.rootTop);
+	const vh = Number(f.viewportHeight);
+	if (![top, bottom, width, height, rootTop, vh].every(Number.isFinite)) return false;
+	// 零尺寸的盒子（宿主 display:contents 那层、还没布局的元素）从来不是作曲家。
+	if (!(width > 0 && height > 0)) return false;
+	// ① 工作台自己的输入框不算：它只是在根容器里面，与宿主那张作曲家卡无关。
+	if (b.insideWorkbench === true) return false;
+	// ② 必须在视口里，且确实贴着底部那一条带（`bottom` 超过视口高度 ＝ 在屏幕下面，不算）。
+	if (!(bottom <= vh)) return false;
+	if (!(bottom > vh - COMPOSER_BOTTOM_BAND)) return false;
+	// 起点要在工作台根容器之下（旧判据那一半，照留）。
+	return top > rootTop;
 }
 
 /** 输入区容器的精确信号：圆角 + 不透明底（见上面判据①）。 */
@@ -687,4 +771,40 @@ export { contextOccupancyPercent } from "../domain-rules.js";
 export function contextOccupancySentence(percent) {
 	if (!Number.isFinite(percent)) return "";
 	return `上下文已用 ${percent}%`;
+}
+
+// ── 材料格式（界面那两行；名单与闸门在 domain-rules.js）─────────────────────
+//
+// 票 `mineru-formats/07`：**词表共享、句子行文各端自己写**（本文件头部那条分工）。
+// 受理名单 `MATERIAL_FORMATS` 是两侧共用的领域规则，住 `src/domain-rules.js`；
+// 这里是上传区那两行**界面句子**的派生——它只读那份名单，不自己再抄一份扩展名。
+//
+// ⚠️ 「未标定」那句是这张票的**诚实性载荷**：名单里 14 种里有 11 种上游只有散文声明、
+// 本仓**零成功记录**（票 01 真机实测只坐实 pdf / png / docx）。收下它们是为了兑现用户
+// 「多格式兼容」的诉求，但**不许让用户以为每一个都是验过的**——所以未标定的那几种
+// 在界面上要点名出来，而不是只在代码注释里说一句。
+
+import { MATERIAL_FORMATS } from "../domain-rules.js";
+
+/** 上传区那一行：支持哪些形状（按 family 归并，顺序取自名单；单一扩展名不套括号）。 */
+export function materialFormatHint() {
+	const groups = [];
+	for (const { ext, family } of MATERIAL_FORMATS) {
+		const last = groups[groups.length - 1];
+		if (last !== undefined && last.family === family) last.exts.push(ext);
+		else groups.push({ family, exts: [ext] });
+	}
+	return `支持格式：${groups
+		.map((g) =>
+			g.exts.length === 1 ? g.family : `${g.family}（${g.exts.join("/")}）`,
+		)
+		.join("、")}`;
+}
+
+/** 未标定那一句：哪几种**没有**成功记录（点名，不含糊）。全部标定时返回空串（不占一行）。 */
+export function materialFormatCalibrationNote() {
+	const done = MATERIAL_FORMATS.filter((f) => f.calibrated).map((f) => `.${f.ext}`);
+	const rest = MATERIAL_FORMATS.filter((f) => !f.calibrated).length;
+	if (rest === 0) return "";
+	return `已实测可用：${done.join("、")}；其余 ${rest} 种是「未标定」——官方声明支持，本仓还没有成功记录。`;
 }

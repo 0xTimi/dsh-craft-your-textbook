@@ -22,22 +22,31 @@
  */
 import {
 	artifactKind,
+	chapterRel,
 	goldChapterNo,
 	productOpenMode,
 	gateHuman,
 	stageLabelHuman,
 	segmentHuman,
+	convertedState,
+	finalAuditSummaryRel,
 	GATE_TOPIC,
 	PHASE_UI_SOURCE,
 	SEGMENT_PHASE,
+	// 票 `demo-flow-fidelity/06`：最后检查那句演示提示的项名单点（服务端 name，见 domain-rules）。
+	QUALITY_CHECKS_TAIL_NAMES,
 } from "../domain-rules.js";
-import { formatTime, humanDuration } from "./rules.js";
+import { formatTime, humanDuration, stageScopedProgressDetail, deriveStallJudgment } from "./rules.js";
 
 // 界面词的两侧共用部分（关卡主题表 / 「第 N 次拍板」模板 / 交办阶段标签翻译 / 六格阶段词）
 // 住在 src/domain-rules.js 的「界面词」区：服务端也要产出人话文本（《过程记录.md》、交办唤醒
 // 消息、提案正文标题都是给人读的），共用件只住 UI 层就得在服务端抄第二份（grill Q24）。
 // 这里只保留 UI 专属映射，并把共用件再导出——UI 组件照旧从本文件取词。
-export { artifactKind, gateHuman, stageLabelHuman };
+export { artifactKind, gateHuman, stageLabelHuman, convertedState };
+// 原件那一格（票 `mineru-formats/11` / `ADR-0029`）：判据与路径形状住在领域规则模块（它们由
+// `MATERIAL_FORMATS[].family` 派生，那份表在那边），UI 组件照旧只从本文件取——与 `convertedState`
+// 同一处置，组件不许自己去 import 领域规则模块里的那一格。
+export { originalPreviewOpenable, originalSourceRel } from "../domain-rules.js";
 export const GATE_UI = GATE_TOPIC;
 
 // ── 界面用词表（批 2，2026-09-20 用户逐行拍板）────────────────────────────────
@@ -159,12 +168,16 @@ export const eventHuman = (type, fallback) =>
 export const CHECK_UI = {
 	"成品文件齐全": "整本书文件齐全",
 	"所有章节都有审计记录": "每章都有检查记录",
-	"没有遗留的 AI 笔记/脚手架": "没有留下 AI 的草稿痕迹",
+	// ⚠️ 票 06 收口（2026-10-08）订正：这一格的键原来是「没有遗留的 AI 笔记/脚手架」——
+	// `engine.js` 在票 20 把那条 check 的 `name` 改成了「没有遗留的通用脚手架标记」，这张表的键
+	// 没跟着改，于是 `checkHuman` 认不出它、**屏上原样印机器名**（键必须是服务端 `name`，
+	// 见本表上面那段注释）。值一个字没动。
+	"没有遗留的通用脚手架标记": "没有留下 AI 的草稿痕迹",
 	"练习与答案齐全": "练习和答案都在",
 	"与已拍板的设计一致": "和你说定的设计一致",
 	// ⚠️ 票 14（承诺账 E）：这两条白话名原来把机制说大了——
 	//   「源材料引用可追溯」的机器判据只是 `sourceCount > 0`（用上了至少一份材料），不验任何一处内容；
-	//   「进度账本齐全」只验 `work/progress.md` 存在，不验「每一步」都有行。
+	//   「进度账本齐全」只验 `工作区/progress.md` 存在，不验「每一步」都有行。
 	// 名字即承诺，所以按机制收（收名，不动服务端判据）。
 	"源材料引用可追溯": "用上了你上传的材料",
 	"风格线条条有着落": "你提的风格要求都处理了",
@@ -181,6 +194,222 @@ export const CHECK_UI = {
 };
 
 export const checkHuman = (name) => CHECK_UI[name] ?? name;
+
+// ── 演示书那句「只跑前 N 项」的提示（票 `demo-flow-fidelity/06`）────────────────────────
+//
+// 用户看得到终检那两块的地方有**两处**：焦点区的终检认可卡（`event-cards.js` 的
+// `FinalApprovalCard`）与阶段页第 6 阶段那块（`phase-page.js` 的 `FinalChecksBlock`）。
+// 演示书在这两处都比真书少两块——机器检查只跑前 6 项、没有 AI 检查报告（票 01 Q5＝乙：
+// **卡上明写**，不伪造报告）——所以两处要说**同一句话**。句子**只此一份**：两个渲染点都调
+// 下面这个函数，谁也不许自己拼一遍（票面：同一句、从一处派生，别抄两份）。
+//
+// 项名**从票 08 的声明面派生**：`src/demo-exemptions.js` 的 `quality-checks-tail`
+// 那条的机器可读元数据 `checkNames` 就是这里的 `QUALITY_CHECKS_TAIL_NAMES`（**同一个数组
+// 引用**，不是抄一份）——但那份数组装的是**服务端 `name`**，所以这句拼接时**逐项过
+// `checkHuman`**（`CHECK_UI`，键＝服务端名）：屏上是界面词（「有工作记录可查」），
+// 不是「进度账本齐全」这类机器名（`CONTEXT.md`「界面用词表」把「进度账本」「禁用词」
+// 列为界面避免词）。
+//
+// 「前 N 项」的 N **来自这一屏真的列了几项**（两个渲染点上手上就有 `checks` 数组，
+// 由调用方递进来）：这是**这一屏的事实**，不是拿条数猜「这是不是演示书」——
+// 是不是演示书只由 `meta.demo` 判（见 `isDemoBook`，票面明令不许用条数反推）。
+// ⚠️ 为什么**不**再从「名义总数 − 名单项数」算（票 06 原版就是 14 − 8 ＝ 6）：
+//   ① 那个 14 在 `src/` 里**没有出处**、只能手抄（原注释自陈「算不出来所以写死」），
+//      而纪律是「别手抄一个会腐烂的数」；
+//   ② 名单按服务端 `name` 补成 9 项那天，`14 − 9 ＝ 5` 会当场把演示书那 6 项说错成 5 项——
+//      算术的两个操作数一个都没有出处，改一处就静默说错话。
+//   演示通道跑的那几项与这一屏列的那几项**在演示书上恒等**（都是那 6 项），所以 N 说成
+//   「这一屏列了几项」既准确、又不靠一份手抄的清单。收口时选的就是这一路（票面二选一）。
+//
+// ⚠️ 这一句是**说明文字、不是判据**（票 06 要做的第 3 条）：声明面若比现实窄，它就少说几项
+// ——那份窄处逐条写在 `QUALITY_CHECKS_TAIL_NAMES` 的注释里，没有任何机器闸门咬它说的项数
+// 对不对。真正被判据钉住的有三格：**它上了屏**（演示 payload）、**屏上每个项名都是界面词**
+// （过 `checkHuman`，`test-component-cards.mjs` / `test-phase-page.mjs` 逐项断）、
+// 以及**真书那一侧一个字都不许有**（反证，同样那两个文件）。
+/**
+ * 演示书在终检那两块上的那句提示（两个渲染点共用这一句）。
+ *
+ * @param {unknown} checksShown 这一屏**真的列出来的**机器检查清单（`checks` 数组）
+ */
+export function demoQualityChecksNote(checksShown) {
+	const shown = Array.isArray(checksShown) ? checksShown.length : 0;
+	const tail = QUALITY_CHECKS_TAIL_NAMES.map((name) => checkHuman(name)).join("／");
+	return `演示模式：只跑前 ${shown} 项机器检查。`
+		+ `真书上这里还会跑「${tail}」这些项，并附一份 AI 检查报告。`;
+}
+
+/**
+ * 这本书是不是演示书（票 `demo-flow-fidelity/06`）——**只给展示面用**。
+ *
+ * 它是「要不要说那句演示提示」的**唯一判据**（两个渲染点共用），与 `engine.js` 里那一族
+ * `meta.demo` 守卫是**两件事**：那些守卫决定演示通道**不做**什么（豁免，登记在
+ * `src/demo-exemptions.js`），这里只决定界面**说不说**这句话——它不给演示通道放行任何东西。
+ *
+ * ⚠️ **不许拿别的事实反推它**（票面明令）：`checks` 条数、有没有 AI 报告都是「别人家的判据」
+ * 的副产品，真书哪天加/减一项就会当场说错话。演示与否只有 `meta.demo` 这一个来源。
+ */
+export const isDemoBook = (meta) => meta?.demo === true;
+
+// ── 从账本倒着找一条事件（票 `depth-review-2026-10/08`）────────────────────────────
+//
+// 搬移前「取最近一条某类型的事件」是四份各自抄的 `[...list].reverse().find((e) => e.type === T)`
+// ——机器检查、AI 检查报告、进度横幅、开始浏览时记进度序号各一份。同一件事抄四遍的代价不是
+// 「多了几行」，是**改判据要改四处、漏一处就静默分叉**（这正是本仓反复治的「一处改、另一处漏」）。
+//
+// 口径逐字照搬原实现，一格都没动：
+//   · **按数组顺序取末位**（先 reverse 再 find），**不按 `seq` 比较**——账本乱序时两者会分叉，
+//     现状是前者，改成后者就是一次静默的行为变更。
+//   · 取不到回 `undefined`（`find` 的原样语义），**兜底归各自的调用方**：机器检查回空数组、
+//     AI 报告回 `null`、进度横幅比记住的序号。判据层不许替它们编。
+//   · 事件列表读不到（`null` / `undefined`）回 `undefined`，不抛。
+//
+// ⚠️ **有一处故意不用它**：壳里 `onPickStep` 记进度序号那一份读的是 **latest ref**
+// （`bookRef.current.core.data?.events`，可能比当前这一帧的渲染更新——壳自己的注释明写这是
+// 有意的）。把它改成读渲染期的 `events`（也就是并进 `deriveBookViewFacts`）会引入一个真实的
+// 时序差异，所以那一份**仍在自己写**，只是不再自己抄这个模板。判据共用 ≠ 数据源共用。
+export function lastEventOfType(events, type) {
+	const list = events ?? [];
+	for (let i = list.length - 1; i >= 0; i -= 1) {
+		if (list[i]?.type === type) return list[i];
+	}
+	return undefined;
+}
+
+/**
+ * 「**展示期**」（票 `walkthrough-2026-10/04`，2026-10-06 裁决甲）：章稿已落盘、而那一步**还没交工**。
+ *
+ * 这一格是怎么来的：`engine.js:1730-1733` 只看「范例章文件在不在盘上」就置 `awaiting-gold`
+ * （不看检查跑没跑完），而 `pendingStage` 要等主笔 AI `stage-submit gold` 才被清空
+ * （`actions/chapters.js` 的 `case 'gold'`）。于是这两件事实的**合取**正好是
+ * 「稿已经给用户看了，但机器这一步还没交出结果」——走查 B4 那一屏。
+ *
+ * 裁决**甲**（承认提前展示是有意的）要的是：展示期归现有状态词「我正在做」，
+ * 而不是把用户叫过来说「轮到你」（此刻验收面的定稿键正禁着，他点不动）。
+ * 判据只用机器自己那两位事实，**不比较任何文件时间**——「审计覆盖当前正文」那套（乙）
+ * 要先推翻本裁决才许用；全仓唯一那处 mtime 比较在 `src/workflow.js:809`。
+ *
+ * ⚠️ **我的枚举面比现实窄在哪里**：本条只认 `pendingStage === 'gold'` 这一位。
+ * 主笔 AI 若在没有交工的情况下结束了回合（状态机停在 `awaiting-gold`、待办没清），
+ * 这一格仍会说「我正在做」——那正是「这一步还挂着」的实话，恢复出口是活性行那颗
+ * 「🔁 从断点继续」，不是把用户叫来点一颗按不动的键。
+ *
+ * @param {object | null | undefined} meta 当前书的状态投影
+ * @param {unknown} pendingStage 待办阶段（`/textbook/status` 顶层那一位）
+ * @returns {boolean}
+ */
+export function goldDraftDisplayed(meta, pendingStage) {
+	return meta?.status === "awaiting-gold" && pendingStage === "gold";
+}
+
+/**
+ * 一本书的**壳级派生**（票 `depth-review-2026-10/08`）：壳（`client-entry.js` 的
+ * `WorkbenchView`）在渲染体上方现算的这几格，收进本文件一处，壳只消费。
+ *
+ * 它收的是**判据**，不是快照解包：`meta` / `gate` / `events` / 待办阶段那几份输入由壳从
+ * `book` 这份 snapshot 拆好递进来（那是投影的事实，不是派生）。本函数只做「从这些事实推出
+ * 界面上要说的那句话」这一件事，纯函数、零副作用、不碰 React。
+ *
+ * ## 八个键与各自的印字出口（搬移不得改任何一个出口的字）
+ *
+ * **出工作台状态词的四个**（`CONTEXT.md` 三词上限：轮到你 / 我正在做 / 已完成，因此这一层
+ * 一个字都不许动）：
+ *   · `humanTurn` → `panels.StatusStrip` 出「⚡ 轮到你 · <humanTurnAction>」；`panels.ActivityLine`
+ *     在轮到用户时**整行不出现**（不是出第四个词）；`event-cards.PhaseBar` 只加「⚡」前缀
+ *     （那不是三个词里的任何一个）。⚠️ **卡内还有一份自己的判据**（`event-cards` 的 PhaseBar
+ *     多一项 `phase === 3`）——那是**另一个事实**，卡内那份照旧，不许合到这份里来。
+ *     ⚠️ 票 `walkthrough-2026-10/04`（裁决甲）：`awaiting-gold` 那一档要**减去展示期**
+ *     （`goldDraftDisplayed`）——稿已在盘、这一步还没交工时归「我正在做」，见那个函数的注释。
+ *   · `pendingStageLabel` → `panels.StatusStrip` 与 `event-cards.StatusCard` 出「我正在做 · …」。
+ *     ⚠️ **空串是正确答案**（`stageHuman` 那一段注释）：`StatusCard` 判 `!== ""` 才出那半句，
+ *     任何非空兜底都会凭空多印一个来源不明的状态词。
+ *   · `progressDetail` → 为空时经 `panels.activityClaimUnsupported` 把「🤖 我正在做」**整条摘掉**
+ *     （`CONTEXT.md` 登记的「不算第四个状态词＝整条不出声」）。取数口径一个字没改。
+ *   · `stall` → `panels.ActivityLine` 出「🤖 我正在做 · N 分钟没动静了」。⚠️ `event-cards.StatusCard`
+ *     那句「只报时长」是**另一件事**（它那行的注释逐字这么写），两个措辞不许合并。
+ *
+ * **不出状态词的四个**：`checks`（机器检查项白话）、`aiReport`（AI 检查报告正文）、
+ * `lastEvent`（错误正文 / 阶段标签 / 计时基准）、`needsConfig`（纯显示值）。
+ *
+ * ## 两条实施红线
+ *
+ * 1. **本函数返回的 `stall` 必须由壳**裸调用**取，不得包 `useMemo`**：`deriveStallJudgment` 的
+ *    `now` 默认 `Date.now()`，记忆化会把时间基准冻在第一次渲染的那一刻（活性行永远停在同一句
+ *    「N 分钟没动静了」）。本函数自身不记忆化，但**调用点**可以——那一处的注释与源码级断言钉着它。
+ * 2. **`humanTurn` 不进 props 袋**：它只喂阶段片 / 状态条 / 活性行三个渲染点，壳从本函数的返回值里
+ *    解构出来直喂那三处。把它塞进袋只会多一个没人消费的键。
+ *
+ * @param {{
+ *   events?: unknown,
+ *   meta?: unknown,
+ *   gate?: unknown,
+ *   pendingStage?: unknown,
+ *   pendingGate?: unknown,
+ *   mainAiRunning?: unknown,
+ *   subagentRunningCount?: unknown,
+ *   subagentActiveSince?: unknown,
+ * }} input
+ * @returns {{
+ *   lastEvent: object | null,
+ *   checks: unknown[],
+ *   aiReport: unknown,
+ *   progressDetail: string,
+ *   pendingStageLabel: string,
+ *   humanTurn: boolean,
+ *   needsConfig: string,
+ *   stall: { stalled: boolean, idleMs: number },
+ * }}
+ */
+export function deriveBookViewFacts(input) {
+	const {
+		events,
+		meta = null,
+		gate = null,
+		pendingStage = null,
+		pendingGate = null,
+		mainAiRunning,
+		subagentRunningCount,
+		subagentActiveSince,
+	} = input ?? {};
+	const list = events ?? [];
+	const lastEvent = list.length > 0 ? list[list.length - 1] : null;
+	// 交办待办阶段的界面词。⚠️ `gate` 那一格**自己短路**去调 `gateHuman`（带关卡号的那一份词），
+	// 绕开 `STAGE_HUMAN`——那是票 `audit-matrix-contract/05` 的反证锚点，补 gate 词表不改变它。
+	const pendingStageLabel =
+		pendingStage === "gate" ? gateHuman(pendingGate ?? "?") : stageHuman(pendingStage);
+	// 「轮到谁」：壳这一份判据（六个 awaiting-* ＋ 关卡等拍板 ＋ 还在材料准备且没进过拍板）。
+	// `meta` 为 null 时整体短路——没有书就没有「轮到你」。
+	// ⚠️ 票 `walkthrough-2026-10/04`（裁决甲）：`awaiting-gold` 那一档**要减去展示期**
+	// （`goldDraftDisplayed`）——稿在盘、这一步还没交工时验收面的定稿键正禁着，此刻说
+	// 「轮到你 · 确认最佳范例章」就是把用户叫来点一颗按不动的键。那一档归「我正在做」。
+	const humanTurn =
+		meta !== null &&
+		(meta.status === "awaiting-explore" ||
+			meta.status === "awaiting-outline" ||
+			(meta.status === "awaiting-gold" && !goldDraftDisplayed(meta, pendingStage)) ||
+			meta.status === "awaiting-chapters-review" ||
+			meta.status === "awaiting-final-approval" ||
+			(gate !== null && gate.status === "awaiting") ||
+			(meta.phase === 1 && gate === null));
+	return {
+		lastEvent,
+		checks: lastEventOfType(list, "textbook/quality")?.data?.checks ?? [],
+		aiReport: lastEventOfType(list, "textbook/ai-report")?.data?.report ?? null,
+		progressDetail: stageScopedProgressDetail(list),
+		pendingStageLabel,
+		humanTurn,
+		// 两个分支都带兜底文案、恒为非空串（`StatusCard` 只把它当纯显示值印一行）。
+		needsConfig:
+			lastEvent?.type === "textbook/error"
+				? `${lastEvent.data?.task ?? ""}失败：${lastEvent.data?.message ?? ""}`
+				: '请先配置大模型接口（右上角设置 → 模型），配好后点"继续"。',
+		stall: deriveStallJudgment({
+			mainAiRunning,
+			subagentRunningCount,
+			subagentActiveSince,
+			lastWriteAt: meta?.updatedAt,
+		}),
+	};
+}
 
 // 焦点区（主卡）选哪张卡：把 WorkbenchView 的内联路由链抽成纯函数，可独立测试。
 // ⚠️ 路由顺序即语义顺序（与历史实现一一对应）：拍板关卡 → 各确认闸门 → 交付 →
@@ -251,18 +480,15 @@ export function workEntryAction(rel) {
 	return "none";
 }
 
-/** 章号 → 章节正文路径（两位序号是契约；与 domain-rules 的 NUMBERED_CHAPTER_FILE_RE 同一个形状）。 */
-const chapterRel = (n) => `work/chapter-${String(n).padStart(2, "0")}.md`;
-
 /**
- * 拍板提案的路径形状：`提案/<前缀>N-vM.md`（v1 与 v2/v3 修订件同形）。
+ * 拍板提案的路径形状：`工作区/方案/<前缀>N-vM.md`（v1 与 v2/v3 修订件同形）。
  * ⚠️ 文件名的两个汉字是**机器身份词**（产物路径——CONTEXT.md「界面用词表」的判定线明写
  * 「文件名、产物路径……一个字不改」），不是界面词；但判定线① 的字面量扫描会把 `src/ui/**`
  * 里**含中文的字符串**一律当人眼可见的字检查，产物路径恰好长成那样。故这里用码点写前缀，
- * 值就是 `提案/关卡`；正则字面量不在扫描面内（`/^提案\//` 照旧可用）。
+ * 值就是 `工作区/方案/关卡`；正则字面量不在扫描面内（`/^工作区\/方案\//` 照旧可用）。
  * 改这一行＝改契约：`domain-rules.productOpenMode` 的 GATE_PROPOSAL_RE 必须认同一个形状。
  */
-const GATE_PROPOSAL_DIR = "提案/";
+const GATE_PROPOSAL_DIR = "工作区/方案/";
 const GATE_PROPOSAL_PREFIX = "\u5173\u5361";
 const gateProposalRel = (gate, version) =>
 	`${GATE_PROPOSAL_DIR}${GATE_PROPOSAL_PREFIX}${gate}-v${version}.md`;
@@ -295,10 +521,10 @@ function eventLabelArtifacts(label, meta) {
 		if (done !== null) out.push(chapterRel(Number(done[1])));
 	}
 	// 其余各步：名字取**前缀**（带后缀的变体一并认）。
-	if (label.startsWith("源探查")) out.push("work/explore.md");
-	if (label.includes("章节骨架") || label.includes("章节安排")) out.push("work/outline.md");
+	if (label.startsWith("源探查")) out.push("工作区/explore.md");
+	if (label.includes("章节骨架") || label.includes("章节安排")) out.push("工作区/outline.md");
 	if (label.includes("最佳范例章")) out.push(chapterRel(goldChapterNo(meta)));
-	if (label.startsWith("合并成书") || label.startsWith("最后检查")) out.push("work/book.md");
+	if (label.startsWith("合并成书") || label.startsWith("最后检查")) out.push("工作区/book.md");
 	// 拍板提案（`设计提案·关卡N` / `设计提案·第 N 关`，修订件带 `·修订vM`）→ 提案 v1 或 vM。
 	const gate = /设计提案·(?:第\s*(\d+)\s*关|关卡\s*(\d+))(?:·修订\s*v\s*(\d+))?/.exec(label);
 	if (gate !== null)
@@ -324,10 +550,10 @@ const LABEL_EVENT_TYPES = new Set([
  *   ③ **存在性**（在 `workEntryForEvent` 里收口）：候选要真在 `/textbook/work` 的清单里才算数。
  *
  * ⚠️ 候选的**动作判据（`workEntryAction === 'sidebar'`）对三层一视同仁**，不只作用在 ①：
- * ②认得出的 `work/outline.md`（章节安排）是机器 JSON，判 `'inline'`（票 pipeline-wiring-gaps/09），
+ * ②认得出的 `工作区/outline.md`（章节安排）是机器 JSON，判 `'inline'`（票 pipeline-wiring-gaps/09），
  * 放它过就是一个点了没反应的「打开」。
  *
- * ⚠️ **「自查第 N 章」故意没有候选**：它落的是 `work/audit-NN.md`——机器审计 JSON
+ * ⚠️ **「自查第 N 章」故意没有候选**：它落的是 `工作区/audit-NN.md`——机器审计 JSON
  * （`{"passed":…,"issues":[…]}`，不是给人读的文件）。既不开右栏，也不给「查看结果」入口：
  * 留一个点了没反应的按钮，正是本轮在修的毛病。每章的检查结论经机器检查清单与
  * AI 自查报告给人读，不靠暴露这个文件（下面只认带「完成」的章级事件，故这条自动成立）。
@@ -350,22 +576,22 @@ function eventArtifactCandidates(event, meta) {
 		for (const rel of eventLabelArtifacts(label, meta)) candidates.push(rel);
 	} else if (event?.type === "textbook/phase-end") {
 		const phase = Number(data.phase);
-		if (phase === 2) candidates.push("work/explore.md");
+		if (phase === 2) candidates.push("工作区/explore.md");
 		else if (phase === 4) candidates.push(chapterRel(goldChapterNo(meta)));
-		else if (phase === 5 || phase === 6) candidates.push("work/book.md");
+		else if (phase === 5 || phase === 6) candidates.push("工作区/book.md");
 	}
 
 	// ⚠️ **三层的候选一律过产物判据**（票 pipeline-wiring-gaps/09）：label 形状层认得出
-	// 「章节骨架 → work/outline.md」，但那份文件内容是机器 JSON（`productOpenMode` 判 `'inline'`），
+	// 「章节骨架 → 工作区/outline.md」，但那份文件内容是机器 JSON（`productOpenMode` 判 `'inline'`），
 	// 而右栏通道只认 `'sidebar'`——候选放行出去，事件行就长出一个**点了没反应**的「打开」。
-	// 那一族的出口是卡片内联折叠清单（`chapters-map.foldOutline` / `KnowledgeMapBlock`），
+	// 那一族的出口是卡片内联折叠清单（`machine-product-folds.foldOutline` / `KnowledgeMapBlock`），
 	// 与「自查第 N 章」不给 audit JSON 入口同源：机器产物不生死按钮。
 	return candidates.filter((rel) => workEntryAction(rel) === "sidebar");
 }
 
 /**
  * **候选的"存在性"收紧 + 提案的免检例外**（这一条判据只此一份）。
- * ⚠️ 例外＝`提案/`：产物清单（`/textbook/work`）从不列它（只列 `work/*.md`），而"落提案文档"与
+ * ⚠️ 例外＝`工作区/方案/`：产物清单（`/textbook/work`）从不列它（只列 `工作区/*.md`），而"落提案文档"与
  * "落这条事件"在服务端是同一函数里的前后两行（engine.js writeProposalDoc → appendEvent），
  * 故提案候选以**事件本身**为存在性证据——否则拍板那一行恒没有入口（票 13 点名的窟窿）。
  * 代价写在 `event-row-entries/spec.md` 决策 5：提案文件若被删，那一行就成了死按钮（今天 0 例）。
@@ -461,16 +687,28 @@ function relPath(rel) {
 		.replace(/^(?:\.\/)+/, "");
 }
 
-/** `work/chapter-NN.md`（两位序号是契约）。
+/** `工作区/chapter-NN.md`（两位序号是契约）。
  *  读侧宽松（`\d+`）：**能不能打开**由 domain-rules.productOpenMode 判（那儿才要求两位），
  *  名字这一层只负责"叫得出"——一份旧书里少补了个零的正文不该在界面上没名字。 */
-const CHAPTER_NAME_RE = /^work\/chapter-(\d+)\.md$/;
-/** 旧版产物目录（`work/_旧版产物/<文件>.<stamp>`；深改归档还会多一层 `深改-<id>/`）。 */
-const ARCHIVED_NAME_RE = /^work\/_旧版产物\/(?:[^/]+\/)?(.+)$/;
-/** 三次拍板的提案（`提案/关卡N-vM.md`，v1 与 v2/v3 修订件同形）。 */
-const GATE_PROPOSAL_NAME_RE = /^提案\/关卡(\d+)-v(\d+)\.md$/;
-/** 材料转换稿（`sources-md/<材料名>.md`，或 MinerU 拆份后的 `sources-md/<材料名>/…`）。 */
-const CONVERTED_SOURCE_NAME_RE = /^sources-md\/(.+)$/;
+const CHAPTER_NAME_RE = /^工作区\/chapter-(\d+)\.md$/;
+/** 旧版产物目录（`工作区/_旧版产物/<文件>.<stamp>`；深改归档还会多一层 `深改-<id>/`）。 */
+const ARCHIVED_NAME_RE = /^工作区\/_旧版产物\/(?:[^/]+\/)?(.+)$/;
+/** 三次拍板的提案（`工作区/方案/关卡N-vM.md`，v1 与 v2/v3 修订件同形）。 */
+const GATE_PROPOSAL_NAME_RE = /^工作区\/方案\/关卡(\d+)-v(\d+)\.md$/;
+/** 材料转换稿（`材料/转换稿/<材料名>.md`，或 MinerU 拆份后的 `材料/转换稿/<材料名>/…`）。 */
+const CONVERTED_SOURCE_NAME_RE = /^材料\/转换稿\/(.+)$/;
+/** 精读细目（`工作区/细目/精读-NN.md`）——票 `context-budget/11` 接线后的家。 */
+const DETAIL_NOTE_NAME_RE = /^工作区\/细目\/精读-(\d+)\.md$/;
+/** 最后检查的五份分报告（`工作区/报告/final-NN.md`）——票 `context-budget/11` 落盘。 */
+const FINAL_REPORT_NAME_RE = /^工作区\/报告\/final-(\d+)\.md$/;
+/** 那份**派生**的条目并集（`工作区/报告/final-summary.md`）——票 `context-budget/12` 的机器拼装件。
+ *  路径**不手写**：逐字取自 `domain-rules.finalAuditSummaryRel`（落盘路径的单一出处）。 */
+const FINAL_SUMMARY_NAME = finalAuditSummaryRel();
+/** 用户上传的原件（`sources/<文件名>`）。名字取自 `MATERIAL_FORMATS` 那一格的 `family` 无关——
+ * **「给不给入口」才按格式判**，名字只答「这一份是什么」＝原件（`CONTEXT.md` 词条）。 */
+const ORIGINAL_NAME_RE = /^sources\/(.+)$/;
+/** 末段扩展名（`板书.v2.png` → `.png`）。名字里**不带任何扩展名**（转换稿那一支同此规矩）。 */
+const NAME_EXTENSION_RE = /\.[A-Za-z0-9]+$/;
 /** 旧版产物的稿次尾巴（`.3f2k9x` 这类 base36 时间戳）。 */
 const DRAFT_STAMP_RE = /\.[0-9a-z]+$/i;
 
@@ -492,7 +730,7 @@ function nameForRel(path) {
 	if (chapter !== null) return `第 ${Number(chapter[1])} 章`;
 	const archived = ARCHIVED_NAME_RE.exec(path);
 	if (archived !== null) {
-		const base = nameForRel(`work/${draftBaseName(archived[1])}`);
+		const base = nameForRel(`工作区/${draftBaseName(archived[1])}`);
 		return base === "" ? "" : `${base}·旧稿`;
 	}
 	const gate = GATE_PROPOSAL_NAME_RE.exec(path);
@@ -502,15 +740,33 @@ function nameForRel(path) {
 		// v1 不写版次（第一次的方案不需要"第 1 版"这种废话）；v2+ 才追加「（第 M 版）」。
 		return version >= 2 ? `${name}（第 ${version} 版）` : name;
 	}
-	const source = CONVERTED_SOURCE_NAME_RE.exec(path);
+const source = CONVERTED_SOURCE_NAME_RE.exec(path);
 	if (source !== null) {
 		const material = source[1].split("/")[0].replace(/\.md$/i, "");
 		return material === "" ? "材料转换稿" : `${material}的转换稿`;
 	}
-	if (path === "work/explore.md") return "读材料挑重点的结果";
-	if (path === "work/outline.md") return "章节安排";
-	if (path === "work/style-spec.md") return "写作规范";
-	if (path === "work/book.md") return "成书";
+	// 原件（票 `mineru-formats/11` / `ADR-0029`）：形状「x 的原件」，与转换稿**同一个基名**
+	// （取自原件名、去掉扩展名）——同一份材料的两个入口在界面上叫得出同一个东西的两半。
+	// ⚠️ PDF 原件**没有**这个入口（`domain-rules.originalPreviewOpenable` 判掉），但名字仍在
+	// 词表里：判「有没有入口」与判「它叫什么」是两条判据，名字这一层不重复那份判断。
+	const original = ORIGINAL_NAME_RE.exec(path);
+	if (original !== null) {
+		const material = original[1].split("/")[0].replace(NAME_EXTENSION_RE, "");
+		return material === "" ? "原件" : `${material}的原件`;
+	}
+	if (path === "工作区/explore.md") return "读材料挑重点的结果";
+	if (path === "工作区/outline.md") return "章节安排";
+	if (path === "工作区/style-spec.md") return "写作规范";
+	if (path === "工作区/book.md") return "成书";
+	// 细目目录与报告目录（票 `context-budget/11`／`12` 落盘）。⚠️ **这一族**开右栏**，
+	//   词表里就必须有它们的名字——不然界面上只剩一个类型词「文件」（判定线⑧，
+	//   `test-product-open-mode.mjs` 的「有正文的产物都叫得出名字」那一格盯的就是这件事）。
+	//   `终检` 是界面避免词，界面这一族一律说「最后检查」（与 brief 任务说明同一译法）。
+	const detailNote = DETAIL_NOTE_NAME_RE.exec(path);
+	if (detailNote !== null) return `第 ${Number(detailNote[1])} 份材料的精读细目`;
+	const finalReport = FINAL_REPORT_NAME_RE.exec(path);
+	if (finalReport !== null) return `最后检查·第 ${Number(finalReport[1])} 路分报告`;
+	if (path === FINAL_SUMMARY_NAME) return "最后检查·五份分报告的汇总";
 	// 过程记录（ADR-0015）：全局产物、写给人读的流水账——名字走词表，不再退成类型词「文件」。
 	// 它**不属任何一步**，所以只出现在焦点区底部那条常驻小条上，不进任何一步的文件清单。
 	if (path === "过程记录.md") return "过程记录";
@@ -536,7 +792,7 @@ export function artifactNameWith(name, qualifier) {
 }
 
 /** 产物事实里的正文/检查记录分类（路径与既有产物判据同形，不另造一套）。 */
-const AUDIT_FACT_PATH_RE = /^work\/audit(?:-[^/]+)?\.md$/i;
+const AUDIT_FACT_PATH_RE = /^工作区\/audit(?:-[^/]+)?\.md$/i;
 
 /** 产物事实里的时间是服务端给的；这里只做有效性检查与既有的可读时间格式化。 */
 function artifactFactTime(modifiedAt) {
@@ -758,7 +1014,7 @@ export function artifactLabel(workFiles, path, seg) {
 
 /**
  * 这一步能**在右栏打开**的产物（动作是 `sidebar` 的那一批）。
- * ⚠️ 机器产物（`work/audit-NN.md`，动作 `none`）与走卡片内联的（`work/knowledge-map.json`，
+ * ⚠️ 机器产物（`工作区/audit-NN.md`，动作 `none`）与走卡片内联的（`工作区/knowledge-map.json`，
  * 动作 `inline`）都不进清单：前者会变成点了没反应的死按钮，后者点了会把 JSON 塞进右栏
  * （ADR-0010 决策 2）。知识地图的人读清单由那一步自己的块就地展示。
  */
@@ -842,6 +1098,26 @@ function eventTime(event) {
 }
 
 /**
+ * 材料行的三态图标——**上传卡与阶段页材料清单共用这一份**（票 `mineru-formats/02`）。
+ *
+ * ⚠️ 这两个模块原先各写一份 `converted === true ? "✅" : "⏳"`（`event-cards.js` 的上传卡
+ * 与 `phase-page.js` 的材料清单），而**只改一处照样全绿**——布尔升三值时失败的那一份
+ * 仍然把 `failed` 说成「还在转」。两份拷贝收成一份之后，界面上「转失败了」才有唯一读法。
+ *
+ * 三个取值都取自 `domain-rules.CONVERTED_STATES` 派生的那份表（真值在领域规则模块，
+ * 这里是展示映射）；`convertedState` 一并再导出，UI 组件只从本文件取这两个件。
+ * ⚠️ 图标**不是工作台状态词**（`CONTEXT.md`「材料缺口」：逐源明细，不占三个状态词的名额）。
+ */
+const CONVERTED_ICON = Object.freeze({
+	pending: "⏳",
+	ok: "✅",
+	failed: "❌",
+});
+
+/** 一份材料该印哪个图标（老书布尔经 `convertedState` 只读归一，不另判）。 */
+export const convertedIcon = (source) => CONVERTED_ICON[convertedState(source)];
+
+/**
  * 材料转换期的唯一一行活动明细；上传卡与阶段页材料清单共用这一份。
  *
  * 计时起点取**当前这一轮最早一条可见 mineru-progress**：本票不把 stage-start / agent-start
@@ -862,7 +1138,7 @@ export function materialConversionActivityText(meta, events, now = Date.now()) {
 
 /** 每个阶段在干什么（阶段页顶部一句说明；界面词）。 */
 export const PHASE_INTRO = Object.freeze({
-	1: "你把教材 PDF 传上来，机器把它转成能读的正文。",
+	1: "你把材料传上来，机器把它转成能读的正文。",
 	2: "AI 读完材料、挑出重点，等你确认。",
 	3: "三次拍板：定下学习目标与难点、教学方法与板块、全书架构与章节，再排好章节。",
 	4: "先写一章给你过目，定下全书风格。",

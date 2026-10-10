@@ -36,8 +36,8 @@ digraph mode {
 
 | 源角色标签（skill 形态登记法；dsh 形态以上传区为准） | 什么文件 | 典型用法（示例，非判据） |
 |---|---|---|
-| `student_textbook` | 学生用书 PDF/MD | 教学主线骨架 |
-| `teacher_textbook` | 教师用书 PDF/MD | 差异比对 + 教学方法补充 |
+| `student_textbook` | 学生用书（原件或已转出的转换稿） | 教学主线骨架 |
+| `teacher_textbook` | 教师用书（原件或已转出的转换稿） | 差异比对 + 教学方法补充 |
 | `syllabus` | 考纲/ECO/课程标准 | 覆盖校验基准（启用 syllabus 覆盖校验时必备） |
 | `authoritative_source` | 权威原文（PMBOK/法典/官方指南/Scrum 指南） | 防幻觉真相源，冲突裁决最高级 |
 | `teaching_notes` | 教学笔记/讲义/精炼笔记 | 教学骨架与例子，条目化起点 |

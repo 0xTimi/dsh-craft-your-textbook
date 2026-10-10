@@ -32,8 +32,9 @@
  *   · 导航只换屏、不开文件、不发动作（ADR-0010 / 0012）。
  *
  * 依赖方向（单向、无环）：本 module **import** `view-rules` 的展示派生（`stepWord` / `phaseOfSegment` /
- * `openableArtifacts` / `decisionText` / `artifactFactText` / `PHASE_INTRO` / `PHASE_UI`）与
- * `domain-rules` 的界面词区；`view-rules` **不** import 本 module。`stepWord` 留在 `view-rules`
+ * `openableArtifacts` / `decisionText` / `artifactFactText` / `PHASE_INTRO` / `PHASE_UI` /
+ * `segmentHuman`）与 `domain-rules` 的**机器身份**（`SEGMENT_PHASE`）；`view-rules` **不** import
+ * 本 module。`stepWord` 留在 `view-rules`
  * （`materialConversionActivityText` 与两屏共用），`stepIcon` 与 `rowText` 的合成搬进本 module
  * （行自带 `rowText`，调用方不再各拼一份）。
  */
@@ -46,8 +47,14 @@ import {
 	artifactFactText,
 	indexRunningChapterClaims,
 	PHASE_INTRO,
+	segmentHuman,
 } from "./view-rules.js";
-import { SEGMENT_PHASE, segmentHuman } from "../domain-rules.js";
+// ⚠️ 直连 `domain-rules` 的**只剩** `SEGMENT_PHASE` 一个——它是**机器身份**（`seg.phase` 缺值时按
+// `kind` 兜底的那张表），不是界面词。**界面词一律经 `view-rules` 再导出**（票 `deep-module-scan/05`：
+// 同一份事实有两条都合法的路径、只有一条被约定过时，漏一处不会报错、只会漂；改 import 不改行为，
+// `segmentHuman` 是同一个函数）。`goldChapterNo` / `judgeMaterialUploadSize` 那几处**故意直连**——
+// 它们是判据与机器身份，见 `.scratch/deep-module-scan/issues/05-…md`「核实结论」那张分类表。
+import { SEGMENT_PHASE } from "../domain-rules.js";
 
 // ── 只读工具 ──────────────────────────────────────────────────────────────
 
@@ -451,6 +458,14 @@ function buildSnapshot({ meta, segments, runningSubagentCount }) {
 			(artifactEntryCountByPhase[phase] ?? 0) + openableArtifacts(seg).length;
 	}
 
+	// 阶段 1 的「有几份」数的是**材料**，不是产物（票 walkthrough-2026-10/03）：阶段 1 在宿主
+	// 分段表里**没有分段**（`domain-rules.js` 的 `SEGMENT_PHASE` 没有 1，`workflow.js` 的首段是
+	// explore），所以上面那份按分段累计的表**结构上**永远给不出阶段 1 的读数——那一格此前恒说
+	// 「还没有文件」，而同屏的卡上明明列着材料。材料清单的单一出处是 `meta.sources`。
+	// ⚠️ 这里**不**把材料并进 `artifactEntryCountByPhase`：两者是两个轴的事实
+	// （`CONTEXT.md`「素材角色」「材料分量」与产物分轴），混进去会让下面那份"按条目"的口径说谎。
+	const materialCount = Array.isArray(normMeta?.sources) ? normMeta.sources.length : 0;
+
 	return {
 		meta: normMeta,
 		segments: normSegments,
@@ -461,6 +476,7 @@ function buildSnapshot({ meta, segments, runningSubagentCount }) {
 		rowBySegmentKey,
 		counts,
 		artifactEntryCountByPhase,
+		materialCount,
 	};
 }
 
@@ -492,6 +508,9 @@ function projectOverview(snapshot) {
 		counts: { ...counts },
 		groups: groupRows(snapshot.overviewRows),
 		artifactEntryCountByPhase: { ...snapshot.artifactEntryCountByPhase },
+		// 阶段 1 那一格要的读数（材料清单的份数），与上面那份产物计数**并列而不同源**
+		// （票 walkthrough-2026-10/03）：那一格没有分段，靠上面那份表恒为 0。
+		materialCount: snapshot.materialCount,
 	};
 }
 

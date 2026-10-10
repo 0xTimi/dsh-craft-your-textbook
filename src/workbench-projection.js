@@ -149,6 +149,13 @@ function normalizeCore(payload, { base = null, delta = false } = {}) {
   ) {
     throw malformed('events 响应的 outline 必须是字符串')
   }
+  if (
+    payload.goldAudit !== undefined &&
+    payload.goldAudit !== null &&
+    typeof payload.goldAudit !== 'string'
+  ) {
+    throw malformed('events 响应的 goldAudit 必须是字符串')
+  }
 
   const incoming = payload.events
   for (const event of incoming) {
@@ -173,9 +180,24 @@ function normalizeCore(payload, { base = null, delta = false } = {}) {
       reviews: listOrEmpty(payload, 'pendingReviews', 'events.pendingReviews'),
     },
     knowledgeMap: typeof payload.knowledgeMap === 'string' ? payload.knowledgeMap : null,
-    // 章节安排原文（`work/outline.md`，内容是机器 JSON）：与 knowledgeMap 同一条路——
+    // 章节安排原文（`工作区/outline.md`，内容是机器 JSON）：与 knowledgeMap 同一条路——
     // 不经 /textbook/file（那条路由按 'preview' 收窄），人读形态由阶段页就地折叠。
     outline: typeof payload.outline === 'string' ? payload.outline : null,
+    // 当前范例章的检查记录原文（`工作区/audit-NN.md`，严格 JSON 的机器产物）：同 outline 一条路
+    // ——不经 `/textbook/file`（那条路由按 'preview' 收窄，对它必然 403），改随 payload 下发。
+    // 判据是**那一份**（服务端按 `meta.goldChapter` 取），前端不再自己拼路径去读。
+    // ⚠️ **三态里「还没读到」（`undefined`）那一格必须留得住**——这一格与上面几格不同：
+    // 它**驱动一颗键的能力**（`goldDisplayPeriod`：`null` ⇒ 挂展示期、把定稿键禁掉）。
+    // 所以服务端**没有这一格**时要读成 `undefined`（＝还没读到 ⇒ 照旧放行），**不是** `null`：
+    // 判成 `null` 就是让卡断言「这一稿的检查记录还没出来」——那是关于**文件**的断言，
+    // 而客户端此刻并不知道（老宿主／半更新时这一格就是缺的），两颗键于是又灰回去，
+    // 正是票 `gold-finalize-blocked/01` 那个形状。上面几格用 `?? null` 是因为它们只影响显示。
+    goldAudit:
+      payload.goldAudit === undefined
+        ? undefined
+        : typeof payload.goldAudit === 'string'
+          ? payload.goldAudit
+          : null,
     chapterStatus: listOrEmpty(payload, 'chapterStatus', 'events.chapterStatus'),
     goldDrafts: listOrEmpty(payload, 'goldDrafts', 'events.goldDrafts'),
     goldDraftVersion: Number.isSafeInteger(payload.goldDraftVersion)

@@ -1,6 +1,18 @@
 /**
  * 动作族模块（架构评审候选 3，2026-09-01 拆分）：actDeepModify
- * 从 src/workflow.js 平移，接口 (ctx, req, res, action, sessionId, project, body) 不变。
+ * 从 src/workflow.js 平移（架构评审候选 3，2026-09-01）。
+ *
+ * ⚠️ 票 `workflow-seams/03`：interface 已收窄成**一个请求对象**
+ * （`{ ctx, action, sessionId, project, body }`）并返回 `{status, json}`——
+ * `_req` 与 `res` 两个传输参数都已从 interface 上消失（`res` 由 `handleAction` 那一次
+ * `sendJson` 写出，落盘边界随它）。
+ *
+ * ⚠️ **本文件不许删、不许合、不许改名**：动作族 id ≡ 本文件名这一点被
+ * `test-contract-action-catalog.mjs` 从**源码文本**锚定（它正则抠 `workflow.js` 的
+ * `HANDLER_OF_FAMILY` 字面量表并要求 handler 绑定名匹配 `act[A-Z]\w*`）；
+ * 另有 `test-context-vocabulary.mjs` 把「探查」钉在 `gates.js`、
+ * `test-gate-write-points.mjs` 点名读本目录下的族文件。
+ * ⇒ 改完之后本文件会变得**近乎空壳**——**那是承重件不是忘了删**。
  * 共享工具来自 ../engine.js。
  */
 import {
@@ -12,15 +24,20 @@ import {
   appendEvent,
   readEvents,
   workDir,
+  archiveDir,
   wakeMainAI,
   handoff,
   runPhase3,
   kick,
-  sendJson,
   deepAffected,
   deepStartSeq,
   syncPendingReviewsAfterTruncate,
 } from '../engine.js'
+import { familyOf, reject, accept } from '../action-runner.js'
+// payload 字段词汇层（票 `deep-module-scan/18` 层一）。⚠️ 本文件用 `textCoerced(..., true)`
+//   ——原表达式是 `textCoerced(body.note, DEEP_MODIFY_NOTE_MAX, true)`，**先强制再裁空白**，
+//   与 `textField`（只认字符串）不是一回事。
+import { textCoerced, DEEP_MODIFY_NOTE_MAX } from './payload-fields.js'
 import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 // 界面词（分段 → 人话）：这条 hint 会渲染进「之前的过程」，所以 `seg.key` 不能原样上屏
@@ -29,7 +46,7 @@ import { segmentHuman } from '../../domain-rules.js'
 
 
 /** 动作族 · 深改：'deep-modify' / 'deep-undo'。 */
-export async function actDeepModify(ctx, _req, res, action, sessionId, project, body) {
+export const actDeepModify = familyOf('deep-modify', async ({ ctx: ctx, action: action, sessionId: sessionId, project: project, body: body }) => {
   switch (action) {
     case 'deep-modify': {
       // 定点修改（深改）：归档该段及下游产物、截断账本到该段起点、注入重做意见、把待办指回被改段重跑下游。
@@ -37,23 +54,23 @@ export async function actDeepModify(ctx, _req, res, action, sessionId, project, 
       assertSessionOwned(project, sessionId)
       const meta = readMeta(project)
       if (meta === null) throw new Error(`unknown project ${JSON.stringify(project)}`)
-      if (meta.demo === true) { sendJson(res, 409, { ok: false, error: '演示书不支持定点修改' }); return }
+      if (meta.demo === true) { return reject(409, '演示书不支持定点修改') }
       // 票 12（spec 第 4 条 / 不变量 4：守卫读的字段＝动作写的字段）：提示语承诺「或先 ⏸ 暂停」，
       // 而「⏸ 暂停」写的是 meta.pause（collab-signals 的 'pause'）——所以暂停即放行，守卫读这个字段。
       // 提示语一个字不改（要改的是路，不是话）；demo 的 409 必须留在本守卫之前（demo 深改始终拒，
       // 与是否暂停无关）。反面照旧：未暂停且该章还在做 → 409。
       if (meta.pause == null && (meta.status === 'running' || meta.pendingStage != null)) {
-        sendJson(res, 409, { ok: false, error: '我正在做；要改历史请先等交工（或先 ⏸ 暂停）' })
-        return
+        return reject(409, '我正在做；要改历史请先等交工（或先 ⏸ 暂停）')
       }
       const segKey = String(body.segment ?? '')
       const affected = deepAffected(project, meta, segKey)
-      const note = String(body.note ?? '').trim().slice(0, 500)
-      if (affected === null) { sendJson(res, 400, { ok: false, error: '不认识的历史段' }); return }
-      if (note === '') { sendJson(res, 400, { ok: false, error: '写一句这次要改什么' }); return }
+      const note = textCoerced(body.note, DEEP_MODIFY_NOTE_MAX, true)
+      if (affected === null) { return reject(400, '不认识的历史段') }
+      if (note === '') { return reject(400, '写一句这次要改什么') }
       // 1) 深改存档（meta+events+产物清单，独立目录，永不复用 seq 名）
       const id = `${Date.now().toString(36)}-${segKey}`
-      const deepDir = join(projectDir(project), 'snapshots', 'deep')
+      // `archiveDir()` 建的是 `过程/存档/`；`deep/` 是它下面**再一层**，仍要自己建。
+      const deepDir = join(archiveDir(project), 'deep')
       mkdirSync(deepDir, { recursive: true })
       const events = readEvents(project)
       // 归档名单＝**真的搬得走的那些**：盘上没有的不进存档。存档的 `archived` 是撤销回移的唯一依据，
@@ -178,8 +195,7 @@ export async function actDeepModify(ctx, _req, res, action, sessionId, project, 
       if (meta.demo !== true) {
         try { wakeMainAI(ctx, project) } catch { /* 唤醒失败不阻塞深改 */ }
       }
-      sendJson(res, 200, { ok: true, project, segment: segKey, archived })
-      return
+      return accept({ project, segment: segKey, archived })
     }
     case 'deep-undo': {
       // 一键撤销最近一次深改（10 分钟内且账面无新进展）。
@@ -187,20 +203,17 @@ export async function actDeepModify(ctx, _req, res, action, sessionId, project, 
       const meta = readMeta(project)
       const last = meta?.lastDeepModify
       if (last == null || Date.now() - last.at > 10 * 60 * 1000) {
-        sendJson(res, 409, { ok: false, error: '没有 10 分钟内的深改可撤销' })
-        return
+        return reject(409, '没有 10 分钟内的深改可撤销')
       }
       if ((meta.eventCount ?? 0) !== last.eventCountAfter) {
-        sendJson(res, 409, { ok: false, error: '深改后账面已有新进展，撤销会丢失它们；如确要撤销请回退快照' })
-        return
+        return reject(409, '深改后账面已有新进展，撤销会丢失它们；如确要撤销请回退快照')
       }
-      const file = join(projectDir(project), 'snapshots', 'deep', `${last.id}.json`)
-      if (!existsSync(file)) { sendJson(res, 404, { ok: false, error: '深改存档文件缺失' }); return }
+      const file = join(archiveDir(project), 'deep', `${last.id}.json`)
+      if (!existsSync(file)) { return reject(404, '深改存档文件缺失') }
       let archive = null
       try { archive = JSON.parse(readFileSync(file, 'utf8')) } catch { archive = null }
       if (archive === null || typeof archive !== 'object') {
-        sendJson(res, 500, { ok: false, error: '深改存档文件损坏，无法撤销；旧版产物仍在 work/_旧版产物/深改-… 目录留档' })
-        return
+        return reject(500, '深改存档文件损坏，无法撤销；旧版产物仍在 工作区/_旧版产物/深改-… 目录留档')
       }
       // 产物回移
       const stampDir = join(workDir(project), '_旧版产物', `深改-${last.id}`)
@@ -219,8 +232,7 @@ export async function actDeepModify(ctx, _req, res, action, sessionId, project, 
       delete restored.deepRedoNote
       rollbackLedger(project, archive.events ?? [], restored)
       appendEvent(project, 'textbook/deep-undo', { segment: archive.segment })
-      sendJson(res, 200, { ok: true, project })
-      return
+      return accept({ project })
     }
   }
-}
+})

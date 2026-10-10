@@ -44,16 +44,19 @@ import { uiCallable, uiReadOnly } from "./workbench-actions.js";
 // 「有没有新版本」自检（判据与网络都在这个 module 里）。**请求由 apply(ctx) 在注册时发起**，
 // 组件只订阅一个已算好的结果——渲染期零请求，否则会污染首屏那几条读通道的请求计数
 // （test-workbench-first-screen.mjs 的 fetch 桩把每次调用都记进 calls，且未 stub 的直接抛）。
-import { startUpdateCheck, updateNoticeText, useUpdateNotice } from "./ui/update-notice.js";
+import { classifyLayer, INSTALLED_PACKAGE, INSTALLED_VERSION, layerBadge, startUpdateCheck, updateNoticeText, useUpdateNotice } from "./ui/update-notice.js";
 // 书级 UI 隔离壳（内部件，不进导出表面）：以 bookKey 为 key，切书/切会话时书级子树整体重挂。
 import { BookSessionScope } from "./ui/book-session-scope.js";
 // 领域规则与纯函数（rules）：本文件直接用的 + 为保持产物表面而再导出的；
 // 双端共享领域件（素材角色、六阶段、范例章号）以 src/domain-rules.js 为源。
 import {
-	formatTime,
-	// 票 stale-detection/01：「多久没动静」的共用判定 + 小助手血缘聚合（三路输入、一个门槛，
-	// 活性行与状态卡消费同一份结果；口径与宿主同源，见 docs/reference/dsh-session-contracts.md）。
-	deriveStallJudgment,
+	// ⚠️ `formatTime` 随账本回放行搬进 `src/ui/event-cards.js`（票 `deep-module-scan/15`）——
+	//   它是「多久之前」那条界面派生，壳里只剩一个调用点，就是那段 inline createElement。
+	// ⚠️ 票 stale-detection/01 的判停判定 `deriveStallJudgment` 与进度详情取数
+	//   `stageScopedProgressDetail` **随票 `depth-review-2026-10/08` 一起不再由壳直接调**——
+	//   壳级派生收进 `view-rules.deriveBookViewFacts`（见下面那次调用），判据与口径一个字没改，
+	//   变的只是「谁调」。小助手血缘聚合（三路输入、一个门槛，活性行与状态卡消费同一份结果；
+	//   口径与宿主同源，见 docs/reference/dsh-session-contracts.md）仍在壳里直接用。
 	indexSubagentDescendants,
 	indexRunningSubagentActivity,
 	// F22 那条旧规则已不成立（2026-09-22 票 12）：渲染处不再拿它门控阶段片，只为保住导出表面而再导出。
@@ -64,7 +67,6 @@ import {
 	splitParagraphs,
 	paragraphHint,
 	diffParagraphs,
-	stageScopedProgressDetail,
 	// 票 28：主 AI 上下文占用。口径与宿主输入区角标同一份数据（`contextPressure` 会话投影），
 	// 读数口在 rules.js；读不到就 null，界面那一格不渲染（绝不显示 0%）。
 	contextOccupancyPercent,
@@ -72,6 +74,9 @@ import {
 	// 取「输入区**容器**的 top」，不取输入元素自身的 top——宿主作曲家卡在输入元素上方还有
 	// padding-top / 提示语 / 排队消息行。判据与真机证据见 rules.js 里这一节的注释。
 	pickComposerAnchorTop,
+	// 票 `walkthrough-2026-10/10`：**谁够格当宿主作曲家**那一刀（工作台自己的输入不算 ＋ 必须在
+	// 视口里）。少了它，终检认可那张长卡自己的意见框会被当成锚点，工作台塌成 207px、整块内容被裁。
+	isComposerCandidate,
 	// 票 24：拍板/认可那两张闸门卡要**自己进视野**（滚到哪 ＋ 这一帧量到了没有）＋ 焦点区空白
 	// 的兜底句（出不出、那句话是什么字）。判据只此一份；这里只负责量坐标与渲染。
 	decisionCardScroll,
@@ -80,30 +85,42 @@ import {
 // 展示派生（事件→文件、阶段→产物、stage→界面文案）集中放卡片域 view-rules.js，
 // 壳只留薄绑定；领域源仍是 domain-rules。
 import {
-	stageHuman,
-	gateHuman,
-	workPathForEvent,
-	// 事件行入口判据的三种处境（票 08）：open / blocked（给灰字）/ none（什么都不长）。
-	workEntryForEvent,
 	focusCardKey,
 	// 票 24：这一张主卡要不要被**带进焦点区可视带**（拍板/认可那两张，见上面那条 effect）。
 	autoScrollCardKey,
 	workEntryAction,
 	artifactName,
-	// 事件行行首的类型词（票 06）：只出客户端词表，不端服务端 label 上屏。
-	eventHuman,
+	// 票 `depth-review-2026-10/08`：壳在渲染体上方现算的那八格派生收进
+	// `deriveBookViewFacts` 一处，壳只消费它的返回值（取词出口与判据一个字没改）。
+	// `humanTurn` 由它给出但**不进袋**——只喂阶段片 / 状态条 / 活性行三个渲染点。
+	deriveBookViewFacts,
+	// 「从账本倒找最近一条某类型的事件」那份模板（倒找的实现只此一份）。⚠️ 壳里 `onPickStep`
+	// 记进度序号那处**仍读 latest ref**（见那里），只是不再自己抄模板。
+	lastEventOfType,
+	// ⚠️ 票 `deep-module-scan/15` 把 `workPathForEvent` / `workEntryForEvent` / `eventHuman`
+	//   连同账本回放行一起搬进了 `src/ui/event-cards.js`——它们是**判据与词汇**，那条渲染面
+	//   现在自己 import（`AGENTS.md`「Frontend layout」：跨域只走 public exports）。
+	//   搬走之前它们**只**被那段 inline createElement 用，所以这里随之删掉。
 } from "./ui/view-rules.js";
 // 候选 06：「阶段 / 步」视图模型。WorkbenchView 用 useMemo([meta, processSegs]) 建**一次**
 // projector，交给全览条 / 阶段页 / 阶段片接线 / 焦点解析共用——同一份 process/meta 只推导一次。
 import { createStageStepProjector } from "./ui/stage-step-model.js";
-// 上传上限与超限文案（前后端共享单一事实源，见 domain-rules.js）。
+// 上传体积的**共享判据**与超限文案（前后端共享单一事实源，见 domain-rules.js）。
+// ⚠️ 这里**不再**自己写 `file.size > MAX_UPLOAD_BYTES` 那道比较（票 10 的界面层纪律）：
+// 写面是「所有上传/选择文件入口」的最后一层，界面层任何第二道体积比较都会让两道上限各走各的。
 import {
-	MAX_UPLOAD_BYTES,
-	uploadTooLargeMessage,
-	EVENT_META,
+	judgeMaterialUploadSize,
+	// 章节正文路径的构造只此一份（票 `depth-review-2026-10/05`）：产物路径是机器身份词，
+	// 壳里原来自带一份 `工作区/chapter-${…}.md` 内联模板，与 `src/ui/**` 那三处各拼各的。
+	chapterRel,
+	// ⚠️ `EVENT_META` 随账本回放行搬进 `src/ui/event-cards.js`（票 `deep-module-scan/15`）——
+	//   它是账本事件类型的契约表，那条渲染面自己 import（双端含义表，两端都要认）。
 } from "./domain-rules.js";
 // 「打开一份文件看看」的地址拼装（dsh-resource://file/…，见 ADR-0010 决策 8）。
 import { bookFileAddress } from "./ui/file-address.js";
+// 产物读取拥有者（票 workbench-card-contract/03）：`/textbook/file` 与 `/textbook/download`
+// 的地址骨架与身份编码只此一份，调用方只给 `rel`。
+import { createArtifactReader } from "./ui/artifact-read.js";
 // 最小 markdown 渲染。
 import {
 	READER_PARA_STYLE,
@@ -111,14 +128,12 @@ import {
 	exploreReportBlocks,
 } from "./ui/md-render.js";
 // 阶段页（点阶段片落到的那一页）：按每一步的天性定制布局，见该文件顶部说明。
-import { PhasePage, OpenArtifactButton } from "./ui/phase-page.js";
+import { PhasePage, OpenArtifactButton, phasePageView } from "./ui/phase-page.js";
 // 流程卡片群。
 import {
-	cardText,
-	cardIcon,
-	collapseConversionRuns,
-	replayRowSummary,
-	replayRowDetail,
+	// ⚠️ `cardText` / `cardIcon` 随账本回放域搬进 `src/ui/replay-list.js`（票
+	//   `depth-review-2026-10/09`），`collapseConversionRuns` / `replayRowSummary` / `replayRowDetail`
+	//   更早搬过一次（票 `deep-module-scan/15`）。壳最后一个取词点已改指，垫片随之撤掉。
 	PhaseBar,
 	WizardCard,
 	UploadArea,
@@ -128,7 +143,26 @@ import {
 	rejectPayload,
 	GatePanel,
 	MineruTokenCard,
+	// 票 `workbench-card-contract` 02：卡片 props 契约，**声明在每张卡自己的域文件里**。
+	// 这里只把它们登记成 slot（接线），不搬任何契约内容——locality 就在这个分界上。
+	gatePanelView,
+	uploadAreaView,
+	statusCardView,
+	deliveryCardView,
+	finalApprovalCardView,
 } from "./ui/event-cards.js";
+// 账本回放域（「之前的过程」那块）：卡片本体 + 它那张 props 契约 + 人话词映射
+// （票 `depth-review-2026-10/09` 从 `./ui/event-cards.js` 搬出，与焦点卡族零内部共享）。
+// 票 09 当时留了一行过渡再导出让壳零改动取词；票 `depth-review-2026-10/05` 收掉那一行，
+// 壳与四组测试全部改指到本模块的真正住址。
+import {
+	cardText,
+	cardIcon,
+	replayListView,
+	ReplayList,
+} from "./ui/replay-list.js";
+// 卡片 props 契约的装配器（中性 module：零 import，不认识任何一张卡）。
+import { createCardView } from "./ui/card-view.js";
 // 对话台（与「自动打开页签」共用同一个消息来源推导）。
 import { ChatDesk } from "./ui/chat-desk.js";
 import { deriveChatDeskNodes } from "./ui/chat-source.js";
@@ -139,6 +173,7 @@ import {
 	GoldCompare,
 	GoldFinalize,
 	GoldTable,
+	goldTableView,
 } from "./ui/gold-table.js";
 // 章节清单与步清单（全览条 / 底部常驻小条 / 右下角广告卡）。
 // ⚠️ 旧的「分段单卡」三件套（`BrowseSection` / `HistoryBrowser` / `FileViewer`）2026-09-21 已删：
@@ -150,18 +185,29 @@ import {
 	NarrowMainHint,
 	FocusFooter,
 	SocratopiaAd,
-	foldKnowledgeMap,
+	// 票 02：这两张卡的 props 契约声明在它们自己的域文件里。
+	chaptersCardView,
+	progressOverviewView,
 } from "./ui/chapters-map.js";
+// 机器产物的人读折叠（知识地图 / 章节安排）——实现在**中性模块**，票 `depth-review-2026-10/03`
+// 从 `ui/chapters-map.js` 搬出来（住址与消费方分离的病）。壳原先经 chapters-map 的过渡再导出
+// 取它（03 定的收尾那一步不在那张票的文件范围里），今天改指到本模块的真正住址。
+import { foldKnowledgeMap } from "./ui/machine-product-folds.js";
 // 确认卡。
-import { ExploreConfirmCard, OutlineConfirmCard } from "./ui/confirm-cards.js";
+import {
+	ExploreConfirmCard,
+	OutlineConfirmCard,
+	exploreConfirmCardView,
+	outlineConfirmCardView,
+} from "./ui/confirm-cards.js";
 // 顶栏、状态条与面板。
 import {
 	StatusStrip,
 	ActivityLine,
 	InterruptNote,
-	// 票 30②：提示条的两档措辞住在 `panels.js`（组件自己的出口），这里只挑该显示哪一档。
-	INTERRUPT_NOTE_TEXT,
-	INTERRUPT_NOTE_TEXT_BREAKS_CHAPTER,
+	// 票 30②＋票 gold-display-period/01：提示条那一族措辞住在 `panels.js`（组件自己的出口）；
+	// 「这一次该弹哪一档」也收进那边的纯函数 `interruptNoteText`。
+	interruptNoteText,
 	AutoFollowAwaitNote,
 	AutoFollowProgressNote,
 	TopBar,
@@ -406,8 +452,10 @@ export function WorkbenchView(props) {
 	// ④ 小助手「自称在跑、却已经多久没动静」（票 walkthrough-fixes/01 · 走查 P44 的接线半）。
 	//    `subagentRuns` 数的是「记录还驻留」——宿主把驻留但空闲的也算在跑，于是**一个早就干完、
 	//    结论一直没被消费的小助手会把自己的报警器一直按住**（实测按了 3 小时 34 分）。
-	//    这一路读的是它名下那些自称在跑的里**最老的一次动静**，与 `subagentRuns` 同口径聚合，
-	//    只多认一个 `updatedAt`。取不到（宿主没给这一位）时是 null，判定照旧走原来三路——
+	//    这一路读的是它名下那些自称在跑的里**最新的一次动静**，与 `subagentRuns` 同口径聚合，
+	//    只多认一个 `updatedAt`。**任一路在门槛内动过就算在推进**——口径 2026-10-06 由取 min
+	//    改成取 max（票 walkthrough-2026-10/01：取 min 时有一路 3 秒前刚写过、屏上仍喊没动静）。
+	//    取不到（宿主没给这一位）时是 null，判定照旧走原来三路——
 	//    宁可不判，也不拿猜出来的时刻去翻案（理由见 `deriveStallJudgment` 的注释）。
 	const subagentActiveSince = useMemo(
 		() => indexRunningSubagentActivity(sessionSummaries).get(session) ?? null,
@@ -453,9 +501,15 @@ export function WorkbenchView(props) {
 	const snapshots = coreData === null ? NO_SNAPSHOTS : coreData.snapshots;
 	const bookDir = coreData === null ? null : coreData.bookDir;
 	const knowledgeMapText = coreData === null ? null : coreData.knowledgeMap;
-	// 章节安排原文（`work/outline.md`，内容是机器 JSON）：判 `'inline'`、不开右栏
+	// 章节安排原文（`工作区/outline.md`，内容是机器 JSON）：判 `'inline'`、不开右栏
 	// （票 pipeline-wiring-gaps/09），人读形态是阶段页第 3 阶段那张就地折叠清单。
 	const outlineText = coreData === null ? null : coreData.outline;
+	// 当前范例章的检查记录原文（`工作区/audit-NN.md`，严格 JSON 的**机器产物**）。
+	// ⚠️ 它**不许**经 `/textbook/file` 读：那条路由只放行 `productOpenMode === 'preview'` 的产物，
+	// 而这一份被判 `'machine'` ⇒ 每次必然 403（票 `gold-finalize-blocked/01` 的病因：
+	// 谈判桌那颗定稿键因此永远灰着、刷新无效）。与知识地图／章节安排同一条路，随 payload 下发。
+	// `coreData === null`（这本书还没到）时给 `undefined`＝「还没读到」，与卡的三态口径同一格。
+	const goldAuditText = coreData === null ? undefined : coreData.goldAudit;
 	const pendingStageView = coreData === null ? null : coreData.pending.stage;
 	const pendingGateView = coreData === null ? null : coreData.pending.gate;
 	const pendingReviews = coreData === null ? NO_PENDING_REVIEWS : coreData.pending.reviews;
@@ -477,6 +531,17 @@ export function WorkbenchView(props) {
 	// 身份只有这一处：显示与动作请求体都读它（决策 7/8），Workbench 不再自持 activeId/ref。
 	const projectId = book.projectId;
 	const bookKey = book.bookKey;
+	// 票 03：产物读取拥有者。`projectId` 读不到时它**不发请求**（表现为一次 reject），所以
+	// 「无当前书」这一支不需要壳再自己判一次。
+	// ⚠️ 必须 useMemo：下面几张卡把 `readArtifact` 放进各自 effect 的依赖数组，每次渲染换新引用
+	// 会让那些 effect 每渲染都重跑（探查报告与章节正文会被反复取）。
+	// 依赖用响应式的 `session`（props 派生）而不是 `sessionRef.current`——ref 读进依赖数组是错的，
+	// 切会话时不会重算。
+	const artifactReader = useMemo(
+		() => createArtifactReader({ sessionId: session, projectId }),
+		[session, projectId],
+	);
+	const readArtifact = artifactReader.readText;
 	// ── process commit token（决策 15 / spec §14）──────────────────────────
 	// PhasePage 的「我正在做」乐观标记**只由最近一次成功、仍属当前身份、且规范化内容确实
 	// 变化的 process commit 清除**。三条各有一格，缺一条就会提前退场：
@@ -534,13 +599,30 @@ export function WorkbenchView(props) {
 	const readError = projectId === null ? book.projectsError : book.core.error;
 	const loadError = readStatus === "error" ? (readError?.message ?? null) : null;
 
-	// ③ 账本新鲜度（`meta.updatedAt`＝账本最后一次写入的时刻）＋ 门槛：合成唯一那份判定。
-	const stall = deriveStallJudgment({
-		mainAiRunning,
-		subagentRunningCount: subagentRuns.runningCount,
-		subagentActiveSince,
-		lastWriteAt: meta?.updatedAt,
-	});
+	// ── 壳级派生：这一本书界面上要说的那几句话（票 `depth-review-2026-10/08`）────────────
+	// 搬移前这八格是壳在渲染体上方**逐格抄一遍**判据（`lastEvent` / `checks` / `aiReport` /
+	// `progressDetail` / `pendingStageLabel` / `humanTurn` / `needsConfig` / `stall`），
+	// 「从账本倒找最近一条某类型的事件」那份模板还另抄了三遍。现在判据收进
+	// `view-rules.deriveBookViewFacts`，壳只消费它的返回值——**每一个键名与取值一个字没改**。
+	//
+	// ③ 账本新鲜度（`meta.updatedAt`＝账本最后一次写入的时刻）＋ 门槛这一路也在其中：它就是
+	//    `stall` 的第四个输入，由派生层喂给 `deriveStallJudgment`（三路输入、一个门槛）。
+	// ⚠️ **绝不 `useMemo` 这一段**：`deriveStallJudgment` 的 `now` 默认 `Date.now()`；
+	// 记忆化会把时间基准冻在第一次渲染的那一刻，活性行于是永远停在同一句「N 分钟没动静了」。
+	// 搬移前它就是裸调用（票 stale-detection/01），这里必须照旧裸调用。
+	// ⚠️ `humanTurn` **不进下面的 `cardBook` 袋**：它只喂阶段片 / 状态条 / 活性行三个渲染点
+	// （阶段片那份只是加「⚡」前缀，不是工作台状态词）。
+	const { lastEvent, checks, aiReport, progressDetail, pendingStageLabel, humanTurn, needsConfig, stall } =
+		deriveBookViewFacts({
+			events,
+			meta,
+			gate,
+			pendingStage: pendingStageView,
+			pendingGate: pendingGateView,
+			mainAiRunning,
+			subagentRunningCount: subagentRuns.runningCount,
+			subagentActiveSince,
+		});
 	// ── 书级 UI state 归位（票 05 / ADR-0021 决策 9 / spec §8）─────────────────
 	// 上一批 state（`viewPhase` / `browsing` / `showHistory` / `gateOpen` / 三个书级面板开关 /
 	// 模式库四件 / 两条横幅 / 不打断提示条 / 建议两件 / `deletingId` / 动作级 `error`+`busy`
@@ -555,6 +637,10 @@ export function WorkbenchView(props) {
 	// 三件、对话台两件与两个 ref、根高度与外层布局、宿主状态。
 	const [mineruSet, setMineruSet] = useState(true);
 	const [mineruToken, setMineruToken] = useState("");
+	// 票 10：本机**真探到**了自动切分能力（Python + PyMuPDF）吗？上传前那道预检要靠它决定
+	// 「PDF 超 200MB 时能不能说『会先切开』」。⚠️ 缺省 **false**：探不到就不许承诺——
+	// 写反了等于给每一台没装 PyMuPDF 的机器发一句没人验过的承诺（比说错更坏：它会让人不再拆）。
+	const [autoSplit, setAutoSplit] = useState(false);
 	// F20：已设置时的「重新设置」展开态——点开输入框、保存成功后回到掩码态。
 	const [mineruResetOpen, setMineruResetOpen] = useState(false);
 	// 对话台：下区高度（拖分界可调，默认 220）、是否收成一条。
@@ -623,11 +709,21 @@ export function WorkbenchView(props) {
 					);
 					for (const d of cands) {
 						const r = d.getBoundingClientRect();
-						if (!(r.width > 0 && r.height > 0)) continue;
-						// 只认「接近视口底部」的输入（DSH 作曲家）；工作台内部表单/顶部搜索框不算。
+						// 谁够格当宿主的作曲家：判据只此一份，在 rules.isComposerCandidate。
+						// ⚠️ 这里**不许**再写一份「r.bottom > vh - 160」——那一条缺了「在视口里」
+						// 与「不在工作台自己里面」两半，终检认可那一屏就靠它把工作台压成 207px
+						// （票 walkthrough-2026-10/10 的真机复现，见该函数的注释）。
 						if (
-							r.top > rect.top &&
-							r.bottom > vh - 160 &&
+							isComposerCandidate(
+								{
+									top: r.top,
+									bottom: r.bottom,
+									width: r.width,
+									height: r.height,
+									insideWorkbench: el.contains(d),
+								},
+								{ rootTop: rect.top, viewportHeight: vh },
+							) &&
 							r.bottom > maxBottom
 						) {
 							maxBottom = r.bottom;
@@ -793,8 +889,8 @@ export function WorkbenchView(props) {
 	//  - 'inline'（knowledge-map.json / outline.md）→ 不在这里开：它们的内容是机器 JSON，
 	//    人读形态由阶段页 / 确认卡**就地**折叠展示（`KnowledgeMapBlock` / `ExploreConfirmCard`
 	//    / `OutlineBlock` / `OutlineConfirmCard`），工作台不再有第二个查看壳。
-	//    ⚠️ `work/outline.md`（章节安排）也在这一族（票 pipeline-wiring-gaps/09）：名字带 `.md`、
-	//    内容是 `{"chapters":[…]}`，与 `work/audit-NN.md` 同一条理由判掉右栏通道。
+	//    ⚠️ `工作区/outline.md`（章节安排）也在这一族（票 pipeline-wiring-gaps/09）：名字带 `.md`、
+	//    内容是 `{"chapters":[…]}`，与 `工作区/audit-NN.md` 同一条理由判掉右栏通道。
 	//  - 'machine'（机器产物/源 PDF）→ 不给人读，什么都不开。
 	const openInSidebar = (rel) => {
 		const bookUi = bookUiRef.current;
@@ -804,7 +900,7 @@ export function WorkbenchView(props) {
 		} catch (err) {
 			// 预览服务解不到时插件根本不会加载（硬依赖）；这里兜的是地址/导航被拒
 			// （例如打开了目录地址）——把原因摆到界面上，不留「点了没反应」。
-			// 票 10（判定三 #2）：报错里原来印 `${rel}`（`work/…` 机器路径）；名字走 `artifactName`
+			// 票 10（判定三 #2）：报错里原来印 `${rel}`（`工作区/…` 机器路径）；名字走 `artifactName`
 			// （CONTEXT.md「产物名」：相对路径原文连提示一起不上屏）。
 			bookUi?.setError(
 				`打开「${artifactName(rel)}」失败：${String(err instanceof Error ? err.message : err)}`,
@@ -841,7 +937,12 @@ export function WorkbenchView(props) {
 		let alive = true;
 		void fetchJson("/textbook/settings")
 			.then((settings) => {
-				if (alive) setMineruSet(settings.settings?.mineruTokenSet === true);
+				if (alive) {
+					setMineruSet(settings.settings?.mineruTokenSet === true);
+					// 票 10：切分能力与 Token 同一次读取下发（同一台机器的事实，不另发一次请求）。
+					// 读不到 / 字段缺席一律落 `false`——「探不到」不是「有」。
+					setAutoSplit(settings.settings?.autoSplitAvailable === true);
+				}
 			})
 			.catch(() => {
 				/* 读不到设置不影响工作台（Token 卡显示未设置态） */
@@ -977,20 +1078,16 @@ export function WorkbenchView(props) {
 			// ⚠️ 那三个名字刻意留字面量且**不并进同一个数组**：契约动作目录那条静态闸把这**一串**
 			//   字面量登记成了豁免（绑「文件 + 这串名字 + 写法」），并进去会让它当场红。`gold-opinion`
 			//   因此走单独一次比较——它是一个名字，不是第二份动作名清单。
-			const wasChaptersReview = meta?.status === "awaiting-chapters-review";
-			if (
+			//    票 gold-display-period/01：**名单留在本文件**（豁免绑的就是本文件），只把
+			//    「哪一相位 ＋ 哪一状态 ⇒ 弹哪一档」那张表搬进 `panels.interruptNoteText`——
+			//    原式那一格写死 `meta?.phase === 5`，把谈判桌（phase 4）整个排除在外了。
+			const noteText =
 				json !== null &&
 				(["style-note", "intervene", "review"].includes(action) ||
-					action === "gold-opinion") &&
-				meta?.phase === 5 &&
-				(wasChaptersReview || meta?.status === "running")
-			) {
-				bookUi?.setNoteToast(
-					wasChaptersReview
-						? INTERRUPT_NOTE_TEXT_BREAKS_CHAPTER
-						: INTERRUPT_NOTE_TEXT,
-				);
-			}
+					action === "gold-opinion")
+					? interruptNoteText({ action, meta, pendingStage: pendingStageView })
+					: null;
+			if (noteText !== null) bookUi?.setNoteToast(noteText);
 			return json;
 		} catch (err) {
 			if (isBookCurrent(guard))
@@ -1184,10 +1281,17 @@ export function WorkbenchView(props) {
 		});
 	};
 
-	const uploadSource = async (file, role) => {
-		// 超限直接拒（服务端会回 413；先在这里拦，避免白传一份注定失败的大文件）。
-		if (file.size > MAX_UPLOAD_BYTES) {
-			const err = new Error(uploadTooLargeMessage());
+	/**
+	 * 上传一份材料。`asName` 是**补传**那一半（票 `mineru-formats/03`）：用户为一份红源重新
+	 * 挑了文件，而这一份要以缺口那一格的名字落上去——换了名字就是新材料，不是补传。
+	 */
+	const uploadSource = async (file, role, asName = null) => {
+		// 上传前的最后一道：走**共享判据**（票 10 的 `judgeMaterialUploadSize`），与上传卡、
+		// 补传那颗选择器**同一个**判据。本层只负责「拦」（抛错让界面记成失败），
+		// 那句「为什么不拦/会先切开」的话由上面两层说——同一件事不许在屏上响两次。
+		const verdict = judgeMaterialUploadSize({ name: asName ?? file.name, size: file.size, autoSplit });
+		if (verdict.blocked) {
+			const err = new Error(verdict.message);
 			err.retryable = false;
 			throw err;
 		}
@@ -1196,7 +1300,8 @@ export function WorkbenchView(props) {
 		// 刷新与它的结果不许落到已经不在这儿的身份上。
 		const guard = projection.capture();
 		const bytes = await file.arrayBuffer();
-		const url = `/textbook/upload?${sess()}&project=${encodeURIComponent(projectId)}&name=${encodeURIComponent(file.name)}&role=${encodeURIComponent(role)}`;
+		const name = asName ?? file.name;
+		const url = `/textbook/upload?${sess()}&project=${encodeURIComponent(projectId)}&name=${encodeURIComponent(name)}&role=${encodeURIComponent(role)}`;
 		const res = await fetch(url, { method: "POST", body: bytes });
 		let json = null;
 		try {
@@ -1241,6 +1346,12 @@ export function WorkbenchView(props) {
 	const convert = () => {
 		void postAction({ action: "convert-start" });
 	};
+	/**
+	 * 「删掉这份」（票 `mineru-formats/03` · `CONTEXT.md`「材料缺口」）：用户对**一份**红源
+	 * 表态——承认缺这一份。动作名只此一处，且走 `postAction` 漏斗（它按目录过「工作台可调用」
+	 * 那一扇门）；服务端只对 `failed` 的那一格开放，别的材料删不掉。
+	 */
+	const removeSource = (file) => postAction({ action: "source-remove", file });
 	const resume = () => {
 		void postAction({ action: "resume" });
 	};
@@ -1265,38 +1376,15 @@ export function WorkbenchView(props) {
 	// 成品预览（交付卡/终检认可卡）：整本走右栏，不再把全文灌进卡片 <pre>
 	// （票 03）。卡片的下载动作是另一条路（字节下载），不受影响。
 	const previewBook = () => {
-		openInSidebar("work/book.md");
+		openInSidebar("工作区/book.md");
 	};
 
-	const lastEvent = events.length > 0 ? events[events.length - 1] : null;
-	const qualityEvent = [...events]
-		.reverse()
-		.find((event) => event.type === "textbook/quality");
-	const checks = qualityEvent?.data?.checks ?? [];
-	const aiReportEvent = [...events]
-		.reverse()
-		.find((event) => event.type === "textbook/ai-report");
-	const aiReport = aiReportEvent?.data?.report ?? null;
-	// 进度详情只认「当前这一步」内的 progress（以最近一条 stage-start 为界）：
-	// 源探查结束进设计关卡后，探查期的通读进度不再残留到「AI 干活中」状态条。
-	const progressDetail = stageScopedProgressDetail(events);
-	const pendingStageLabel =
-		pendingStageView === "gate"
-			? gateHuman(pendingGateView ?? "?")
-			: stageHuman(pendingStageView);
-	const humanTurn =
-		meta !== null &&
-		(meta.status === "awaiting-explore" ||
-			meta.status === "awaiting-outline" ||
-			meta.status === "awaiting-gold" ||
-			meta.status === "awaiting-chapters-review" ||
-			meta.status === "awaiting-final-approval" ||
-			(gate !== null && gate.status === "awaiting") ||
-			(meta.phase === 1 && gate === null));
-	const needsConfigText =
-		lastEvent?.type === "textbook/error"
-			? `${lastEvent.data?.task ?? ""}失败：${lastEvent.data?.message ?? ""}`
-			: '请先配置大模型接口（右上角设置 → 模型），配好后点"继续"。';
+	// ⚠️ 这一段原先逐格现算的那八格（`lastEvent` / `checks` / `aiReport` / `progressDetail` /
+	// `pendingStageLabel` / `humanTurn` / `needsConfig` / `stall`）**已于票
+	// `depth-review-2026-10/08` 收进 `view-rules.deriveBookViewFacts`**，现在上面那次调用给出。
+	// 取值口径逐字未变——其中进度详情仍只认「当前这一步」内的 progress（以最近一条 stage-start
+	// 为界：源探查结束进设计关卡后，探查期的通读进度不再残留到「AI 干活中」状态条）。
+
 	// 票 21 · P4：「🔑 还差一步：MinerU Token」这张红卡的清除判据**跟着「转换已成功」走**，
 	// 不再跟着一份开机快照走（`/textbook/settings` 的 `useEffect` 依赖只有 `[session]`，会话内
 	// 从不刷新 ⇒ 卡在转换成功后还挂约 25 分钟，只能靠刷新页面消失）。
@@ -1333,8 +1421,14 @@ export function WorkbenchView(props) {
 	// （`loadError` 从 readiness 派生）。两者共用**同一句** `⚠️ …`，位置与从前一致。
 	const visibleError = (ui) => (ui.error !== null ? ui.error : loadError);
 	// 「有新版可升」那一行。与 visibleError 一样**只在有话说的时候渲染**：`behind` 出句子，
-	// `up-to-date`／`unreadable` 出 null——「已是最新」和「读不到」都不该占用户的眼睛。
-	const updateNotice = updateNoticeText(useUpdateNotice());
+	// `up-to-date`／`ahead`／`unreadable` 出 null——「已是最新」和「读不到」都不该占用户的眼睛，
+	// 「本地比 registry 新」也没有一句对的话可说（见 `updateNoticeText`）。
+	// 「层徽记」是同一处的另一半：跑的不是发布版时出短签（那时上面那句闭嘴，见
+	// `updateNoticeText`）。两者**最多同时出一句**——各自的判据在另一档都返回 null。
+	// 层由构建期注入的**包名**判（版本号两层都是 1.3.x，分不开），判据在 update-notice.js 里。
+	const layer = classifyLayer({ packageName: INSTALLED_PACKAGE, version: INSTALLED_VERSION });
+	const badge = layerBadge(layer);
+	const updateNotice = updateNoticeText(useUpdateNotice(), layer);
 	// 顶栏介入工具条：风格线/留言清单（旧账本 ?? [] 兜底）与面板开关/暂停入口。
 	const styleNotes = (meta?.styleNotes ?? []).filter(
 		(n) => n.status === "active",
@@ -1556,9 +1650,15 @@ export function WorkbenchView(props) {
 						setViewPhase(null);
 						// 开始浏览时记住当前进度序号：这之后 AI 再出的 progress 才算「新进展」（方案 A）。
 						// 事件列表取**同一份 snapshot**（latest ref），不是另存一份副本。
-						const lastProgress = [...(bookRef.current.core.data?.events ?? NO_EVENTS)]
-							.reverse()
-							.find((e) => e.type === "textbook/progress");
+						// ⚠️ 票 `depth-review-2026-10/08`：判据模板（倒着找最后一条某类型事件）与
+						// `view-rules.lastEventOfType` 共用，**但数据源刻意不并进壳级派生**——
+						// 渲染期那份 `deriveBookViewFacts` 读的是**当前这一帧的 `events`**，而这里是
+						// latest ref（可能已经更新）。改读渲染期那份会引入一个真实的时序差异，
+						// 所以「共用判据」不等于「共用数据源」。
+						const lastProgress = lastEventOfType(
+							bookRef.current.core.data?.events ?? NO_EVENTS,
+							"textbook/progress",
+						);
 						progressSeqRef.current = lastProgress?.seq ?? -1;
 						setProgressBanner(false);
 					};
@@ -1572,6 +1672,203 @@ export function WorkbenchView(props) {
 					// 它按「精确步 key → 旧段 key（落该段第一步）→ 回退 meta.phase」的顺序解析，并保住
 					// first-match 语义；Workbench 不再自己 `stepsOf` / `phaseOfSegment` 找一遍。
 					// `browsing` 是**步 key**（票 04）；旧写法（段 key）也认，都认不出才退回 meta.phase。
+					// ── 卡片 props 契约（票 `workbench-card-contract` 02）────────────────────────
+					//
+					// 「这张卡吃什么」写在**卡自己的域文件**里（`src/ui/card-view.js` 的 `defineCardView`），
+					// 壳只负责把「当前这本书 + 接线」递过去。下面这一块**就是**那本书的壳侧视图：焦点区 12 张
+					// 主卡的 props 袋不再由这个文件逐项手抄。
+					//
+					// ⚠️ **为什么不 `useMemo`**：这份袋**每帧重建，这是对的、不是偷懒**。
+					//   · `postAction` 没有 `useCallback`，每帧新引用，且闭包捕获 `projectId`——记忆化一次，
+					//     动作请求就会带上**上一本书**的身份。今天靠「每帧新建」天然免疫，收编后这层免疫消失，
+					//     所以**不许**挂 `useMemo`。
+					//   · `stageStepProjector` 的 `useMemo` 三依赖之一 `runningSubagentCount` 来自宿主会话状态，
+					//     **不在 `book` 里**——`book` 引用没动它就换了身份。
+					//   · `busy` 是 `BookSessionScope` 的**可变** UI state，记忆化会把 12 张卡的置灰冻结在第一次
+					//     渲染的那个值上。
+					// 换句话说「同一个 `View` 上两次取同一 slot 是同一引用」这条记忆化只活在**一次渲染内**，而
+					// 一次渲染本来就只需要它一次。今天每次渲染也是新建一个 props 字面量，逐帧重建因此是
+					// **行为保持**的。
+					//
+					// ⚠️ **键名一律用 book 侧的标识符**——这一列是 `card-view.js` 未知键闸认的那一列。
+					// **一个名字不许两处来源**：两张卡的 prop 名撞车时（`ExploreConfirmCard` 与
+					// `OutlineConfirmCard` 都叫 `onConfirm`，壳里却是两个不同的动作），book 侧用不撞名的键，
+					// 卡侧的 prop 名由那张卡的 `derive` 整形出来。
+					const cardBook = {
+						// ── 书级只读数据（来自 `book` 这份 snapshot 与它的派生）
+						meta,
+						gate,
+						events,
+						checks,
+						aiReport,
+						lastEvent,
+						exploreSummary,
+						knowledgeMapText,
+						// ⚠️ 别漏这一项：阶段页第 3 阶段的章节安排清单吃它，而 `foldOutline` 的 try/catch 会把
+						// 解析失败**吞成 `null`**⇒ 漏传时那张清单静默不渲染，屏上什么异常都看不出来。
+						// （收编时真漏过一次，被卡旁契约那一路抓出来的——见票 02 `## Answer`。）
+						outlineText,
+						// 谈判桌吃它（判「这一稿的检查记录出没出来」＋ 检查徽章）。**机器产物随 payload
+						// 下发**，不走 `/textbook/file`——那条路由对 `工作区/audit-NN.md` 必然 403。
+						goldAuditText,
+						goldDrafts,
+						goldDraftVersion,
+						// ── 壳注入的接线（回调与导航目标，不是界面词）
+						busy,
+						postAction,
+						onDecide: decide,
+						onRollback: rollback,
+						onAddPattern: analyzePattern,
+						onUpload: uploadSource,
+						onConvert: convert,
+						onIdentify: identifyRoles,
+					// ⚠️ 票 `mineru-formats/03`（收编时与本票**并行**落在 main 上，所以这里补登记）：
+					// 材料不齐时上传卡就是那个红的唯一出口——「补传这一份」沿用上传写面但**以缺口那一格
+					// 的名字**落上去，「删掉这一份」走 `source-remove`（只对 `failed` 的那一格开放）。
+					// 另加票 10 的上传前体积预检：`false` = 不许承诺会自动拆。
+					// 这三个是 `uploadAreaView` 收编**之后**才进 `fromBook` 的——只按顶层解构点名会漏掉
+					// `autoSplit`（它由内层组件消费，靠透传）。
+					onReplaceSource: (file, source) =>
+						uploadSource(file, source.role ?? "学生用书", source.file),
+					onRemoveSource: removeSource,
+					autoSplit,
+						onResume: resume,
+						onPreview: previewBook,
+						onApprove: () => {
+							void postAction({ action: "final-approve", approved: true });
+						},
+						onReject: (note) => {
+							void postAction({ action: "final-approve", approved: false, note });
+						},
+						onDeleteStart: () => setDeletingId(projectId),
+						onDeleteConfirm: () => deleteBook(projectId),
+						// ⚠️ 两个「确认」回调**故意不撞名**：两张卡的 prop 都叫 `onConfirm`，指向的却是两个不同
+						// 的动作。合成一个（按 `focusCardKey` 三元挑）等于把一处手对的接线藏进这个文件——那种
+						// 接线错了没人看得见，正是本票要拆的那类静默。
+						confirmExplore,
+						confirmOutline,
+						onViewReport: () => viewWork({ path: "工作区/explore.md", label: "读材料报告" }),
+						fetchText: artifactReader.readText,
+						onSuggestWords: async () => {
+							const guard = projection.capture();
+							const json = await fetchJson("/textbook/action", {
+								method: "POST",
+								headers: { "Content-Type": "application/json", Accept: "application/json" },
+								body: JSON.stringify({
+									action: uiCallable("suggest-words"),
+									session: sessionRef.current,
+									project: projectId,
+									goal: meta.goal,
+									route: meta.route,
+									science: meta.science,
+									chapterCount: (meta.outline?.chapters ?? []).length,
+								}),
+							});
+							// 旧身份的建议不往当前书送（null＝没有建议，与取不到同一条路）。
+							if (!isBookCurrent(guard)) return null;
+							return json.suggestion ?? null;
+						},
+						// ⚠️ 状态卡只问「这一本删了吗」，所以这里给的是**比较后的布尔**，不是 `deletingId`
+						// 原值（那是 `ui` 解构里的 key）。
+						deletingId: deletingId === projectId,
+						// ── 壳已经算好的派生值（原样递下去，不在卡里重算一遍）
+						// ⚠️ **键名是 `needsConfig`、不是壳里那个局部名**：这一位在卡契约里**不**必填
+						//（`statusCardView.required` 只有 meta / onResume），写错键名不会抛、只会让
+						// 状态卡那一行静默空着——所以判据是「袋里的键名」，不是「壳里的变量名」。
+						needsConfig,
+						pendingStageLabel,
+						progressDetail,
+						stall,
+						// ── 产物读取（票 03：地址拼装归 `ui/artifact-read.js`）
+						readArtifact,
+						downloadHref: artifactReader.downloadHref,
+						// ⚠️ 必须是**未过滤**的 `meta.styleNotes`——壳里那个 `styleNotes` 局部量是给
+						// `StylePanel` 用的 active 过滤版，两者不是同一份。
+						styleNotes: meta.styleNotes,
+						// ── 章节卡（`ChaptersCard`）：书级数据 + 三条入账出口的接线
+						chapterStatus,
+						pendingReviews,
+						workFiles,
+					// 票 `deep-module-scan/15`：账本回放列表（`ReplayList`，第 13 个 slot）要的四个键。
+					// ⚠️ `workFilesReady` 这个 prop 名是壳里 projection 的 `work.known` 口径泄漏
+					//   （壳自己的注释就承认过）；随 ReplayList 搬走时改成 `workKnown`。
+					workKnown: workFilesReady,
+					// 展开态是**壳级 state**（回放行跨焦点区与阶段页都在，状态归壳所有）。
+					gateOpen,
+					setGateOpen,
+					// 「打开产物」那个收口（产物判据 → DSH 右栏）。回放行**不新造**第二条打开路径。
+					onViewRow: viewWork,
+						// ⚠️ 壳里写的是 `chapterSegments: processSegs`（`/textbook/process` 的分段事实；票 20
+						// 「谁在写哪一章」与徽章新鲜度都吃它）。book 侧用壳里那个标识符，卡侧由 derive 整形。
+						processSegs,
+						contextPercent,
+						// 票 20：此刻真在跑的小助手有几个（与顶栏「🔎 N 个小助手在跑」同一份读数）。
+						runningSubagentCount,
+						onApproveAll: () => {
+							void postAction({
+								action: "chapters-review-confirm",
+								approved: true,
+							});
+						},
+						// ⚠️ 与源探查那张卡的 `onViewReport` **是两个不同的闭包、两个键**（`工作区/chapter-NN.md`
+						// vs `工作区/explore.md`）。不许合并成一个——那会把一处手对的接线藏进壳里。
+						onView: (n) =>
+							viewWork({
+								path: chapterRel(n),
+								label: `第 ${n} 章`,
+							}),
+						submitReview,
+						// ── 阶段 / 步视图模型（`ProgressOverview` 与 `PhasePage` 共用这一份 projector）
+						// ⚠️ 它**不是**模块级单例：`useMemo` 的三个依赖之一 `runningSubagentCount` 来自宿主
+						// 会话状态，**不在 `book` 里**——`book` 引用没动它就换身份。这也是上面「袋每帧重建」
+						// 那条理由的一半。
+						projector: stageStepProjector,
+						// ── 全览条（`ProgressOverview`）的壳-local 导航接线。
+						// 「没在回看任何一步」是**显式的 null**，不是「键不存在」——卡内高亮判据写的正是
+						// `browsingKey !== null && browsingKey === row.key`，那个 `!== null` 指的就是这一格。
+						browsingKey: browsing,
+						onPickStep,
+						onPickPhase,
+						// ── 阶段页（`PhasePage`）：两个 mount 点共用这一份契约。
+						// ⚠️ 下面这组**原样转发**，一个都不在这里重算——阶段页里那些派生早就是「一次推导」
+						// （`stage-step-model.js` 的 projector，壳里 `useMemo` 建一次、全屏共用）。
+						processToken,
+						// ⚠️ 壳里写的是 `onOpen: openInSidebar`：book 侧用壳里那个标识符，卡侧的 prop 名 `onOpen`
+						// 由 `phasePageView` 的 `derive` 整形。理由：同一个「打开」语义在这份壳里还有别的闭包
+						// （事件行那颗、源探查卡的 `onViewReport`），一个扁平的 book 上撞了名就说不清谁是谁。
+						openInSidebar,
+						// 定点修改与撤销（票 11：两下都**不换屏**，只就地改／就地撤；撤销那一下同理）。
+						onDeepModify: (segKey, note) => {
+							void postAction({ action: "deep-modify", segment: segKey, note });
+						},
+						onDeepUndo: () => {
+							void postAction({ action: "deep-undo" });
+						},
+					};
+					const cardView = createCardView(cardBook, {
+						gate: gatePanelView,
+						explore: exploreConfirmCardView,
+						outline: outlineConfirmCardView,
+						gold: goldTableView,
+						upload: uploadAreaView,
+						status: statusCardView,
+						delivered: deliveryCardView,
+						final: finalApprovalCardView,
+						chapters: chaptersCardView,
+						progressOverview: progressOverviewView,
+						// 第 13 个 slot（票 `deep-module-scan/15`）：账本回放列表。此前那约 230 行
+						// inline createElement 住在壳里，是焦点区之外**唯一一个「吃什么」不在卡旁的
+						// 渲染单元**——同屏 12 张卡都有契约，唯独它没有，于是测试只能各测一头
+						//（`test-component-cards.mjs` 只测三个纯函数，渲染那半从没穿过 interface）。
+						// ⚠️ 它**不是** `focusCardKey` 路由出来的焦点区主卡（回看态才出现的一块），
+						//   但 `card-view.js` 的未登记 slot 守卫照样适用——这正是搬过来的好处：
+						//   「漏登记」当场响，今天不会。
+						replay: replayListView,
+						// 两个 mount 点（浏览态 / 阶段页态）登记**同一个** builder——「这张卡吃什么」
+						// 只此一份，差异那三个键走 `.with({...})`。
+						phasePageBrowse: phasePageView,
+						phasePagePhase: phasePageView,
+					});
 					const viewPhaseOfBrowsing =
 						browsing === null
 							? (meta?.phase ?? 1)
@@ -1585,43 +1882,18 @@ export function WorkbenchView(props) {
 						setViewPhase(n === (meta.phase ?? 1) ? null : n);
 						setBrowsing(null);
 					};
-					// 候选 06：两处 `PhasePage` 接线共享一份 props / 回调。**两个 mount 点保留**（阶段片 →
-					// 浏览态页 → 三个展开面板 → 阶段页态页）——面板夹在两页面点之间，这段 DOM 顺序是
-					// CONTEXT「阶段片」修订③ 与 ADR-0012 末条写下的位置契约，合并渲染点＝可观察行为变化。
-					// 这里只把重复的 props 与回调收进 helper；差异（key / focusedStep / events）仍逐处传。
-					const renderPhasePage = (overrides) =>
-						createElement(PhasePage, {
-							projector: stageStepProjector,
-							// 候选 06 + 票 08：乐观 redo 的清除信号＝**process commit token**
-							// （ADR-0021 决策 15：当前身份 + 成功 + 规范化内容确实变化的那一次
-							// process commit），不是 projector 身份——`meta` 与 `process` 独立到达
-							// （详见 spec「装配与生命周期」），而 stale 的 last-known 也不是新的
-							// server truth，两者都会让「按引用判断」提前清掉标记。
-							processToken,
-							meta,
-							checks,
-							aiReport,
-							knowledgeMapText,
-							outlineText,
-							goldDrafts,
-							goldDraftVersion,
-							onOpen: openInSidebar,
-							busy,
-							onDeepModify: (segKey, note) => {
-								void postAction({ action: "deep-modify", segment: segKey, note });
-								// 票 11（spec §3 热区表「就这么改」那行判"不合法"：入口按钮不得替用户换屏）：
-								// 提交后**不换屏**——留在这一页，被改的那一段就地标成「我正在做」（乐观标记由
-								// `PhasePage` 持有并交给 projection 叠加）。要不要回「现在」由用户自己走阶段片
-								// 「当前阶段」那一格（票 12 已裁：它常驻）。
-							},
-							// 撤销入口（10 分钟窗）在阶段页页脚；它归「刚才那一次定点修改」。
-							// 票 11 复核：这一下同样**不换屏**——撤销也是阶段页上的入口按钮，替用户换屏是同一处违规；
-							// 撤销后那一行由下一份 `/textbook/process` 还原成真实状态。
-							onDeepUndo: () => {
-								void postAction({ action: "deep-undo" });
-							},
-							...overrides,
-						});
+// 票 02：`renderPhasePage(overrides)` 这个局部 helper **随本票退役**。
+// 它是 props 袋分叉逼出来的补丁：两个 mount 点共用 13 项、差异只有三个键，于是壳把重复那
+// 13 项收进一个闭包、把差异当 `...overrides` 摊开——代价是「这张卡吃什么」既不在卡里、也不在
+// 一处看得见的表上，而是散在一个 helper 与两行调用点之间。
+//
+// 现在那 13 项归 `src/ui/phase-page.js` 的 `phasePageView`（**声明在卡自己的文件里**），两个
+// mount 点各自 `cardView.phasePageBrowse` / `cardView.phasePagePhase` 登记**同一个** builder，
+// 差异三项走 `.with({...})`——那三个键登记在契约的 `defaults` 里，所以 `.with` 改得动它们。
+//
+// **两个 mount 点仍保留、位置一动不动**（阶段片 → 浏览态页 → 三个展开面板 → 阶段页态页）：
+// 面板夹在两页面点之间是 CONTEXT「阶段片」修订③ 与 ADR-0012 末条写下的**位置契约**，
+// 合并渲染点＝可观察行为变化。位置由 `test-wording-invariants.mjs` 那组源码级断言钉着。
 						return createElement(
 						"div",
 						{
@@ -1649,12 +1921,7 @@ export function WorkbenchView(props) {
 						// 候选 06：只传 `projector`——抬头 / currentPhaseText / 分组清单全部来自模型的
 						// overview projection，组件不再自己推导（旧的 segments/meta/currentPhase props 已迁）。
 						browsing === null && viewPhase === null
-							? createElement(ProgressOverview, {
-									projector: stageStepProjector,
-									browsingKey: browsing,
-									onPickStep,
-									onPickPhase,
-								})
+							? createElement(ProgressOverview, cardView.progressOverview)
 							: null,
 						// 自动跟随横幅（F5 方案 A）：等拍板强制回「现在」（6 秒自清）；浏览历史时 AI 有新进展（点击清浏览回现在）。
 						awaitBanner
@@ -1765,12 +2032,20 @@ export function WorkbenchView(props) {
 							// 候选 06：阶段片 hover 的「这一步有几份文件」取 overview projection 的
 						// `artifactEntryCountByPhase`（按分段条目累计，与阶段页按路径去重的
 						// `uniqueFileCount` 是**有意不同的两个事实**——不静默统一，见 spec）。
+						// ⚠️ **阶段 1 那一格不吃这一份**：它没有分段，按分段累计恒为 0，于是那一格
+						// 此前恒说「还没有文件」而同屏卡上列着材料（票 walkthrough-2026-10/03）。
+						// 它数的是材料，读数由 `materialCount` 单独给（同一份 projection 里）。
 						artifactCountOf: (n) => stageStepOverview.artifactEntryCountByPhase[n] ?? 0,
+						materialCount: stageStepOverview.materialCount ?? 0,
 							onSelect: phaseBarSelect,
 						}),
 						// 右栏挤压时的一句提示（票 26 / P27 ＋ P37）：**纯提示**，不可点、不发动作、
 						// 不换屏——收起右栏是宿主顶栏那颗按钮的事，本票只指路，布局一个字不动。
-						// 条件＝主区窄于阈值 **且** 右栏开着（判据在 `narrowMainHintShown`，纯函数）。
+						// 条件＝主区窄于阈值 **且** 主区右边**没有顶到视口右边**（判据在
+						// `narrowMainHintShown`，纯函数）。⚠️ 2026-10-06（票 walkthrough-2026-10/08）：
+						// 第二个条件**不是**「右栏开着」的判别者——收起态主区被 `W + 32` 封顶又水平居中，
+						// 右边也留着 144px（见 `chapters-map.js` 里 `SIDEBAR_OPEN_RIGHT_GAP` 的注释）；
+						// 真正的判别者是宽度那一支。
 						// 落点：**阶段片之后**。阶段片是常驻导航面（「回到现在」长在它当前那一格上），
 						// 前面只许站定高小件（smoke-test 2d-3d 的 SMALL_CHROME 白名单），不把它加进去。
 						createElement(NarrowMainHint, {
@@ -1784,10 +2059,15 @@ export function WorkbenchView(props) {
 						// **不再渲染另一套单卡**，改成复用阶段页那一页、并把焦点定在选中的
 						// 那一步——步清单点一步与顶栏点一格从此落到同一种卡。
 						browsing != null
-							? renderPhasePage({
+							? createElement(PhasePage, {
+									// ⚠️ `key` 写在**袋外面**、与它并列：React 建元素时就把 `key` 摘走，
+									// 组件 `props` 上永远没有它——它压根不是这张卡的 props（票 02）。
+									// 换个身份（`seg-${browsing}`）是为了让那棵子树整棵重挂，票 05 的隔离边界靠它。
+									...cardView.phasePageBrowse.with({
+										phase: viewPhaseOfBrowsing,
+										focusedStep: browsing,
+									}),
 									key: `seg-${browsing}`,
-									phase: viewPhaseOfBrowsing,
-									focusedStep: browsing,
 								})
 							: null,
 						// 顶栏 🎨 风格线 / 📮 留言 展开面板（Task 17 常驻入口；点开即见清单，再点或 ✕ 收起）。
@@ -1818,10 +2098,12 @@ export function WorkbenchView(props) {
 						// 阶段页：这一步走到哪、这一阶段有哪几步、每一步产出了哪些文件。
 						// 产物一律由卡片里写着「打开」的按钮交给右栏（导航本身不开文件）。
 						viewPhase !== null
-							? renderPhasePage({
-									phase: viewPhase,
-									events,
-								})
+							? createElement(
+									PhasePage,
+									// ⚠️ 这一处**不传 `key`**：它是「阶段页态」那一屏，身份由 `viewPhase` 决定，
+									// 与浏览态那处不是同一棵子树（浏览态那处带 `key`，切步即整棵重挂）。
+									cardView.phasePagePhase.with({ phase: viewPhase, events }),
+								)
 							: null,
 						// 状态条：spec 不变量 10——回看时不摆"现在"的内容（状态条 / 活性行 /「现在」主卡
 						// 一律收起）。2026-09-22 票 03：旧门控只看 `viewPhase`，于是**浏览态**
@@ -1883,174 +2165,23 @@ export function WorkbenchView(props) {
 							// 焦点区主卡路由（抽成 focusCardKey 纯函数：view-rules.js，可独立测试）。
 							switch (focusCardKey(meta, gate)) {
 								case "gate":
-									return createElement(GatePanel, {
-										gate,
-										onDecide: decide,
-										onRollback: rollback,
-										busy,
-										error: null,
-										onAddPattern: analyzePattern,
-									});
+									return createElement(GatePanel, cardView.gate);
 								case "explore":
-									return createElement(ExploreConfirmCard, {
-										meta,
-										exploreSummary,
-										// 知识地图（机器产物）原文：卡片内联人读清单用它，不再走文件接口。
-										knowledgeMapText,
-										project: projectId,
-										session: sessionRef.current,
-										onConfirm: confirmExplore,
-										onViewReport: () =>
-											viewWork({ path: "work/explore.md", label: "读材料报告" }),
-										busy,
-									});
+									return createElement(ExploreConfirmCard, cardView.explore);
 								case "outline":
-									return createElement(OutlineConfirmCard, {
-										meta,
-										busy,
-										onConfirm: confirmOutline,
-									});
+									return createElement(OutlineConfirmCard, cardView.outline);
 								case "gold":
-									return createElement(GoldTable, {
-										meta,
-										busy,
-										goldDrafts,
-										goldDraftVersion,
-										postAction,
-										onSuggestWords: async () => {
-											const guard = projection.capture();
-											const json = await fetchJson("/textbook/action", {
-												method: "POST",
-												headers: {
-													"Content-Type": "application/json",
-													Accept: "application/json",
-												},
-												body: JSON.stringify({
-													action: uiCallable("suggest-words"),
-													session: sessionRef.current,
-													project: projectId,
-													goal: meta.goal,
-													route: meta.route,
-													science: meta.science,
-													chapterCount: (meta.outline?.chapters ?? []).length,
-												}),
-											});
-											// 旧身份的建议不往当前书送（null＝没有建议，与取不到同一条路）。
-											if (!isBookCurrent(guard)) return null;
-											return json.suggestion ?? null;
-										},
-										// `fetchText`（最佳范例章正文的文件读取）**刻意不加** capture 守卫：
-										// 它由 GoldTable 自己的挂载 effect 发起，而 StrictMode 的 effect 重放
-										// 会立刻退订再重订阅——那一次 generation 推进会让「挂载时 capture 的
-										// 守卫」当场失效，正文就被换成一条错误条。它的落点是 keyed 壳内的
-										// Gold 卡：身份一变那棵子树整棵重挂（票 05 的隔离边界），迟到结果
-										// 压根碰不到新身份，与本票要挡的那件事无关。
-										fetchText: (path) =>
-											fetch(
-												`/textbook/file?${sess()}&project=${encodeURIComponent(projectId)}&path=${encodeURIComponent(path)}`,
-											).then((res) => {
-												if (!res.ok) throw new Error(`HTTP ${res.status}`);
-												return res.text();
-											}),
-									});
+									return createElement(GoldTable, cardView.gold);
 								case "final":
-									return createElement(FinalApprovalCard, {
-										project: projectId,
-										session: sessionRef.current,
-										checks,
-										onPreview: previewBook,
-										busy,
-										meta,
-										aiReport,
-										styleNotes: meta.styleNotes,
-										onApprove: () => {
-											void postAction({ action: "final-approve", approved: true });
-										},
-										onReject: (note) => {
-											void postAction({ action: "final-approve", approved: false, note });
-										},
-									});
+									return createElement(FinalApprovalCard, cardView.final);
 								case "delivered":
-									return createElement(DeliveryCard, {
-										project: projectId,
-										session: sessionRef.current,
-										checks,
-										onPreview: previewBook,
-										busy,
-										meta,
-										aiReport,
-										styleNotes: meta.styleNotes, // 风格线落实清单：从 meta 传入，内部 ?? [] 兜底（旧账本无此字段）
-									});
+									return createElement(DeliveryCard, cardView.delivered);
 								case "chapters":
-									return createElement(ChaptersCard, {
-										meta,
-										chapterStatus,
-										pendingReviews,
-										progressDetail,
-										// 票 28：主 AI 上下文占用（章节清单头部那一句）。null = 读不到，
-										// 组件照此不渲染那一格——不是显示 0%。
-										contextPercent,
-										reviewMode:
-											meta.status === "awaiting-chapters-review",
-										onApproveAll: () => {
-											void postAction({
-												action: "chapters-review-confirm",
-												approved: true,
-											});
-										},
-										onView: (n) =>
-											viewWork({
-												path: `work/chapter-${String(n).padStart(2, "0")}.md`,
-												label: `第 ${n} 章`,
-											}),
-										onReview: submitReview,
-										busy,
-										events, // F17 章级「完成」态推导用（agent-end 事件 → 第N章）
-										workFiles, // F17 「看看这章」置灰用（chapter 文件不在产物清单就禁用）
-									// 票 10 · P47②：章卡上补一句审计新鲜度，与步清单那份「比正文旧，属于旧稿」同源。
-									// 新鲜度是**服务端已判定的事实**（`seg.artifactFacts[].freshness`，出处在
-									// `src/workflow.js` 的 `buildArtifactFacts`），浏览器不拿文件时间自己重算——
-									// 所以这里只把**已经下发的**分段事实透下去，不新增取数通路。
-									chapterSegments: processSegs,
-									// 票 20：此刻真在跑的小助手有几个 —— 「我正在做」与「归属」两处的**同一个**入参。
-									// 与顶栏「🔎 N 个小助手在跑」（`panels.js` 的 ActivityLine，同一份
-									// `subagentRuns.runningCount`）逐字相等，屏上两个数字因此不会打架。
-									runningSubagentCount: runningSubagentCount,
-										project: projectId,
-										session: sessionRef.current,
-										postAction, // F39 过目态内联展开/段级三键
-									});
+									return createElement(ChaptersCard, cardView.chapters);
 								case "upload":
-									return createElement(UploadArea, {
-										sources: meta.sources ?? [],
-										converting: meta.converting === true,
-										conversionStartedAt: meta.updatedAt,
-										events,
-										onUpload: uploadSource,
-										onConvert: convert,
-										onIdentify: identifyRoles,
-										busy,
-									});
+return createElement(UploadArea, cardView.upload);
 								default:
-									return createElement(StatusCard, {
-										meta,
-										lastEvent,
-										events,
-										needsConfig: needsConfigText,
-										onResume: resume,
-										busy,
-										pendingStageLabel,
-										progressDetail,
-										// 票 stale-detection/01：状态卡不再自己算一遍停顿时长、也不再出黄色警告框
-										// 与那颗按钮（那两样归顶上那行活性行——它每个阶段都在，而状态卡只在兜底
-										// 这一支才在）。它消费的**就是活性行那一份判定对象**，只用其中一位来决定
-										// 计时那行说「我正在做」还是只说时长。
-										stall,
-										// F28：error 态删书重来入口——复用既有 deletingId/deleteBook 两步删除机制（与业务头同源）。
-										onDeleteStart: () => setDeletingId(projectId),
-										onDeleteConfirm: () => deleteBook(projectId),
-										deletingId: deletingId === projectId,
-									});
+									return createElement(StatusCard, cardView.status);
 							}
 						})();
 						// 这一层是**纯测量壳**：没有样式、不参与排版之外的任何事（票 24 ①）。
@@ -2063,7 +2194,7 @@ export function WorkbenchView(props) {
 						viewPhase === null
 							? createElement(
 							"div",
-							{ style: { margin: "8px 0" } },
+							{ style: { margin: "8px 0", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" } },
 							createElement(
 								"button",
 								{
@@ -2074,244 +2205,21 @@ export function WorkbenchView(props) {
 									? "▾ 收起之前的过程"
 									: "▸ 之前的过程（点开可回放抽查）",
 							),
+							// 层徽记的落点（票 layer-badge）：这条小条的**右端**。
+							// 位置是按「不让它抢现场」定的，不是按「哪有空位」——原先摆在阶段片下面
+							// 第一行时，一句四十来字的话在窄栏里折成三五行，那不是提示是噪声。
+							// 现在上屏的只有短签，长解释进 `title`（见 layerBadge 的注释）。
+							// 另两条边界写在判据那边：它排在阶段片之后（`smoke-test.mjs` 2d-3d 的
+							// SMALL_CHROME 白名单只管阶段片之前的直接子节点），且只在有书的
+							// 「现在」那一屏有这一条小条——没建书时没有要提醒的现场。
+							badge === null
+								? null
+								: createElement("span", { style: S.smallLink, title: badge.hint }, badge.label),
 						)
 							: null,
-						viewPhase === null && showHistory
-							? collapseConversionRuns(events).map((row) => {
-								// 票 07（P23）：连续的转换进度**聚合成一条**（16 条一模一样的
-								// 「材料转换」占满前 20 行）。聚合**不是丢弃**——`row.events` 留着全部，
-								// 那颗纯展开控件展开后逐条可见。
-								const event = row.event;
-								const isRun = row.events.length > 1;
-								const product = workPathForEvent(event, meta, workFiles);
-									// 票 08（`event-row-entries/spec.md` 决策 8；`workbench-transitions/spec.md`
-									// 不变量 14）：判据认得出候选、但那份文件**还没在产物清单里**的行，
-									// 与「本来就没有候选」的行是两种处境——前者给一行灰字，后者什么都不长。
-									// 判据在 `view-rules.workEntryForEvent`（单一出处）：`blocked` 恒不带
-									// `path`/`label`，所以这里**给不出名字**（决策 8「不起名」在判据层就成立）。
-									// ⚠️ 还没拿到产物清单时（首屏 / 切书后）**不判** `blocked`：那时 `workFiles`
-									// 是空数组，"文件不在清单里"与"清单还没到"不可分，判了就会闪一句假灰字。
-									// 票 08 把这格钉在 `work.known` 上（ADR-0021 决策 11/16）：`known` 恒在
-									// **ready 与 stale** 时为 true——stale 只是这一轮没读到，last-known 清单
-									// 照旧是真的，所以「结果还没生成」在 stale 下**照判**；只有 unknown（还没到）
-									// 与 error（第一次就没到、没有 last-known）不判。
-									const blocked =
-										workFilesReady &&
-										workEntryForEvent(event, meta, workFiles).kind === "blocked";
-									const isGate = event.type === "textbook/gate-proposal";
-									// **这一行就是展开态的键**（`key` 与 `detailOpen` 都取它，只此一处）。
-									// 票 07（`event-row-entries/spec.md` 决策 12；`workbench-transitions/spec.md`
-									// 不变量 2）：不能拿 `event.seq` 当键——真账本里 `seq` **不唯一**
-									// （`restoreSnapshot` 把 `meta.eventCount` 写回 `events.length`、
-									// `deep-modify` 写回 `kept.length`，见 `workflow/engine.js` 与
-									// `workflow/actions/deep-modify.js`，于是同一个 `seq` 在新一轮里被复用：
-									// 一本书里 9 条事件同为 `seq=54`），点一行会连带展开/收起同号的行。
-									// 取 `seq`+`type`+`time` 而不是列表下标：下标是**位置**、不是行的身份——
-									// 工作台每 2s 重取 `/textbook/events`，同一个 WorkbenchView 里还会切书
-									// （`setActiveId`），位置键在重取/切书后会落到"恰好坐在那个位置的另一行"，
-									// 把同一个毛病换个方式复现（跨书泄漏一颗展开态）。同号事件是不同轮次
-									// 写下的，`appendEvent` 恒写新的 `time: Date.now()`，故这个组合在真账本里唯一。
-									const rowKey = `${event.seq}::${event.type}::${event.time}${isRun ? `::run${row.events.length}` : ""}`;
-									const detailOpen = gateOpen === rowKey;
-								// 票 07（P28/P29/P57）：行首（`<strong>`，事件类型词）**一个字没动**——
-								// 硬天花板见 `smoke-test.mjs` 的行首探针（把行首换回 `cardText` 会立刻红）。
-								// 摘要取账本 `data` 里**早就有**的字段（`label`/`reason`/`reasons`/`note`/
-								// `detail`/`text`…），作为行首**之后**的一个 span 追加；没有对应字段的
-								// 类型整格不出（这是渲染缺口，不是采集缺口——不新增任何采集）。
-								const rowSummary = replayRowSummary(row, {
-									converting: meta?.converting === true,
-								});
-								// 票 07（P29）：展开门**按事件类型放开**——原来只认提案行（`isGate`），
-								// 于是「交工被拒 / 出错 / 拍板驳回 / 提示」那几行彻底惰性（行内按钮数 0、
-								// `cursor: auto`、无兄弟节点＝不是折叠了，是不可点、看不全）。
-								// 判据：**摘要之外还有全文**才长那颗纯展开控件（纯展开收起热区，不发动作、
-								// 不开右栏）——没有全文的行（阶段开始、豁免放行…）一个控件都不长，
-								// 不摆死按钮，也不撞「同一排可点性一致」。
-								const rowFull = replayRowDetail(row);
-								const expandable =
-									!isGate && rowFull !== "" && rowFull !== rowSummary;
-								const toggleLabel = isRun
-									? `▸ 看 ${row.events.length} 条进度`
-									: "▸ 看详情";
-									// 「查看中」高亮不做了：产物现在开在 DSH 右栏（那份内容不经过本组件，
-									// 工作台也无从知道用户关没关它），硬留一个对不上的状态反而骗人。
-									return createElement(
-										"div",
-										{
-											key: rowKey,
-											// 票 06（`event-row-entries/spec.md` 决策 7；`workbench-transitions/spec.md`
-											// 不变量 2）：**整行不可点**。原来这条行挂着一个容器级 `onClick`，把
-											// 「开产物 / 展开提案」两个身份缝在同一条行上、还带 `cursor: pointer` 的
-											// 可点暗示——一个热区只干一件事，行里从此只留行内显式控件（下面那两颗按钮：
-											// 提案行的「▸ 提案详情 / ▾ 收起」与有产物行的「打开」）。
-											style: S.card,
-										},
-										createElement(
-											"div",
-											null,
-											createElement("span", null, cardIcon(event)),
-											" ",
-											// 票 06（`event-row-entries/spec.md` 决策 10「名字由客户端出」；
-											// `workbench-transitions/spec.md` 不变量 7「UI 不渲染服务端 label」）：
-											// 行首只出**客户端词表**的事件类型词：`EVENT_UI`（界面覆盖）优先、
-											// `EVENT_META.label`（双端含义表）兜底。
-											// ⚠️ 兜底与 `cardText` 的 `default:` 分支**并不逐字相同**（2026-09-23 代码审查
-											// 修正了这里原先"同源"的说法）：`cardText` 最后退回 `event.type`，这里退回
-											// 空串。差别只在**未登记的类型**上——`EVENT_META` 是账本事件类型的契约表
-											// （服务端按 `EVENT_TYPES` 校验），真账本走不到那一支；真走到了，宁可
-											// 这一格不出词，也不把 `textbook/xxx` 这种机器串摆到人眼前
-											// （与不变量 7 同一取向：界面不露机器身份词）。
-											createElement(
-												"strong",
-												null,
-												eventHuman(event.type, EVENT_META[event.type]?.label ?? ""),
-											),
-											// 票 07（P28/P11/P57）：摘要**追加在行首之后**（不是把行首换掉——那是
-											// `smoke-test.mjs` 行首探针守着的硬天花板）。内容取账本 `data` 里早有
-											// 的字段：驳回理由、交工被拒的原因、机器兜底拦下了什么、进度叙述、提示
-											// 正文……截断到与行文本上限同口径；没有对应字段的类型整格不出
-											// （渲染缺口，不是采集缺口——本票不新增任何采集）。
-											rowSummary !== ""
-												? createElement(
-														"span",
-														{
-															style: {
-																marginLeft: "8px",
-																opacity: 0.82,
-																fontSize: "12px",
-															},
-														},
-														rowSummary,
-													)
-												: null,
-											// 票 07（`event-row-entries/spec.md` 决策 7；`workbench-transitions/spec.md`
-											// 不变量 2）：行内那颗**纯展开**控件——只干一件事（改展开态），
-											// **不发动作、不开右栏**。它与同行的「打开」是"两个控件、各一个身份"
-											// （整块热区里嵌行内控件合法），不是"同一热区两个身份"。
-											// 必须是真 `<button>` 且文字挂在**第一个文本子节点**上：按文本找按钮的
-											// 辅助件只认这个形状（`assertion-plan.md` §2「findButton」）。
-											// 提案行照旧说「▸ 提案详情」；其余**有全文**的行说「▸ 看详情」/「▸ 看 N 条
-											// 进度」——票 07 把展开门从"只认提案行"按事件类型放开（判据见上面
-											// `expandable` 那几行）。热区身份＝**纯展开收起**（不变量 2）。
-											isGate || expandable
-												? createElement(
-														"button",
-														{
-															style: { ...S.smallLink, marginLeft: "10px" },
-															onClick: () =>
-																setGateOpen(detailOpen ? null : rowKey),
-															// 悬浮提示只说这颗控件干的那一件事（不变量 12：文案不承诺没有
-															// 机制的）——说「详情」不说「全文」。
-															title: detailOpen
-																? "收起这一条的详情"
-																: isGate
-																	? "就地展开这份提案的详情（不打开右栏）"
-																	: "就地展开这一条的详情（不打开右栏，也不发动作）",
-														},
-														detailOpen
-															? "▾ 收起"
-															: isGate
-																? "▸ 提案详情"
-																: toggleLabel,
-													)
-												: null,
-											product !== null
-												? createElement(OpenArtifactButton, {
-														// 票 02 导出的同一颗按钮（spec 决策 9：不新造控件）。
-														// 名字取**客户端按路径判**的 `artifactName`（票 05）：不读服务端
-														// label、不把路径原文摆上屏；悬浮提示同源——按钮内部自己按
-														// `artifactName(item.path)` 拼（票 06 第 5 条：不另造第二套提示语）。
-														item: product,
-														label: `${artifactName(product.path)} 打开`,
-														// 只开这一个：交给既有收口 `viewWork`（产物判据 → DSH 右栏），
-														// 不在事件行里另写第二条打开路径。
-														onOpen: () => viewWork(product),
-													})
-												: blocked
-													? // 票 08（决策 8）：**灰字，不是灰按钮**。三条理由（spec 原文）：
-														// ①不可点的控件摆进可点那一列会撞不变量 2 的「同一排可点性一致」；
-														// ②它要给**还不存在的产物**起名字，与「产物名」口径别扭；
-														// ③真账本上这事只发生在一本书、而且是同一对控件重复 195 次。
-														// `<span>` 不是 `<button>`＝不进热区、不参与点击、不发动作。
-														createElement("span", { style: S.hint }, "结果还没生成")
-													: null,
-											createElement(
-												"span",
-												{
-													style: {
-														float: "right",
-														opacity: 0.6,
-														fontSize: "12px",
-													},
-												},
-												formatTime(event.time),
-											),
-										),
-										isGate
-											? detailOpen
-												? createElement(
-														"div",
-														{
-															style: {
-																marginTop: "6px",
-																fontSize: "12px",
-																opacity: 0.9,
-															},
-														},
-														createElement(
-															"p",
-															{ style: { margin: "0 0 4px" } },
-															event.data?.summary ?? "",
-														),
-														(event.data?.detail ?? "") !== ""
-															? createElement(
-																	"pre",
-																	{
-																		style: {
-																			whiteSpace: "pre-wrap",
-																			wordBreak: "break-word",
-																			background: "var(--dsw-alias-bg-layer-1)",
-																			borderRadius: "6px",
-																			padding: "8px",
-																			fontSize: "12px",
-																			margin: "4px 0 0",
-																		},
-																	},
-																	event.data.detail,
-																)
-															: null,
-													)
-												: (event.data?.summary ?? "") !== ""
-													? createElement(
-															"div",
-															{ style: { marginTop: "6px", opacity: 0.85 } },
-															event.data.summary,
-														)
-													: null
-											: null,
-										// 票 07（P29）：非提案行的展开态——给的是这一行的**全文**
-										// （驳回理由原文 / 交工被拒的原因 / 机器兜底那条 / N 条转换进度…）。
-										// 纯展开收起：只改这一行的可见性，不发动作、不开右栏、不换屏。
-										expandable && detailOpen
-											? createElement(
-													"pre",
-													{
-														style: {
-															whiteSpace: "pre-wrap",
-															wordBreak: "break-word",
-															background: "var(--dsw-alias-bg-layer-1)",
-															borderRadius: "6px",
-															padding: "8px",
-															fontSize: "12px",
-															margin: "4px 0 0",
-														},
-													},
-													rowFull,
-												)
-											: null,
-									);
-								})
-							: null,
+					viewPhase === null && showHistory
+						? createElement(ReplayList, cardView.replay)
+						: null,
 						// 「📄 第一步 · 材料准备」那张抽屉已并入阶段页（点阶段片第 1 格 ＝ 那一步的页面，
 						// 摆材料清单与转换状态）；现场的上传卡仍在（当前阶段那格＝回到现在）。
 						// 抽屉的唯一入口正是阶段片第 1 格，入口改道后它成了不可达的死代码，故删除。
@@ -2430,12 +2338,35 @@ export function WorkbenchView(props) {
 		//   h = min(40px, (列宽 - W) / 2 - 48px)   左带 = [中心 - W/2 - 24 - h, 中心 - W/2 - 24]
 		//   右带 = [中心 + W/2 + 24, 中心 + W/2 + 24 + h]
 		// ⇒ 水平居中的工作台只要 `总宽 ≤ W + 48` 就整体落在带外。
-		// ⚠️ 这里的 `20px` 是票 04「待定的一个数」：**不是**闭式的 48。真机量到的严格上限是 718
-		//   （= W 下限 680 + 48 − 10px 滚动条槽），票面建议取 700 留余量 ⇒ 余量取 20
-		//   （680 + 20 = 700）。因为 W 的下限是宿主 clamp 写死的 680，`W + 20 ≤ W + 48` 恒成立，
-		//   **无论用户把正文宽度拖到哪一档，这个约束都不会失效**。真机核过之后再钉死这个数，
-		//   届时只改这一行。
-		maxWidth: "calc(var(--dsh-chat-content-width, 680px) + 20px)",
+		// ⚠️ 这里的 `20px`（下面两条之一）是票 04「待定的一个数」：**不是**闭式的 48。真机量到的
+		//   严格上限是 718（= W 下限 680 + 48 − 10px 滚动条槽），票面建议取 700 留余量 ⇒ 余量取 20。
+		//   ⚠️⚠️ **它与「下面那两条」已于 2026-10-05 一起作废**（票 16）：只写上限不写下限，
+		//   整条是空转的。留着上面这几行只为交代**为什么这里会有一个宽度上限**——
+		//   手柄几何闭式与票 04 的来历见下一段与那份契约快照。
+		//
+		// ── 票 16（工作台宽度不跟随对话框宽度）· 2026-10-05 ──────────────────────
+		// ⚠️ 上面那个「待定的一个数 20」**到此作废**，连同它想解决的那个空转：只留
+		// `max-width` 的时候，宿主把工作台挂在 `.wSkVaW_viewArea`
+		// （`display:flex; flex-direction:column`）里，而**跨轴 auto 外边距会取消 flex 项的
+		// `align-self:stretch`** ⇒ 工作台退回 shrink-to-fit，实际宽度 =
+		// `min(内容的 max-content, W + 20)`。用户原话「页面的宽度在流程进行中老变，并不是
+		// 跟着输入框的宽度来的」就是这一条：内容窄的那一屏（材料准备）≈510px，报告宽的那一屏
+		// （交付）≈930px，**两屏的天花板一模一样**（票 16 的决定性证据）。
+		//
+		// 修法：**取宿主的输入框那一套宽度变量**，不自己重算——
+		//   输入框本体 = `.pXSMma_stack{width:100%; max-width:var(--dsh-composer-card-max-width)}`
+		//     装在 `.uV2eYG_root{padding:0 var(--dsh-composer-side-clearance) 4px}` 里
+		//   ⇒ 输入框宽 = `min(列宽 − 2×clearance, W + 32)`
+		// 下面这两条逐字就是那个式子（变量与宿主快照见
+		// `docs/reference/dsh-chat-width-handle-geometry-contracts.md` §2b/§5）：
+		//   `width`   —— **下限**：没有它就还是 shrink-to-fit，票 16 原样复发；
+		//   `maxWidth`—— 换成宿主给输入框用的那条（W+32），工作台与输入框于是同宽、同中心线。
+		// ⚠️ `W + 32 ≤ W + 48` 恒成立 ⇒ 票 04 承诺的「不落进那两条透明手柄带」**仍然成立**；
+		//   而且工作台到带沿的余量（8px）与输入框**一模一样**——两者一起被手柄让开。
+		// ⚠️ 读数不到时回落到 `680 + 32 = 712`：那是一条**稳定的**宽度（不再随内容变），
+		//   退化方向是安全的。要重新摘这两个变量时改这里 + 那份契约快照（两处一起改）。
+		width: "calc(100% - 2 * var(--dsh-composer-side-clearance, 16px))",
+		maxWidth: "var(--dsh-composer-card-max-width, 712px)",
 		marginInline: "auto",
 	};
 	if (meta === null || loading) {

@@ -20,6 +20,7 @@ import {
   deepAffected,
   dshHome,
   foldGate,
+  flushMeta,
   gateApproved,
   goldN,
   handoff,
@@ -34,11 +35,13 @@ import {
   readEvents,
   readMeta,
   readRegistry,
-  sendJson,
+  isRunning,
   snapshotsDir,
   sourcesDir,
   trashProject,
   waived,
+  bookRelOnDisk,
+  legacyDirConflicts,
   workDir,
   workFile,
   updateMeta,
@@ -53,11 +56,13 @@ import { actCollabSignals } from './workflow/actions/collab-signals.js'
 import { actChapters, readChapterAuditSummary } from './workflow/actions/chapters.js'
 import { actPatternsOps } from './workflow/actions/patterns-ops.js'
 import { buildActionFamilyTable } from './workflow/registration.js'
+import { runAction } from './workflow/action-runner.js'
+import { bookShapeReport, refreshArtifactRegistry } from './workflow/book-shape.js'
 import { readFileSync, readdirSync, writeFileSync, existsSync, statSync, mkdirSync, renameSync, rmSync, realpathSync } from 'node:fs'
 import { join, resolve, basename } from 'node:path'
 import { isWithin } from './path-guard.js'
-import { readSettings } from './mineru-lib.js'
-import { MAX_UPLOAD_BYTES, uploadTooLargeMessage, productOpenMode, artifactKind, SEGMENT_PHASE, countHanzi, contextOccupancyPercent, ROLES, guessRoleFromName } from './domain-rules.js'
+import { readSettings, autoSplitAvailable } from './mineru-lib.js'
+import { MAX_UPLOAD_BYTES, uploadTooLargeMessage, productOpenMode, artifactKind, SEGMENT_PHASE, countHanzi, contextOccupancyPercent, convertedState, ROLES, guessRoleFromName, isAcceptedMaterialFormat, unsupportedMaterialFormatMessage, chapterRel, chapterName } from './domain-rules.js'
 
 
 export const name = 'textbook-workflow'
@@ -65,9 +70,42 @@ export const name = 'textbook-workflow'
 // 回答：`sessionProjections`（宿主 `contextPressure` 会话投影的读数口，票 walkthrough-fixes/28）。
 // 没有它，领任务说明里那一句「上下文已用 N%」就永远不出现（读数口未绑定 ⇒ null ⇒ 整句不追加，
 // 读不到就不显示，不显示 0%）——而不是写一个假数。
-export const inject = ['webServer', 'agents', 'subagents', 'sessions', 'sessionProjections']
+// 票 `chapter-audit-orchestration/04` 再加 `jobs`：暂停要停掉这本书 owner 名下**在跑的编排脚本**
+// （消费点 `ctx.jobs.list` / `ctx.jobs.kill` 在 `src/workflow/actions/collab-signals.js`）。
+// 它是宿主组合里的**常驻服务**（`@deepseek-ai/dsh-base` 的 `cordis.patch.yml` 在宿主组合里加载
+// `dsh-jobs-local`，`ctx.jobs` 由那一份的实现声明合并进来）⇒ 走直接成员访问，不进动态读取登记表。
+// 按 AGENTS.md「用谁就声明谁」：声明在 `dev/host-contract-gate/catalog/web-chat.js` 的
+// `contracts.session.source.hostServiceInjection.required` 里，拿掉这一枚会判红 `undeclared-host-service`。
+export const inject = ['webServer', 'agents', 'subagents', 'sessions', 'sessionProjections', 'jobs']
 
 const SESSION_ID_RE = /^[A-Za-z0-9._-]{1,128}$/
+
+
+/**
+ * 写一次 JSON 响应 —— **HTTP adapter**（字节与 header 归它，状态落盘不归它）。
+ *
+ * ⚠️ 票 `deep-module-scan/11`：这个函数原先住在 `src/workflow/engine.js`，于是**一条领域不变量
+ * （状态必须在工作单元结束时落盘）的 owner 是住在领域 module 里的 HTTP adapter**。
+ * 后果是每一条**不经 HTTP 的路径**都得自己记得调 `flushMeta()`——今天有 9 处测试在替生产代码记这件事
+ * （`test-material-gap-stance.mjs` 七处、`test-ledger-seq-integrity.mjs` 两处）。
+ *
+ * ⇒ 本次是**纯搬运**：43 个调用点**全部**在本文件里，engine 里一处都不用，所以搬完是一处不漏的机械移动。
+ * **搬动的机械条件正是那 43 个调用点都在这里**——若哪天某个动作族开始直接用它，得先想清楚那是
+ * 「不经 HTTP 的领域路径」（该自己 flush，不该用这个）还是「又多了一个 HTTP adapter」。
+ */
+function sendJson(res, status, value) {
+  // 元数据批量落盘边界：任何 HTTP 响应前把待写 project.json 同步写盘，
+  // 外部读者（工作台/测试直读）始终看到最新状态（与旧同步写语义一致）。
+  // ⚠️ **顺序不许调**：flushMeta 在 writeHead 之前。换了顺序，`test-startup-recovery.mjs:297-303`
+  // 那种「返回瞬间文件可能还是旧值、轮询等 flush」的假设要重新验。
+  flushMeta()
+  const body = JSON.stringify(value)
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+  })
+  res.end(body)
+}
 
 
 /**
@@ -187,8 +225,8 @@ function readRawBody(req) {
 }
 
 
-/** POST /textbook/upload?session=&project=&name=&role= （raw body = PDF 字节） */
-async function handleUpload(req, res) {
+/** POST /textbook/upload?session=&project=&name=&role= （raw body = 原件字节；后缀闸门见下） */
+async function handleUpload(ctx, req, res) {
   const url = new URL(req.url, 'http://localhost')
   const sessionId = requireSession(url.searchParams.get('session'), res)
   if (sessionId === null) return
@@ -201,8 +239,13 @@ async function handleUpload(req, res) {
     sendJson(res, 400, { ok: false, error: '缺少或非法的 project 参数' })
     return
   }
-  if (name === null || name.trim() === '' || !/\.pdf$/i.test(name)) {
-    sendJson(res, 400, { ok: false, error: '请选择 PDF 文件（.pdf）' })
+  // ⚠️ 票 07：受理闸门与 400 文案**都从 `MATERIAL_FORMATS` 派生**（`src/domain-rules.js`），
+  // 浏览器那个 `<input accept>` 由**同一份**常量派生——两侧不许各写一份（照 `ROLES` /
+  // `MAX_UPLOAD_BYTES` 的先例）。原来这里是 `!/\.pdf$/i.test(name)` 一行手抄的后缀，
+  // 改名单时它会**静默**留在原地（前端放行、后端拒收，或反过来）。
+  // 名单里的多数格式（图片 / Office）上游只有散文声明、零成功记录 ⇒ 那一格在界面上标「未标定」。
+  if (name === null || name.trim() === '' || !isAcceptedMaterialFormat(name)) {
+    sendJson(res, 400, { ok: false, error: unsupportedMaterialFormatMessage() })
     return
   }
   // 素材角色是**封闭五分类**（CONTEXT.md「素材角色」/ ADR-0023 决策 1）。原先这一格是裸取查询串：
@@ -236,6 +279,7 @@ async function handleUpload(req, res) {
     // 记进了账本——原先拿着函数开头那份旧状态整份写回，会把账高打回读请求体之前的旧值，
     // 于是同一拍的下一次上传重号（真账本头六笔 source-added 序号全是 1，票 02）。
     let added = false
+    let resent = false
     updateMeta(project, (state) => {
       const sources = state.sources ?? []
       // 幂等：同一文件名重复上传只更新角色，不再追加条目/事件。
@@ -244,15 +288,36 @@ async function handleUpload(req, res) {
       const existing = sources.find((source) => source.file === safeName)
       if (existing !== undefined) {
         existing.role = role
+        // 票 `mineru-formats/03`（ADR-0028 决策 3）的**「补传」那一半**：同一个名字再传一次，
+        // 而那一格正是一个缺口（`failed`）⇒ 这是用户对这一份表过态「我补一份」，把它放回
+        // `'pending'`，下一轮状态机真的会重转它（`failed` 自己不会被挑中重传，票 02）。
+        // ⚠️ 只对 `failed` 放行：转成过的那份（`ok`）重传**不动**它的结局——那是另一个问题
+        // （原件换了、转换稿还是旧的），不在本票射程里，票面 Comments 记着。
+        // 顺手清掉旧的转换稿路径：那一格要重新转，旧的 `md` 留着就是一处会指向过期文件的指针。
+        if (convertedState(existing) === 'failed') {
+          existing.converted = 'pending'
+          delete existing.md
+          resent = true
+        }
       } else {
-        sources.push({ file: safeName, role, converted: false })
+        sources.push({ file: safeName, role, converted: 'pending' })
         added = true
       }
       state.sources = sources
       state.status = 'active'
+      // 补传的那一格是「待转」，不是「已转」——状态得让状态机能接上去（见下面那次 kick）。
+      if (resent) state.status = 'running'
     })
     if (added) appendEvent(project, 'textbook/source-added', { file: safeName, role })
-    sendJson(res, 200, { ok: true, project, file: safeName, role })
+    if (resent) appendEvent(project, 'textbook/hint', { text: `已补传《${safeName}》，正在重新转换这一份` })
+    // 补传要**当场**接上状态机：用户点的是「补传这一份」，点完就该看着它重转，
+    // 而不是还得再点一次「开始转换」才动（那就不是一个动作，是两步）。
+    // ⚠️ 已经有一个状态机在跑时**不**再起第二个：那一轮每轮都重读 meta，下一次循环自己
+    // 就把这一格 pending 挑去转了；两个 runLoop 并跑会把同一批待转源重复提交给 MinerU
+    // （烧额度）。「有没有在跑」经 `isRunning` 取（票 `deep-module-scan/10`：原先两处各读一次
+    //  `runners.has`、含义只活在各自的注释里；`runners` 本身仍导出，因为删书要清理它）。
+    if (resent && ctx !== undefined && isRunning(project) === false) void kick(ctx, project)
+    sendJson(res, 200, { ok: true, project, file: safeName, role, resent })
   } catch (error) {
     const tooLarge = error?.code === BODY_TOO_LARGE
     sendJson(res, tooLarge ? 413 : 500, {
@@ -293,7 +358,11 @@ function handleFile(req, res) {
   try {
     assertSessionOwned(project, sessionId)
     const root = resolve(projectDir(project))
-    const target = resolve(root, rel)
+    // ⚠️ **老书读侧兜底**：传上来的是**规范形状**（`工作区/chapter-01.md`），而老书盘上是老名那一份
+    // ——`bookRelOnDisk` 负责这一步「新名 → 盘上真落点」。
+    // ⚠️ **越界判定不许因此放松**：它返回的那一条照样过下面两道 `isWithin`（符号链接那道也在），
+    // 兜底只许在**书夹之内**的老名段上生效，不许变成一条绕过越界判定的旁路。
+    const target = bookRelOnDisk(project, rel)
     if (!isWithin(root, target)) {
       sendJson(res, 403, { ok: false, error: '路径越界' })
       return
@@ -346,7 +415,7 @@ function handleWork(req, res) {
           if (chapter !== null) label = `第 ${Number(chapter[1])} 章`
           else if (audit !== null) label = `第 ${Number(audit[1])} 章·机器自查`
         }
-        if (label !== null) files.push({ path: `work/${name}`, label })
+        if (label !== null) files.push({ path: `工作区/${name}`, label })
       }
     }
     files.sort((a, b) => a.path.localeCompare(b.path))
@@ -404,7 +473,7 @@ function handleDownload(req, res) {
  * 渲染的是 `dsh-tool-ask-user`（工具名 `ask_user_question`）的 schema。答案**本来留痕了**，
  * 只留在宿主会话档案里；书账本里查不到，那才是这一票要补的通路。
  *
- * **为什么是新端点而不是新动作**：契约面动作目录（`src/contract-actions.js`）的 43 个规范动作里
+ * **为什么是新端点而不是新动作**：契约面动作目录（`src/contract-actions.js`）的 45 个规范动作里
  * 没有任何一个的语义是「记下用户答了什么」——硬套 `intervene`（留言）会让账本说「稍后处理」，
  * 而用户答完那一刻 AI 正在等这个答案，说法就是假的。动作身份归目录，目录不归本票改。
  *
@@ -507,7 +576,8 @@ const HANDLER_OF_FAMILY = new Map([
 const ACTION_FAMILY_OF = buildActionFamilyTable(HANDLER_OF_FAMILY)
 
 
-/** POST /textbook/action 动作分发 */
+/** POST /textbook/action 动作分发 —— **HTTP adapter**（读流、限体、写响应）。
+ *  判据全在下面那个 `dispatchAction` 里，这里只负责传输那一层。 */
 async function handleAction(ctx, req, res) {
   let body
   try {
@@ -519,24 +589,65 @@ async function handleAction(ctx, req, res) {
     })
     return
   }
+  // ⚠️ I2 · 回包 ≠ 落盘：`dispatchAction` 不调 flushMeta，落盘边界就在下面这次 sendJson 里
+  // （`test-material-gap-stance.mjs` 直接 import flushMeta 7 处，那条路径不经 HTTP）。
+  // ⚠️ `reply === undefined`＝这个族没有这个动作的 case：照旧什么都不写
+  // （今天 handler 掉出 switch、socket 挂着；改成回 400 是行为变化）。
+  const reply = await dispatchAction(ctx, body)
+  // 「实际有什么」那一份：**机器每次动作扫盘写回**登记（票 `context-budget/10`）。
+  // ⚠️ 写在动作漏斗这一层而不是读通道：工作台 2 秒轮询一次 `/textbook/process`，
+  // 放读通道等于每两秒写一次盘。⚠️ 只在有书且动作真落过盘时才扫；被拒的请求（400/409）
+  // 不扫——盘上什么都没变，重扫一遍只是白写。
+  if (reply !== undefined && reply.status < 400 && typeof body?.project === 'string' && PROJECT_ID_RE.test(body.project)) {
+    try { refreshArtifactRegistry(body.project) } catch { /* 登记是派生件，写不进去不许拖垮动作 */ }
+  }
+  if (reply !== undefined) {
+    sendJson(res, reply.status, reply.json)
+  }
+}
+
+
+/**
+ * **动作层 interface**：打一个规范动作，拿一个应答。传输不在这个 interface 上——
+ * 它不碰 `req`/`res`，只认「一次动作请求」与「一次应答」这一对形状。
+ *
+ * 与 `handleAction` 的关系：`handleAction` 是它上面的 **HTTP adapter**（读流、限 64MB、
+ * 写状态码与 header、触发 `flushMeta` 落盘边界）；本函数是 seam 本身。
+ *
+ * ⚠️ **本函数不导出，ADR-0003 决策 4 原样保持**：「动作族 handler 不对测试单独导出——
+ * 现有 mkReq/mkRes fakes 是唯一的第二 adapter」。票 03 第 4 步曾把它导成测试面
+ * （`test-session-title.mjs` 不再造假件），code-review 双轴后**已撤回**（票 03 · 裁决）：
+ * 那条路要额外付一个定时器隐患 + 一个与票面不符的入口位置，换来的只有 0.4 秒。
+ * ⇒ 测试要调动作层，**仍然自己造 mkReq/mkRes**。
+ *
+ * ⚠️ **返回 `{status, json}`，不写任何响应**——所以**盘面还没落盘**
+ * （落盘边界在 `sendJson` 里，见 I2）。
+ *
+ * @param {object} ctx 宿主上下文（与 `apply(ctx)` 收的是同一个形状）。
+ * @param {{action:string, session?:string, project?:string}} request 解析后的请求体本体。
+ * @returns {Promise<{status:number, json:object}|undefined>}
+ */
+async function dispatchAction(ctx, request) {
+  const body = request ?? {}
   const { action, project } = body
-  const sessionId = requireSession(body.session, res)
-  if (sessionId === null) return
+  const sessionId = sessionOf(body.session)
+  if (sessionId === null) {
+    return { status: 400, json: { ok: false, error: '缺少或非法的 session 参数' } }
+  }
   if (typeof action !== 'string' || action === '') {
-    sendJson(res, 400, { ok: false, error: '缺少 action' })
-    return
+    return { status: 400, json: { ok: false, error: '缺少 action' } }
+  }
+  const family = ACTION_FAMILY_OF.get(action)
+  if (family === undefined) {
+    return { status: 400, json: { ok: false, error: `未知动作: ${action}` } }
   }
   try {
-    // 未知动作与旧 default 同文案（对外接口零变化）。
-    const family = ACTION_FAMILY_OF.get(action)
-    if (family === undefined) {
-      sendJson(res, 400, { ok: false, error: `未知动作: ${action}` })
-      return
-    }
-    await family(ctx, req, res, action, sessionId, project, body)
+    const reply = await runAction(family, { ctx, action, sessionId, project, body })
+    // 与 handleAction 同一句：没有这个 case 就照旧什么都不写（这里返回 undefined）。
+    return reply
   } catch (error) {
     ctx.logger.warn(`textbook: action ${action} failed: ${String(error)}`)
-    sendJson(res, 500, { ok: false, error: String(error instanceof Error ? error.message : error) })
+    return { status: 500, json: { ok: false, error: String(error instanceof Error ? error.message : error) } }
   }
 }
 
@@ -574,7 +685,8 @@ function handleEvents(req, res) {
     const goldMeasuredChapter = goldN(meta)
     let goldMeasuredHanzi = null
     try {
-      const goldPath = workFile(project, `chapter-${String(goldMeasuredChapter).padStart(2, '0')}.md`)
+      // ⚠️ 这里要的是**基名**：`workFile` 自己拼 `工作区/`，给它相对路径会变成 `工作区/工作区/chapter-NN.md`。
+      const goldPath = workFile(project, chapterName(goldMeasuredChapter))
       if (existsSync(goldPath)) goldMeasuredHanzi = countHanzi(readFileSync(goldPath, 'utf8'))
     } catch { /* 还没产出正文时留 null，不编数字 */ }
     const metaView = {
@@ -610,7 +722,7 @@ function handleEvents(req, res) {
       const kmText = readFileSync(workFile(project, 'knowledge-map.json'), 'utf8')
       knowledgeMap = kmText
       const km = JSON.parse(kmText)
-      const converted = (meta.sources ?? []).filter((source) => source.converted === true).length
+      const converted = (meta.sources ?? []).filter((source) => convertedState(source) === 'ok').length
       exploreSummary = {
         sources: converted,
         knowledgePoints: Array.isArray(km.knowledgePoints) ? km.knowledgePoints.length : 0,
@@ -618,23 +730,45 @@ function handleEvents(req, res) {
         teachingFocus: Array.isArray(km.teachingFocus) ? km.teachingFocus.slice(0, 5) : [],
       }
     } catch { exploreSummary = null }
-    // 章节安排原文（`work/outline.md`）：**内容是机器 JSON**，判 `'inline'` 不开右栏
+    // 章节安排原文（`工作区/outline.md`）：**内容是机器 JSON**，判 `'inline'` 不开右栏
     // （票 pipeline-wiring-gaps/09），人读形态是阶段页第 3 阶段那张就地折叠清单
-    // （`chapters-map.foldOutline`）。同知识地图：随事件一起下发，文件读不到时为 null。
+    // （`machine-product-folds.foldOutline`）。同知识地图：随事件一起下发，文件读不到时为 null。
     let outlineText = null
     try {
       outlineText = readFileSync(workFile(project, 'outline.md'), 'utf8')
     } catch { outlineText = null }
+    // 当前范例章的**检查记录原文**（`工作区/audit-NN.md`）：同样是「机器产物但有人读」——
+    // 内容是**严格 JSON**，`productOpenMode` 判 `'machine'`（ADR-0010 决策 2），所以
+    // `/textbook/file` 对它是**明确 403**（那条路由只放行 `'preview'`）。
+    // ⚠️ **病**（票 `gold-finalize-blocked/01`，2026-02-11 真机《抑郁患者自救》）：谈判桌那张卡
+    // 就是拿 `/textbook/file` 去读它的，于是**每一次请求都必然 403** ⇒ 卡永远停在「展示期」、
+    // 「定稿」「重写」两颗键永远灰、**刷新无效**（那不是缓存问题，是每次都失败），
+    // 书卡在第三阶段出不去。从别的入口（AI 工具 `gold-approve`）定稿却能成——两侧口径不一致。
+    // ⇒ 与上面两份走**同一条既有路**：随 payload 下发，前端不再经那条路由读它
+    // （人读形态由谈判桌的检查徽章 ＋ 那句 fact line 承担）。
+    // 读不到（还没落盘／读失败）时为 `null`——正好落进前端三态里的「没有／读不到」那一格。
+    // ⚠️ 文件名形状与 `:901`／`:928` 那两处逐字同款（`audit` 族同一个补两位序号契约）。
+    let goldAudit = null
+    try {
+      goldAudit = readFileSync(workFile(project, `audit-${String(goldMeasuredChapter).padStart(2, '0')}.md`), 'utf8')
+    } catch { goldAudit = null }
     // 金标准稿版本（谈判桌页签数据）：_旧版产物 里按时间戳升序的旧稿；当前稿号 = 旧稿数 + 1。
     let goldDrafts = []
     try {
       const archiveDir = join(workDir(project), '_旧版产物')
       if (existsSync(archiveDir)) {
-        const goldRe = new RegExp(`^chapter-${String(goldN(meta)).padStart(2, '0')}\\.md\\.([0-9a-z]+)$`)
+        // 归档旧稿的文件名是**基名**加时间戳后缀（`chapter-NN.md.<stamp>`）⇒ 序号取 `chapterName`。
+        // ⚠️ **两处形状陷阱**，都踩过（改这一行前先读）：
+        //   ① `chapterName` 返回的是**文件名**、不是正则片段——里面那个 `.` 不转义的话，
+        //      `chapter-07Xmd.abc` 也会被认成一份旧稿（原来手写模板里的 `\\.` 正是这个转义）；
+        //   ② 它**已经含 `.md`**，所以后面只能接 `\\.` + 时间戳，再写一次 `\\.md` 会变成
+        //      `chapter-07\.md\.md\.…`，于是**一份旧稿都认不出来**（`_旧版产物` 整族静默失效）。
+        // `String.replace` 只换第一处，而 `chapter-NN.md` 里恰好只有一个 `.`——改形状时要重新核这一句。
+        const goldRe = new RegExp(`^${chapterName(goldN(meta)).replace('.', '\\.')}\\.([0-9a-z]+)$`)
         goldDrafts = readdirSync(archiveDir)
           .flatMap((name) => { const m = goldRe.exec(name); return m === null ? [] : [{ name, at: parseInt(m[1], 36) }] })
           .sort((a, b) => a.at - b.at)
-          .map((d, i) => ({ version: i + 1, path: `work/_旧版产物/${d.name}`, at: d.at }))
+          .map((d, i) => ({ version: i + 1, path: `工作区/_旧版产物/${d.name}`, at: d.at }))
       }
     } catch { goldDrafts = [] }
     sendJson(res, 200, {
@@ -642,7 +776,7 @@ function handleEvents(req, res) {
       dir: projectDir(project),
       gate: foldGate(project),
       snapshots: listSnapshots(project),
-      work: existsSync(workFile(project, 'book.md')) ? 'work/book.md' : null,
+      work: existsSync(workFile(project, 'book.md')) ? '工作区/book.md' : null,
       pendingStage: meta.pendingStage ?? null,
       pendingGate: meta.pendingGate ?? null,
       pendingReviews: Array.isArray(meta.pendingReviews) ? meta.pendingReviews : [],
@@ -654,6 +788,7 @@ function handleEvents(req, res) {
       exploreSummary,
       knowledgeMap,
       outline: outlineText,
+      goldAudit,
     })
   } catch (error) {
     sendJson(res, 500, { ok: false, error: String(error instanceof Error ? error.message : error) })
@@ -676,8 +811,8 @@ function buildArtifactFacts(projectId, artifacts) {
       const stat = statSync(join(root, rel))
       if (!stat.isFile()) continue
       const path = rel.replace(/\\/g, '/')
-      const chapter = /^work\/chapter-(\d{2})\.md$/.exec(path)
-      const audit = /^work\/audit-(\d{2})\.md$/.exec(path)
+      const chapter = /^工作区\/chapter-(\d{2})\.md$/.exec(path)
+      const audit = /^工作区\/audit-(\d{2})\.md$/.exec(path)
       const fact = {
         path: rel,
         kind: artifactKind(path),
@@ -710,7 +845,7 @@ function buildProcessMap(projectId) {
   // 根因（2026-09-20 走查 04 屏）：原式一律 `phase >= N ? 'active' : 'pending'`，于是书一进
   // 第 3 期，第 2/3 次拍板与章节安排统统亮成「▶ 我正在做」——从没碰过的步骤也在"做"。
   const pending = meta?.pendingStage ?? null
-  // 产物存在性按「项目目录相对路径」判（artifacts 输出即相对路径；workFile 会再拼 work/，不能复用）。
+  // 产物存在性按「项目目录相对路径」判（artifacts 输出即相对路径；workFile 会再拼 工作区/，不能复用）。
   const existsRel = (rel) => existsSync(join(projectDir(projectId), rel))
   // 探源
   push({
@@ -722,7 +857,7 @@ function buildProcessMap(projectId) {
     status: meta?.status === 'awaiting-explore'
       ? 'waiting-user'
       : (meta?.exploreConfirmed === true || phase >= 3 ? 'done' : (pending === 'explore' ? 'active' : 'pending')),
-    artifacts: ['work/explore.md', 'work/knowledge-map.json'].filter(existsRel),
+    artifacts: ['工作区/explore.md', '工作区/knowledge-map.json'].filter(existsRel),
     redoNote: meta.exploreRedoNote ?? null,
   })
   for (const gate of ['1', '2', '3']) {
@@ -767,7 +902,7 @@ function buildProcessMap(projectId) {
       : (gate3Ok || phase >= 4
         ? 'done'
         : (pending === 'outline' ? 'active' : 'pending')),
-    artifacts: existsRel('work/outline.md') ? ['work/outline.md'] : [],
+    artifacts: existsRel('工作区/outline.md') ? ['工作区/outline.md'] : [],
     redoNote: meta.outlineRedoNote ?? null,
   })
   const goldDone = meta.goldSealed != null || phase >= 5
@@ -776,7 +911,10 @@ function buildProcessMap(projectId) {
     key: 'gold', label: '最佳范例章（风格母版）', kind: 'gold',
     phase: SEGMENT_PHASE['gold'],
     status: goldDone ? 'done' : (meta.status === 'awaiting-gold' ? 'waiting-user' : (phase >= 4 ? 'active' : 'pending')),
-    artifacts: ['work/style-spec.md', `work/chapter-${String(goldNn).padStart(2, '0')}.md`, `work/audit-${String(goldNn).padStart(2, '0')}.md`].filter(existsRel),
+    // ⚠️ 产物清单里的路径是**书夹相对路径**（`existsRel` 自己 join 书夹根），所以取 `chapterRel`
+    // 而不是 `chapterName`——后者是基名，喂进去 `existsRel` 会去书夹根找 `chapter-NN.md`。
+    // `工作区/audit-NN.md` 是 `audit` 族的同款契约（同一个补两位序号），本票只收本章正文那一族。
+    artifacts: ['工作区/style-spec.md', chapterRel(goldNn), `工作区/audit-${String(goldNn).padStart(2, '0')}.md`].filter(existsRel),
     decision: meta.goldSealed == null ? undefined : { version: meta.goldSealed.version, approved: true, note: '已定稿为最佳范例章' },
     redoNote: meta.goldRedoNote ?? null,
   })
@@ -803,20 +941,20 @@ function buildProcessMap(projectId) {
       stage: stageN,
       // 票 nav-vs-preview/01：只随过程图谱给人读摘要；原始机器 JSON 仍不开右栏。
       auditSummary: readChapterAuditSummary(projectId, n),
-      artifacts: [`work/chapter-${String(n).padStart(2, '0')}.md`, `work/audit-${String(n).padStart(2, '0')}.md`].filter(existsRel),
+      artifacts: [chapterRel(n), `工作区/audit-${String(n).padStart(2, '0')}.md`].filter(existsRel),
     })
   })
   push({
     key: 'chapters-review', label: '全章过目', kind: 'review',
     phase: SEGMENT_PHASE['review'],
-    status: meta?.status === 'awaiting-chapters-review' ? 'waiting-user' : (meta?.chaptersReviewed === true || existsRel('work/book.md') ? 'done' : 'pending'),
+    status: meta?.status === 'awaiting-chapters-review' ? 'waiting-user' : (meta?.chaptersReviewed === true || existsRel('工作区/book.md') ? 'done' : 'pending'),
     artifacts: [],
   })
   push({
     key: 'merge', label: '合并成书', kind: 'merge',
     phase: SEGMENT_PHASE['merge'],
-    status: existsRel('work/book.md') ? 'done' : (phase >= 6 ? 'active' : 'pending'),
-    artifacts: existsRel('work/book.md') ? ['work/book.md'] : [],
+    status: existsRel('工作区/book.md') ? 'done' : (phase >= 6 ? 'active' : 'pending'),
+    artifacts: existsRel('工作区/book.md') ? ['工作区/book.md'] : [],
   })
   push({
     key: 'final', label: '最后检查与交付', kind: 'final',
@@ -824,7 +962,7 @@ function buildProcessMap(projectId) {
     // 批 1 根因修复：原式只认 delivered → done，其余 phase>=6 → active，
     // 于是终检等认可时纵向地图显示「▶ 正在做」，而横向阶段片显示「⚡轮到你」——同屏打架。
     status: meta?.status === 'delivered' ? 'done' : (meta?.status === 'awaiting-final-approval' ? 'waiting-user' : (phase >= 6 ? 'active' : 'pending')),
-    artifacts: existsRel('work/book.md') ? ['work/book.md'] : [],
+    artifacts: existsRel('工作区/book.md') ? ['工作区/book.md'] : [],
   })
   // 影响预告数据：每段的深改影响范围（下游段 keys / 会被归档的现存产物 / 是否可深改）。
   // demo 书不开放定点修改（canDeepModify=false，走旧全自动通道）。
@@ -861,7 +999,16 @@ async function handleProcess(ctx, req, res) {
     // 票 12 · ①：与 `handleEvents` 同一个检测点，理由见 `engine.noteStyleSpecChange` 的注释。
     // 工作台这两条路都是 2 秒一轮，且**同时**在跑；去重（`styleSpecSeen`）保证同一次变更只记一条。
     try { noteStyleSpecChange(project) } catch { /* 记账失败不许拖垮这一轮读取 */ }
-    sendJson(res, 200, { ok: true, project, segments: buildProcessMap(project) })
+    // 书夹形状那两份表的对账事实（票 `context-budget/10`）：缺件/多件**各自点名**。
+    // ⚠️ 老书没有清单 ⇒ `shape: null`，**不拦也不显示**（用户故事 12：老书照常打开、能交付）。
+    let shape = null
+    try { shape = bookShapeReport(project) } catch { /* 派生件读不出就当没有，不拖垮这一轮读取 */ }
+    // ⚠️ **老名／新名两套同时存在的段逐条点名**（老书读侧兜底）：解析层按「新名优先」取其一，
+    // 于是老的那一份会被**遮住**——不报出来，用户看到的是「我明明有产物，怎么少了一半」，
+    // 而兼容层把「少东西」藏起来比不兼容更坏。空数组是常态（不是新书一律老书），恒定在场。
+    let legacyDirs = []
+    try { legacyDirs = legacyDirConflicts(project) } catch { /* 派生事实读不出就当没有 */ }
+    sendJson(res, 200, { ok: true, project, segments: buildProcessMap(project), shape, legacyDirs })
   } catch (error) {
     sendJson(res, 500, { ok: false, error: String(error instanceof Error ? error.message : error) })
   }
@@ -880,12 +1027,23 @@ function handleProjects(req, res) {
 }
 
 
-function handleSettings(_req, res) {
+/**
+ * GET /textbook/settings —— 全局设置快照（客户端只用它渲染 Token 卡与**上传前那道预检**）。
+ *
+ * 票 10：`autoSplitAvailable` 是**本机的事实**（有没有 Python + PyMuPDF），由 `mineru-lib` 的
+ * 探针真探一次给出；**探针是惰性缓存的**，所以第一次要付一次子进程的开销（最坏 15 秒超时），
+ * 之后这次调用都是瞬时的。⚠️ 它**故意不进**书投影的四条通道：那是「当前书的事实」，
+ * 装没装 PyMuPDF 是**这台机器**的事实，两者混在一起会让切会话时多发无谓请求。
+ */
+async function handleSettings(_req, res) {
   try {
     const settings = readSettings()
     sendJson(res, 200, {
       ok: true,
-      settings: { mineruTokenSet: typeof settings.mineruToken === 'string' && settings.mineruToken !== '' },
+      settings: {
+        mineruTokenSet: typeof settings.mineruToken === 'string' && settings.mineruToken !== '',
+        autoSplitAvailable: await autoSplitAvailable(),
+      },
     })
   } catch (error) {
     sendJson(res, 500, { ok: false, error: String(error instanceof Error ? error.message : error) })
@@ -1031,7 +1189,19 @@ function processRedoMarks() {
 }
 
 
-export function apply(ctx) {
+/**
+ * 注册工作台后端。`config` 是**可选**第二实参（既有调用约定：宿主契约闸门与探针都按两实参调插件，
+ * 见 `dev/host-contract-gate/probe/standing-mount-probe.js` 的 `async apply(ctx, config)`）。
+ *
+ * 今天它只收一个旋钮 `startupRecoveryDelayMs`（最后那个定时器的延迟，**默认仍是 3000**）：
+ * 启动恢复链本身仍是一等公民、时机仍只由 apply 定（ADR-0003 决策 2），本参数只是把那个**值**
+ * 变成可注入——链上那 10 次支付（9 份文件 ＋ 一个被两个导入者各 import 一遍的链外夹具）改传 `0`
+ * 之后，不再各白等 3.5 秒。生产调用点一个字都不改（不传第二实参 ⇒ 3000）。
+ *
+ * ⚠️ 参数名只能是 `config`／`opts`：宿主契约闸门的「动态读取」只扫 `props`／`ctx` 对象面，
+ * 叫 `props` 会当场踩闸（票 `test-chain-latency/03` 的决定台账第 2 条）。
+ */
+export function apply(ctx, config = {}) {
   bindAnnounce(ctx)
 
   // 票 walkthrough-fixes/28：主 AI 上下文占用的读数口（同 `bindAnnounce` 的显式契约：只在 apply 绑一次）。
@@ -1054,15 +1224,19 @@ export function apply(ctx) {
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/textbook/events', handler: handleEvents }), 'textbook: events route')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/textbook/process', handler: (req, res) => handleProcess(ctx, req, res) }), 'textbook: process route')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/textbook/action', handler: (req, res) => handleAction(ctx, req, res) }), 'textbook: action route')
-  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/textbook/upload', handler: handleUpload }), 'textbook: upload route')
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/textbook/upload', handler: (req, res) => handleUpload(ctx, req, res) }), 'textbook: upload route')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/textbook/work', handler: handleWork }), 'textbook: work route')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/textbook/file', handler: handleFile }), 'textbook: file route')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/textbook/download', handler: handleDownload }), 'textbook: download route')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/textbook/settings', handler: handleSettings }), 'textbook: settings route')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/textbook/question', handler: handleQuestion }), 'textbook: question route')
   ctx.logger.info('[textbook-workflow] 造书工作台后端已加载（步骤5：六阶段状态机）')
-  // 宿主重启后延迟 3 秒走启动恢复链（三步顺序见 startupRecovery；这里只定时机）。
+  // 宿主重启后延迟走启动恢复链（三步顺序见 startupRecovery；这里只定时机）。
+  // 延迟值是**可注入的**（`config.startupRecoveryDelayMs`，默认 3000ms＝生产行为逐字不变）：
+  // 测试传 `0` 把这次「游离的恢复」在场景开跑前烧完，不用再各等 3.5 秒。
+  // ⚠️ `??` 而不是 `||`：传 `0` 是**有意义的一格**（立刻走），不能被当成缺省。
+  const startupRecoveryDelayMs = config.startupRecoveryDelayMs ?? 3000
   setTimeout(() => {
     startupRecovery(ctx)
-  }, 3000)
+  }, startupRecoveryDelayMs)
 }

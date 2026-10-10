@@ -31,20 +31,38 @@ import {
 	workEntryAction,
 } from "./view-rules.js";
 // 票 09：章节卡非过目态那颗「打开」＝票 02 那颗共用按钮，住中性模块（阶段页再导出它）。
-// ⚠️ 不许从 `./phase-page.js` import：那个文件已经 import 本文件（`foldKnowledgeMap`），
-// 反向 import 会成环（`chapters-map → phase-page → chapters-map`）。
+// 📌 **当初「不许从 `./phase-page.js` import，反向会成环」那条理由已经不存在了**（票
+// `depth-review-2026-10/03`）：那个环由 `phase-page → chapters-map` 这条边撑着（为了
+// `foldKnowledgeMap` / `foldOutline`），而那两个函数今天住在第三个文件——中性模块
+// `./machine-product-folds.js`，那条边随之撤掉。
+// ⚠️ 但**结论不变**，而且现在它的理由更硬：`open-artifact-button.js` 是渲染路径上的**真共用件**
+// （阶段页三处 + 事件行 + 本文件），搬进任何一个域都会让另一个域反向 import 它。
 import { OpenArtifactButton } from "./open-artifact-button.js";
-import { goldChapterNo } from "../domain-rules.js";
+import { chapterRel, goldChapterNo } from "../domain-rules.js";
+// 票 02（`workbench-card-contract`）：「这张卡吃什么」写在**卡旁边**，不写在壳里。
+// 声明式本身住在中性 module `card-view.js`（零 react 依赖、零域词），本文件只声明
+// 「本文件这两张卡各吃哪几个键」——见下面 `chaptersCardView` / `progressOverviewView`。
+import { defineCardView } from "./card-view.js";
 
-/**
- * 章号 → 章节正文路径（两位序号是契约，与 `view-rules` 里那份同一形状）。
- * 三处调用点（拉正文 / 「文件在不在产物清单里」的置灰判据 / 「打开」按钮的产物名）共用一份，
- * 别各拼一遍。
- */
-const chapterRel = (n) => `work/chapter-${String(n).padStart(2, "0")}.md`;
+// 📌 **章号 → 章节正文路径不再在本文件自建**（票 `depth-review-2026-10/05`）：构造只此一份，
+// 住在 `../domain-rules.js` 的 `chapterRel`（与识别侧 `NUMBERED_CHAPTER_FILE_RE` 同居），
+// `view-rules.js` 那份逐字相同的本地副本已一并撤掉。下面三处调用点——拉正文 /「文件在不在
+// 产物清单里」的置灰判据 /「打开」按钮的产物名——取的仍是同一份形状。
 
 /** 「准备中」那一格：图标与中性色，逐字保持票 20 之前那一格的样子（组件里不留零散字面量）。 */
 const CHAPTER_NOT_READY = Object.freeze({ icon: "⏳", tone: "#57606a" });
+
+/**
+ * 「产物清单还没读到」的那一份空引用——`chaptersCardView.defaults.workFiles` 的缺省值。
+ *
+ * ⚠️ **必须是模块级同一引用**（spec 缺省三规则第 3 条）：每帧新建一个 `[]` 会让下游任何
+ * 「引用变了没有」的比较每帧都为真。壳里那几处手抄的 `Object.freeze([])` 就是这么退役的
+ * ——不是删掉了兜底，是把同一句话从内联挪到了契约里。
+ *
+ * ⚠️ 它**不替壳说话**：壳的 `workFiles` 照旧进 `fromBook`，这一格只在**书没给**时补上，
+ * 而且只补 `undefined`（书上给 `null` 原样保住，缺省三规则第 2 条）。
+ */
+const NO_WORK_FILES = Object.freeze([]);
 
 // 票 27 · P38 ①：章节卡那颗「打开」按态分——**没定稿的章在按钮自己身上说清这一点**。
 //
@@ -187,6 +205,101 @@ function ChapterReviewLine(props) {
 	);
 }
 
+/**
+ * `ChaptersCard` 的 props 契约（票 `workbench-card-contract` 02）。
+ *
+ * 「这张卡吃什么」写在**卡旁边**（locality）：壳只负责把「当前这本书 ＋ 接线」递过来
+ * （`client-entry.js` 的 `case "chapters"` → `cardBook`）。给这张卡加一个输入要改的是
+ * **这个文件**，不是那个两千多行的壳——那条「知识住在壳里」的路就是本票要拆的。
+ *
+ * ⚠️ **book 侧的键取壳里那个不撞名的标识符**，卡片消费的 prop 名由 `derive` 整形成卡片体内
+ * 那个名字。一本书只有一本扁平的 book：两张卡的 prop 名撞车时（两张确认卡都叫 `onConfirm`，
+ * 壳里却是两个不同动作）只有这样才说得清谁是谁。
+ *
+ * **必填三项**——缺任一个 ⇒ **装配期**抛 `CardViewError`（点名是这张卡、缺哪个字段），
+ * 而不是等用户点下去才发现「什么都没发生」：
+ *   · `postAction`：章卡上三条入账出口都走它（提意见 / 处置与翻案 / 段落三键）。收编前这三处
+ *     各有一道 `if (postAction === undefined) return;` 守卫（`onReview` 之外的 `onRevoke`、
+ *     `onOpinion`、`onRevokeOpinion` 三个回调的第一行）——生产里它们不可达，票 01 查实那是
+ *     「壳漏传就静默降级」，`.scratch/dead-gates` 不变量 7 禁的形状。已删，注释留在原位。
+ *   · `readArtifact`：「看看这章」的内联正文经它取回（票 03 的 `ui/artifact-read.js`；
+ *     `project` / `session` 两个身份 prop 随之退休）。
+ *   · `onView`：每章那颗「打开」（`OpenArtifactButton`）。壳里它是 `viewWork` 的一个**闭包**
+ *     （`path` 固定成 `工作区/chapter-NN.md`），与源探查那张卡的 `onViewReport` 不是同一个函数。
+ *
+ * ⚠️ **`derive` 只有一个参数**（此刻的袋子，含 book 键、缺省与 `.with()` 覆盖后的最终值）。
+ * ⚠️ **`.with()` 改不动 `derive` 整形出来的那几个键**（delta 的闭集 = `fromBook` ∪ `defaults`）：
+ *    「一个名字一处来源」在 `card-view.js` 里是**闸**不是纪律。真要在调用处换掉
+ *    `chapterSegments` / `onReview` / `reviewMode` 中的哪一个，先想清楚它该归谁。
+ */
+export const chaptersCardView = defineCardView({
+	card: "ChaptersCard",
+	fromBook: [
+		// ── 书级只读数据（`client-entry.js` 里同名或近似名的局部量）
+		"meta",
+		"chapterStatus",
+		"pendingReviews",
+		"progressDetail",
+		"contextPercent",
+		"events",
+		"workFiles",
+		// ⚠️ 壳里写的是 `chapterSegments: processSegs`（`/textbook/process` 的分段事实；票 20
+		//    「谁在写哪一章」与徽章新鲜度都吃它）。book 侧用壳里那个标识符，卡侧由 derive 整形。
+		"processSegs",
+		// 票 20：此刻**真在跑**的小助手有几个（与顶栏「🔎 N 个小助手在跑」同一份读数）。
+		// ⚠️ 刻意**不给**缺省 0：卡内的 `view-rules.indexRunningChapterClaims` 自己按 0 算
+		//    （注释逐字写着「缺这一格按 0 算，不是缺省成『全都在写』」），那句话留在判据那边。
+		"runningSubagentCount",
+		"busy",
+		// ── 壳注入的接线（回调与读取口，不是界面词）
+		"readArtifact",
+		"postAction",
+		// 壳里是就地箭头：`() => void postAction({action:"chapters-review-confirm", approved:true})`
+		// ——它没有自己的局部标识符，prop 名就是它在壳里写的名字（`client-entry.js` 的
+		// `onApproveAll`）。与 final 卡那颗 `onApprove`（壳里的 `onApprove` 键）是两个键，不撞名。
+		"onApproveAll",
+		// 壳里是就地箭头：`(n) => viewWork({path: "工作区/chapter-NN.md", label: 第 n 章})`。
+		// ⚠️ 撞名核查：`onView` 在壳里只出现在**这一处**；源探查确认卡那一处叫
+		//    `onViewReport`（`viewWork({path:"工作区/explore.md"})`），是两个不同的闭包、两个键。
+		"onView",
+		// 壳里写的是 `onReview: submitReview`（`client-entry.js` 的 `submitReview` 本名）。
+		"submitReview",
+	],
+	required: ["postAction", "readArtifact", "onView"],
+	defaults: {
+		// 「产物清单还没读到」＝「读到一份空清单」，在卡里是同一句话（`hasChapterFile` 里
+		// `files.length === 0` ⇒ 一律不置灰，旧账本口径）。空引用必须是模块级同一引用 ⇒
+		// `NO_WORK_FILES`。壳照旧传 `workFiles`，这一格只在**书没给**时补。
+		workFiles: NO_WORK_FILES,
+		// 票 28：主 AI 上下文占用读不到就是「不显示这一格」，**绝不显示 0%**。
+		// 缺省只在 `undefined` 时填——书上给 `null` 原样保住（缺省三规则第 2 条）。
+		contextPercent: null,
+		// ⚠️ 下面两个是 **SSR 专用开口**，不是「让测试偷懒的旁门」（票 03 裁决 A，2026-10）：
+		//    壳**从不**传它们；全仓唯一注入点是 `smoke-test.mjs` 第 24 节，那一节用
+		//    `renderToStaticMarkup` **直接渲这张卡**——正文是卡内 effect 取回来的，SSR 跑不了
+		//    effect，不靠这两个 prop 就无法呈现「章节已展开」这一态。定性：**给一个客户端状态
+		//    补的 SSR 渲染路径**（真实取数那条路仍由组件测试钉着，两处并存，不是二选一）。
+		//    将来冒烟那一节若改用客户端渲染，这两个 prop 随之删除——**记在这里，别让它们
+		//    悄悄长成别的东西**（destructure 处 `:326-336` 那段说明是它的原文）。
+		// 复核「`null` 作缺省安全」（两处用法逐字）：`:350` 的
+		// `Number.isSafeInteger(initialOpenChapter) && initialOpenChapter >= 1`
+		// 对 `null` 与 `undefined` 同为 `false`（不预开初始态）；`:599-602` 的
+		// `typeof chapterTextOverride === "string" && chapterTextOverride !== ""`
+		// 对 `null`（`typeof` 得 `"object"`）与 `undefined` 同为 `false`（回落
+		// `chapterText`）。⇒ 两者逐字同路，不需要另找缺省值。
+		initialOpenChapter: null,
+		chapterTextOverride: null,
+	},
+	// 壳里的现算表达式 ＋ book 侧键 → 卡片 prop 名的整形。**无条件**给出下面每一个键。
+	derive: (bag) => ({
+		chapterSegments: bag.processSegs,
+		onReview: bag.submitReview,
+		// 过目态（票 10）：壳里就是这一句 `meta.status === "awaiting-chapters-review"`。
+		// 收进契约是为了**只此一份**——留在壳里各写一份，正是本票要收的「接线住在壳里」。
+		reviewMode: bag.meta?.status === "awaiting-chapters-review",
+	}),
+});
+
 export function ChaptersCard(props) {
 	const {
 		meta,
@@ -207,18 +320,34 @@ export function ChaptersCard(props) {
 		// ⚠️ 缺这一格按 0 算（不是缺省成「全都在写」）：少说一次「我正在做」收得回来，
 		// 多说一次就是票 20 那个病本身。
 		runningSubagentCount,
-		project,
-		session,
+		// 票 03：产物读取归 `ui/artifact-read.js`（`createArtifactReader(...).readText`），
+		// 本卡只给一个 `rel`。`project` / `session` 两个身份 prop 因此**退休**——它们原先只被用来
+		// 拼那一条 URL（收编前全卡对这两个名字的引用只有 destructure、那道 `project == null` 早退、
+		// 那条 URL、以及依赖数组里的它们）。
+		readArtifact,
+		// ⚠️ 下面两个是 **SSR 专用开口**，不是「让测试偷懒的旁门」（票 03 裁决 A，2026-10）。
+		//
+		// 收编时本想一并删掉，理由是它们违反 `dead-gates` 不变量 7「断言必须经产品代码的路径把
+		// 字段喂进去」。**那个理由只对客户端测试成立**——`test-component-cards.mjs` 那三条已改走
+		// 真实点击（从收起态点「▸ 展开第 N 章正文」取正文），比原来更强，不退回。
+		//
+		// **但 `smoke-test.mjs` 第 24 节用的是 `renderToStaticMarkup`（SSR）**：正文是**卡内 effect
+		// 取回来**的（`client-entry.js:6072` 记着「SSR 跑不了 useEffect/fetch」），SSR 不跑 effect ⇒
+		// 不靠这两个 prop，**SSR 就无法呈现「章节已展开」这一态**。这不是豁免一条业务判据，是给一个
+		// 客户端状态补一条 SSR 渲染路径；真实取数那条路仍由组件测试钉着（两处并存，不是二选一）。
+		// 将来若冒烟那一节改用客户端渲染，这两个 prop 即可随之删除——**记在这里，别让它们悄悄长成别的东西**。
+		initialOpenChapter,
+		chapterTextOverride,
 		// 票 28：主 AI 上下文占用百分比（null = 宿主读不到，界面不显示这一格）。
 		contextPercent,
 		postAction,
-		initialOpenChapter,
-		chapterTextOverride,
 	} = props;
 	const [reviewing, setReviewing] = useState(null);
 	const [comment, setComment] = useState("");
 	// F39（2026-08-20 走查）：过目态「看看这章」内联展开——openChapter 记当前点开的章号，
-	// 正文经文件接口拉取（initialOpenChapter / chapterTextOverride 仅供测试注入，生产不传）。
+	// 正文经 `readArtifact` 取（票 03：地址拼装归 `ui/artifact-read.js`）。
+	// 生产入口只有「从收起态点开」（`setOpenChapter`，`:576` 展开 / `:763` 收起）；
+	// `initialOpenChapter` 只为上面那条 SSR 路径预开初始态。
 	const [openChapter, setOpenChapter] = useState(() =>
 		Number.isSafeInteger(initialOpenChapter) && initialOpenChapter >= 1
 			? initialOpenChapter
@@ -237,14 +366,16 @@ export function ChaptersCard(props) {
 		setChapterText(null);
 		setChapterError(null);
 		if (openChapter === null || openChapter === undefined) return undefined;
-		if (project === null || project === undefined) return undefined;
-		const rel = chapterRel(openChapter);
-		fetch(
-			`/textbook/file?session=${encodeURIComponent(session)}&project=${encodeURIComponent(project)}&path=${encodeURIComponent(rel)}`,
-		)
-			.then((res) =>
-				res.ok ? res.text() : Promise.reject(new Error(`HTTP ${res.status}`)),
-			)
+		// 票 03：只给一个 `rel`，地址由 `ui/artifact-read.js` 拼。
+		// ⚠️ 收编前这里有一道 `if (project === null || project === undefined) return undefined;`——
+		// 它在生产里**不可达**（壳的 `case "chapters"` 分支必传 `projectId`，而 `projectId` 非空蕴含
+		// `meta` 非空，见 `.scratch/workbench-card-contract/issues/01` 的投影不变式）。它真正的用途是
+		// 让组件测试不发网络请求——那正是 `dead-gates` 不变量 7 禁的形状。
+		// 「无当前书 ⇒ 不发请求」现在归那个 module（表现为一次 reject），落进下面**同一条**降级路径。
+		//
+		// ⚠️ 错误策略**逐字保留**（两条正当策略之一）：读不到就在这一章里显示错误条。
+		// 另一条在 `confirm-cards.js`（静默降级，不显示报告区）。**不许把两条统一**。
+		readArtifact(chapterRel(openChapter))
 			.then((text) => {
 				if (alive) setChapterText(text);
 			})
@@ -255,7 +386,7 @@ export function ChaptersCard(props) {
 		return () => {
 			alive = false;
 		};
-	}, [openChapter, project, session]);
+	}, [openChapter, readArtifact]);
 	const rows = (meta?.outline?.chapters ?? []).map((chapter, index) => {
 		const found = (chapterStatus ?? []).find(
 			(row) => Number(row.n) === index + 1,
@@ -464,10 +595,13 @@ export function ChaptersCard(props) {
 			const rowReviews = (pendingReviews ?? []).filter(
 				(r) => Number(r.chapter) === Number(row.n),
 			);
-			const shownText =
-				typeof chapterTextOverride === "string" && chapterTextOverride !== ""
-					? chapterTextOverride
-					: chapterText;
+			// 票 03：`chapterTextOverride` 是 SSR 专用开口（见 destructure 处那段说明）——
+		// SSR 不跑 effect，正文取不回来，正文区靠它才有内容可渲染。
+		// 客户端那一条（`readArtifact` 取回来的 `chapterText`）是**默认**路径。
+		const shownText =
+			typeof chapterTextOverride === "string" && chapterTextOverride !== ""
+				? chapterTextOverride
+				: chapterText;
 			// F38（2026-08-20 走查）：每章「源材料索引」——源：用哪本材料哪部分 · 覆盖知识点 N 个 · 体量依据。
 			// 字段缺失就不显示对应段；全缺则整行不渲染。
 			const sourceIndex = [
@@ -668,7 +802,14 @@ export function ChaptersCard(props) {
 									busy,
 									progressText: reviewProgress.get(row.n) ?? null,
 									onRevoke: (key, review) => {
-										if (postAction === undefined) return;
+										// 票 02（`workbench-card-contract`）：原先这个回调的第一行是
+										// `if (postAction === undefined) return;`，收编进契约后删掉——不再需要这道防
+										// 「壳漏传」的保险，因为 `postAction` 是本卡契约里的**必填** props
+										// （`chaptersCardView.required`）：壳漏传会在**装配期**就响着抛，并点名是这张卡、
+										// 缺哪个字段，不必等用户点了这颗键才发现「按下去什么都没发生」。
+										// ⚠️ 取证（删它的前提）：本回调由 `ChapterReviewLine` 的按钮 `onClick`
+										// （`:194`）触发，**渲染期零执行**——函数体在渲染中被构造，但只有真点了
+										// 「撤回」/「翻案」才进来，所以删它不改变任何一次渲染的输出。
 										// 票 09：按处置态分派两个**方向相反**的动作。两条都复用契约目录里
 										// 已有的名字（`gold-opinion-revoke` / `review-revoke`，都已是工作台可调用），
 										// **不新增动作名**——新增会让契约动作目录那几处写死的计数四处红。
@@ -777,7 +918,23 @@ export function ChaptersCard(props) {
 												opinions: rowOpinions,
 												busy,
 												onOpinion: (kind, wish, para, hint) => {
-													if (postAction === undefined) return;
+													// 票 02（`workbench-card-contract`）：原先这里的第一行是
+													// `if (postAction === undefined) return;`，收编进契约后删掉——不再需要这道防
+													// 「壳漏传」的保险，因为 `postAction` 是契约里的**必填**项，漏传会在**装配期**
+													// 就响着抛（点名是这张卡、缺哪个字段），不必等用户按了段落三键才发现「按了
+													// 什么都没发生」；另见 `chaptersCardView.required` 那条注释。
+													//
+													// ⚠️ **这三处里就数它不一样**：删掉守卫之后，这个回调的**第一动作变成本地
+													// state 写**（就是紧跟着的那句 `setKeepOpenChapter(row.n)`），不是发动作。今天
+													// 那道守卫在 `postAction` 缺失时会把这一次本地写**一起短路掉**——而「把刚提了
+													// 意见的这一章钉在展开态」是票 30① 的本地效果，与发不发动作无关。
+													//
+													// ⚠️ 取证（删它的前提）：本回调只在 GoldReader 确认层的提交键被按 `onClick` 时
+													// 进来（`gold-table.js` 的三颗提交键 `:438`／`:523`／`:680` →
+													// `submitMark`／`submitWish`／`submitGeneral`，定义在 `:369`／`:334`／`:350`），
+													// **渲染期零执行**——渲染只是把这个函数构造出来。
+													// 🚨 零覆盖区（票 02「🚨 零覆盖区」一节）：段落三键这条入账路径全仓没有组件级
+													// 测试，删守卫没有回归网，靠上面那条必填声明兜住漏传。
 													// 票 30①：段落三键这一条入账路径同样把这一章钉在展开态。
 													setKeepOpenChapter(row.n);
 													void postAction({
@@ -790,7 +947,13 @@ export function ChaptersCard(props) {
 													});
 												},
 												onRevokeOpinion: (id) => {
-													if (postAction === undefined) return;
+													// 票 02：同上——原先这道 `if (postAction === undefined) return;` 已随契约收编删除
+													// （`postAction` 是 `chaptersCardView` 的**必填** props，壳漏传在**装配期**就抛）。
+													// ⚠️ 取证：本回调只在 GoldReader 那颗段落键被按 `onClick` 时进来
+													// （`gold-table.js:605-611` → `:607`），渲染期零执行。
+													// 🚨 零覆盖区（票 02「🚨 零覆盖区」）：全仓搜 `onRevokeOpinion` 只命中
+													// `smoke-test.mjs:4565`，而那里渲的是独立的 `GoldReader`、不是这张卡——这条路径
+													// 没有组件级测试，删守卫没有回归网，靠上面那条必填声明兜住漏传。
 													void postAction({
 														action: "gold-opinion-revoke",
 														id,
@@ -953,6 +1116,41 @@ export function StepList(props) {
  * 抬头、currentPhaseText、分组清单全部来自 `project({kind:"overview"})`。props 从「传
  * segments/meta 自己推导」迁为「传 projector」；导出名与用户可见行为不变。
  */
+/**
+ * `ProgressOverview` 的 props 契约（票 `workbench-card-contract` 02）。
+ *
+ * 全览条（焦点区顶部「全书 N 步 · 还剩 M 步」＋ 展开清单）只吃四样：一个 projector、
+ * 一个「正在看哪一步」、两个导航回调。
+ *
+ * ⚠️ **`projector` 走 `fromBook`、不走 `derive`**：它是壳里 `stageStepProjector` 的**原样
+ * 转发**（`projector: stageStepProjector`），没有任何现算。放进 `derive` 等于给同一个名字
+ * 造第二处来源，还要白白多担一条「`.with()` 改不动」的约束。
+ * ⚠️ 而它**不是模块级单例**：壳里是
+ * `useMemo(() => createStageStepProjector({meta, processSegs, runningSubagentCount}), [...])`，
+ * 三个依赖之一的 `runningSubagentCount` 来自**宿主会话状态**、不在 `book` 里 ⇒ **book 引用
+ * 没动，projector 的身份照样会换**。所以别把它当记忆化 key，也别因为「book 没变」就以为
+ * 袋可以缓存（壳 `cardBook` 每帧重建是刻意的，见 `client-entry.js` 那段注释）。
+ *
+ * ⚠️ 另外三个是**纯壳-local 的导航接线**（`browsingKey` ← 壳的 `browsing`；`onPickStep` /
+ * `onPickPhase` 就是壳里那两个同名局部量）。它们**与 `PhasePage` 没有交集**——只有
+ * `projector` 一项重叠——照实登记即可，**不许**为了「和阶段页对齐」把两边凑成同一个形状。
+ */
+export const progressOverviewView = defineCardView({
+	card: "ProgressOverview",
+	fromBook: ["projector", "browsingKey", "onPickStep", "onPickPhase"],
+	// `projector` 在**每次渲染**都被无条件调用（`project({kind:"overview"})`）——缺了它不是
+	// 「点一下没反应」，是这张卡当场渲不出来。所以它是必填。
+	// ⚠️ 反过来 `onPickStep` / `onPickPhase` **不列必填**：卡内是 `onPickStep?.(…)` 的可选调用
+	// （清单行点不动时的合法状态），声明成必填等于把一件合法的事写成接线事故。
+	required: ["projector"],
+	defaults: {
+		// 「没在回看任何一步」是**显式的 null**，不是「键不存在」：`StepList` 的高亮判据
+		// （`:1073`）是 `browsingKey !== null && browsingKey === row.key`，
+		// 那个 `!== null` 写的就是这一格。
+		browsingKey: null,
+	},
+});
+
 export function ProgressOverview(props) {
 	const [open, setOpen] = useState(false);
 	const { projector, browsingKey, onPickStep, onPickPhase } = props;
@@ -1028,6 +1226,11 @@ export function ProgressOverview(props) {
 // 「打开右侧边栏」↔「收起右侧边栏」之间切换）。2K 视口下同一颗按钮让主区 1110 → 2270，
 // 行也顺带变短（同一颗按钮也是「正文太宽」的解药——票 26 记档：两层一起说，但**不许新造第二句**）。
 //
+// ⚠️ 上面那两个「塌了多少」是**票 26 当时的读数**（**票 16 之前**：工作台通栏填满中心列 ⇒ 主区宽
+// ≈ 中心列宽）。今天主区宽改由 `T = min(C − 32, W + 32)` 给出（票 16，2026-10-05）：1280 下是
+// 392 ↔ 712、2K 下 754 ↔ 952 —— 算式与依据见下面 `NARROW_MAIN_WIDTH` 的注释（2026-10-06 票
+// `walkthrough-2026-10/08` 对齐）。**文案一个字没改**（那句「能宽一倍」是票 08 红线的逐字保留件）。
+//
 // ⚠️ **布局一个字不动**：走查 `:656` 那个 `min-width` 方案已被作者自己在 `:662-664` 撤回，
 // 本票只加文案：不引入 min-width、不引覆盖式浮层、不碰任何宿主布局属性。
 //
@@ -1036,10 +1239,43 @@ export function ProgressOverview(props) {
 // 🚫 不许把它做成整块热区去替用户点那颗宿主按钮，也**不许新造一个收起动作**（收起那颗按钮是
 // 宿主的，本票只指路）。
 
-/** 主区窄于此（px）就提一句。真机数：1280 右栏开着 w≈414 / 收起 w≈990；2K 开 w≈1110 / 收 w≈2270。 */
+/** 主区窄于此（px）就提一句。
+ *
+ * 2026-10-06（票 `walkthrough-2026-10/08`）把取数对齐到**今天的接线**并重算了「余量」这笔账：
+ * 接线是 `src/client-entry.js` 的 `rootStyle`（票 16）⇒ 主区实宽 `T = min(C − 32, W + 32)`
+ * （`C` ＝ 宿主中心列宽、`W` ＝ `--dsh-chat-content-width`；列宽与 `W` 见快照
+ * `docs/reference/dsh-chat-width-handle-geometry-contracts.md` §1／§2／§2b）：
+ *   · 1280 右栏**收起**：`C = 1000`、`W = clamp(680, 640, 920) = 680` ⇒ `T = min(968, 712) = 712`
+ *   · 1280 右栏**开着**：`C =  424`、`W = 680`                         ⇒ `T = 392`
+ *   · 2K（2560）开 / 关：`T = 754` / `T = 952`
+ * ⇒ 本注释原写的「真机数 990 / 414、2270 / 1110」是**票 16 之前**的通栏读数（那时工作台通栏填满
+ * 中心列，`T ≈ C`），与今天真正喂进这个判据的量已经不是一回事了。
+ * **余量就是 712 − 700 = 12px**，而且 `712` 是**平台值**不是尖峰：`C ∈ [744, 1062]` 这一段上
+ * `T` 恒等于 `W + 32`（`C` 再大，`W` 按 `0.64C` 爬到 920 封顶 ⇒ `T` 到 952；`C ≤ 744` 时改由
+ * `C − 32` 说了算）。所以这 12px 不会因为侧栏拖一下就翻（1280 下侧栏 264–420 ⇒ `C = 860–1020`，
+ * 仍在平台里）；默认口径下能把 `T` 压到 700 以下的只有 `C < 732`，而那一刻 `T = C − 32`
+ * ⇒ **是列宽在压它**，「收起右栏能让这里变宽」这句话在该格才成立。
+ * ⛔ 这个 `700` **不是从任何一个量推出来的**：它是票 04「真机严格上限 718、取 700 留余量」那个
+ * 决定的残留（今天「不落进那两条透明手柄带」已由 `T ≤ W + 32 ≤ W + 48` 结构性保证，不再靠它兜）。
+ * 按 `CONTEXT.md`「工作台的宽度＝输入框的宽度」那一条，**不许**自己按 `--dsh-chat-content-width`
+ * 重推一个上限来替换它（用户拖过手柄后真机量到过 `W = 1239`）⇒ 本票只对齐取数与注释，
+ * **不动阈值、不动布局**。
+ * ⚠️ **我的枚举面比现实窄在哪里**：判据只看得见主区自己那两个数，所以它分不出 `T` 小是因为
+ * 中心列窄、还是因为用户把 `W` 拖小了（`W` 可被拖到 640 ⇒ `W + 32 = 672 < 700`）。
+ */
 export const NARROW_MAIN_WIDTH = 700;
 
-/** 主区右边缘离视口右边这么远（px）＝右边被别的东西占着（＝右栏开着）。 */
+/** 主区右边缘离视口右边这么远（px）就**不排除**「右边被别的东西占着」。
+ *
+ * ⚠️ 2026-10-06（票 08）复核：它**不再是「右栏开着」的判别者**——收起态因为主区被 `W + 32` 封顶
+ * 又水平居中，右边还留着 `(1000 − 712) / 2 = 144px` 的**空列**（≥ 64）；开着态是 `576 + 16 = 592`
+ * （也 ≥ 64）。两支都过，所以「过得了这一支」并不说明右栏开着。
+ * 它今天真正管的是**反方向**那一格：窗口本身就窄、右栏没开时，主区由 `C − 32` 顶到列沿
+ * （按同一算式：视口 780 ⇒ `C = 724`、`T = 692`、右边只剩 16px）⇒ 靠这一支把指错方向的提示压住，
+ * 否则「窗口窄」会被误读成「右栏挤的」。**真正的判别者是宽度那一支**（`mainWidth`）。
+ * 强度如实：`gap ≥ 64` 只是「右边还有空」的必要条件，不是「右栏开着」的判据。
+ * ⚠️ 它也因此**保守**：列被两边同时挤（窗口窄 ＋ 右栏开着）时右边同样只剩十几像素 ⇒ 这一格不提示。
+ */
 export const SIDEBAR_OPEN_RIGHT_GAP = 64;
 
 /** 那一句提示（纯提示，不点）。含「收起右栏」这个可行动的说法，也点名那颗按钮在顶栏。 */
@@ -1051,9 +1287,10 @@ export const NARROW_MAIN_HINT_TEXT =
  *
  * 两个量都来自**主区自己**的盒子（工作台根容器），不读宿主 DOM、不查宿主状态：
  *   · `mainWidth` —— 主区宽度；量不到（页签没激活、盒子还没长出来）一律**不显示**，不猜。
- *   · `mainRightGap` —— 主区右边缘到视口右边的距离：右栏开着时右边被占一大块（真机 586 / 1170px），
- *     收起时主区一路顶到视口右边（真机只剩 ~10px）。用它把「右栏开着」这一条落实了，
- *     免得窗口本来就窄、右栏没开时也冒出一句指错方向的提示。
+ *     **窄不窄由这一支说了算**（今天 `T` 由 `T = min(C − 32, W + 32)` 给出，见上面那个常量）。
+ *   · `mainRightGap` —— 主区右边缘到视口右边的距离。⚠️ 它**不等于**「右栏开着」：收起态也有
+ *     144px 的空列（2026-10-06 票 08 复核，数字与理由见上面那个常量）。它今天的作用是压住
+ *     「窗口本来就窄」那一格——收起的右边缘贴着列沿时右边只剩十几像素，那一格必须不提示。
  *
  * @param {number|null|undefined} mainWidth    主区宽度（px）
  * @param {number|null|undefined} mainRightGap 主区右边缘到视口右边的距离（px）
@@ -1327,109 +1564,18 @@ export function SocratopiaAd() {
 	);
 }
 
-// ── 机器产物的人读折叠：knowledge-map.json 的**唯一**人读形态 ─────────────────
-// ⚠️ 有正文的产物（章节/报告/方案/成品）一律走 DSH 右栏预览，不经这里（ADR-0010 决策 2）；
-// 这里只剩机器产物但**有人读形态**的那两条：知识地图（`foldKnowledgeMap`）与章节安排
-// （`foldOutline`，票 pipeline-wiring-gaps/09）——人读形态都是**就地折叠清单**——
-// 阶段页第 2 阶段的 `KnowledgeMapBlock` 与源探查确认卡调前者，第 3 阶段的 `OutlineBlock` 调后者，
-// 别让同一样东西两处两种读法。
-// （2026-09-21：原来还有 `FileViewer` 那个查看壳的第二条路，它不在渲染路径上，已随旧单卡删除。）
-
-// F38（2026-08-20 走查）：knowledge-map.json 的最小人读折叠——把原始 JSON 的
-// 章节建议/知识点清单/材料小节折叠成逐行清单；解析失败或无内容返回 null（回退原样）。
-export function foldKnowledgeMap(text) {
-	let data;
-	try {
-		data = JSON.parse(text);
-	} catch {
-		return null;
-	}
-	if (data === null || typeof data !== "object") return null;
-	const lines = [];
-	const chapters = Array.isArray(data.chapterSuggestion)
-		? data.chapterSuggestion
-		: [];
-	if (chapters.length > 0) {
-		lines.push(`📚 章节建议（${chapters.length} 章）`);
-		chapters.forEach((chapter, index) => {
-			const title = String(chapter?.title ?? "").trim();
-			const src = String(chapter?.source ?? "").trim();
-			lines.push(`${index + 1}. ${title}${src !== "" ? `　← ${src}` : ""}`);
-		});
-		lines.push("");
-	}
-	const kps = Array.isArray(data.knowledgePoints) ? data.knowledgePoints : [];
-	if (kps.length > 0) {
-		lines.push(`🎯 知识点清单（${kps.length} 个）`);
-		for (const point of kps) {
-			const title = String(point?.title ?? "").trim();
-			if (title === "") continue;
-			const diff = String(point?.difficulty ?? "").trim();
-			const src = String(point?.source ?? "").trim();
-			lines.push(
-				`· ${title}${diff !== "" ? `（${diff}）` : ""}${src !== "" ? ` ${src}` : ""}`,
-			);
-		}
-		lines.push("");
-	}
-	const materials = Array.isArray(data.materials) ? data.materials : [];
-	if (materials.length > 0) {
-		lines.push(`📄 材料小节（${materials.length} 份）`);
-		materials.forEach((material, index) => {
-			const title = String(material?.title ?? "").trim();
-			const sections = Array.isArray(material?.sections)
-				? material.sections
-						.map((s) => String(s?.title ?? "").trim())
-						.filter((t) => t !== "")
-				: [];
-			lines.push(
-				`资料${material?.num ?? index + 1}${title !== "" ? `（${title}）` : ""}：${sections.join(" / ") || "（未读到小节标题）"}`,
-			);
-		});
-		lines.push("");
-	}
-	if (lines.length === 0) return null;
-	return lines.join("\n").replace(/\n+$/, "");
-}
-
-/**
- * `work/outline.md`（章节安排）的**人读折叠形态**（票 pipeline-wiring-gaps/09）。
- *
- * ⚠️ 这一份与 `foldKnowledgeMap` 同族、同一形状：文件名带 `.md`，**内容是机器 JSON**
- * （`{"chapters":[…]}`，落盘见 `actions/chapters.js` 的 `writeWork(project,'outline.md',…)`
- * 与演示模式的 `engine.js` 那一行），所以 `domain-rules.productOpenMode` 判它 `'inline'`
- * ——不开右栏（与 `work/audit-NN.md` 同一条理由）。它与 audit 那一族的分别只在于
- * **有人读**：人读形态是**就地折叠清单**，本函数是它**唯一**的实现
- * （阶段页第 3 阶段的 `OutlineBlock` 调它；拍板前那张 `OutlineConfirmCard` 从 `meta` 直接渲染，
- * 数据与本函数同源、措辞各自成篇）。
- *
- * 解析失败 / 无内容返回 `null`（由调用方回退原文）——**不许假装读懂了**（与 foldKnowledgeMap 同纪律）。
- * @param {string} text `work/outline.md` 的原文。
- * @returns {string|null} 人读清单；读不出来时 `null`。
- */
-export function foldOutline(text) {
-	let data;
-	try {
-		data = JSON.parse(text);
-	} catch {
-		return null;
-	}
-	if (data === null || typeof data !== "object") return null;
-	const chapters = Array.isArray(data.chapters) ? data.chapters : [];
-	if (chapters.length === 0) return null;
-	const lines = [`📐 章节安排（${chapters.length} 章）`];
-	chapters.forEach((chapter, index) => {
-		const title = String(chapter?.title ?? "").trim();
-		lines.push(`${index + 1}. ${title}`);
-		const summary = String(chapter?.outline ?? "").trim();
-		if (summary !== "") lines.push(`　${summary}`);
-		const source = String(chapter?.source ?? "").trim();
-		if (source !== "") lines.push(`　源：${source}`);
-		const points = (Array.isArray(chapter?.points) ? chapter.points : [])
-			.map((pt) => String(pt ?? "").trim())
-			.filter((pt) => pt !== "");
-		if (points.length > 0) lines.push(`　覆盖知识点 ${points.length} 个：${points.join(" / ")}`);
-	});
-	return lines.join("\n");
-}
+// ── 机器产物的人读折叠：实现不住在这里 ───────────────────────────────────────
+// ⚠️ 有正文的产物（章节/报告/方案/成品）一律走 DSH 右栏预览，不经这一族（ADR-0010 决策 2）；
+// 这里只剩机器产物但**有人读形态**的那两条：知识地图与章节安排（`工作区/outline.md`）——
+// 人读形态都是**就地折叠清单**，实现在**中性模块** `machine-product-folds.js`
+// （`parseKnowledgeMap` / `foldKnowledgeMap` / `foldOutline`）。
+//
+// 📌 **票 `depth-review-2026-10/03`**：这两个函数原先住在**这个文件的尾部**，而该文件内部**零调用**
+// ——渲染路径上唯一的消费者是阶段页第 2 阶段（知识地图）与第 3 阶段（章节安排）那两块。
+// 住址与消费方分离，于是「不许 import，防成环」的三处注释被写了出来（那个环由
+// `phase-page → chapters-map` 那条边撑着，边一撤就不存在了）。搬走之后这个文件不再是它们的家。
+//
+// 📌 **票 `depth-review-2026-10/05` 收尾**：这里原先还留着一行**过渡再导出**（`foldKnowledgeMap`），
+// 只为等壳 `client-entry.js` 把那一行 import 改指到 `./ui/machine-product-folds.js`。改指已落地，
+// 那行过渡再导出连同它自陈「收尾＝改指然后删掉」的整段注释一并撤掉——留着就是「注释与代码相矛盾」。
 

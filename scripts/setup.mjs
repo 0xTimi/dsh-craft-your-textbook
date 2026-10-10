@@ -165,7 +165,13 @@ const HOST_VERSION_STATES = new Set(['meets-minimum', 'below-minimum', 'unreadab
  */
 export function parseHostVersion(raw) {
   const text = String(raw ?? '').trim()
-  const matched = /v?(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]*)?/u.exec(text)
+  // ⚠️ **`^…$` 锚点是承重的**（票 `.scratch/host-version-drift/01`）：收编前这条正则**不锚定**，
+  // 于是它对自己上面那段注释逐字点名的 `dsh 0.1.7` 读得出 `0.1.7`——**代码与自己的契约相反**。
+  // 更糟的是不锚定等于**猜**：输出里混进别的东西时（`error: cannot find module\n0.1.7`），
+  // 它会把一段真文本里的子串当成版本报出去，正是「静默读出一份假的事实」那一族。
+  // 本机实测 `dsh --version` 印的是裸串（2026-10-02：`dsh --version` → `0.1.7-rc.2`），
+  // 所以收紧**不会**造成「用户装不上」——`judgeHostVersion` 的「读不出」那一档是提示不是拦截。
+  const matched = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/u.exec(text)
   if (matched === null) {
     return { ok: false, code: 'host-version-unreadable', raw: text, detail: `读不出宿主版本号：${text === '' ? '(空)' : text}` }
   }

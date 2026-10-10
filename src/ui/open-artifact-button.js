@@ -6,11 +6,17 @@
  * （产物行 / 材料行 / 旧稿行）、事件行行内、章节卡非过目态都用它，不许再抄一份实现。
  *
  * ⚠️ 它原住在 `src/ui/phase-page.js`（票 02 把内部件升成具名导出 `OpenArtifactButton`）。
- * 票 09 要章节卡（`chapters-map.js`）也用它，而 `phase-page.js` 已经 import 了 `chapters-map.js`
- * （`foldKnowledgeMap`）——反过来 import 就成环
+ * 票 09 要章节卡（`chapters-map.js`）也用它，而当时 `phase-page.js` 已经 import 了
+ * `chapters-map.js`（为了 `foldKnowledgeMap`）——反过来 import 就成环
  * （`chapters-map → phase-page → chapters-map`），且环上两个文件都是渲染路径上的域文件。
  * 故把这一件搬到**中性模块**：`phase-page.js` 原样再导出它（票 02 的导出表面不变），
  * `chapters-map.js` 从这里 import——两个域都不碰对方的实现，也不引入环。
+ *
+ * 📌 **那条环今天已经不存在了**（票 `depth-review-2026-10/03`）：`foldKnowledgeMap` 与
+ * `foldOutline` 搬去了中性模块 `machine-product-folds.js`，于是 `phase-page → chapters-map`
+ * 那条边撤掉了。⚠️ **本文件仍住在中性模块**、两个域仍各自直接 import 它——这已是终局而不是
+ * 权宜：它是**渲染路径上的真共用件**（阶段页三处 + 事件行 + 章节卡），搬进任何一个域都会
+ * 让另一个域反向 import 它。换句话说，「防成环」不再是理由，但结论不变。
  *
  * prop 契约：`{ item, onOpen, label?, disabled?, title?, style? }`——
  *  - `item.path` 是工作区相对路径，点一下交出 `onOpen(item.path)`；
@@ -41,7 +47,7 @@ export function OpenArtifactButton(props) {
 			},
 			onClick: () => props.onOpen(props.item.path),
 			disabled: props.disabled === true,
-			// 票 10（判定三 #1）：这里原来印 `${props.item.path}`（`work/explore.md` 这类机器路径）。
+			// 票 10（判定三 #1）：这里原来印 `${props.item.path}`（`工作区/explore.md` 这类机器路径）。
 			// CONTEXT.md「产物名」明写「产物相对路径原文连按钮的悬浮提示一起不上屏」——名字一律走
 			// `artifactName`（票 05 的同一份词表，任何屏同一个名字）。
 			title: props.title ?? `在右栏打开「${artifactName(props.item.path)}」`,

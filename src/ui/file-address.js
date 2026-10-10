@@ -2,15 +2,22 @@
  * DSH 文件地址拼装（`dsh-resource://file/…`）——工作台「打开一份文件看看」共用。
  *
  * 为什么自己实现：这套语法与语义属于 dsh 的 `@deepseek-ai/dsh-util-workspace-path`
- * （`fileAddressFor` / `sessionFileAddress`），但那个包不发布进客户端模块表
+ * （上游那边叫 `fileAddressFor` / `sessionFileAddress`），但那个包不发布进客户端模块表
  * （各客户端插件在自己的 bundle 里内联它，我们引不到），故按其同一规则本地实现；
- * `fileAddressFor` 的行为与上游逐条对齐（地址串断言在 test-product-open-mode.mjs
+ * 拼出来的地址与上游逐条对齐（地址串断言在 test-product-open-mode.mjs
  * 的「地址语法」「工作区相对/绝对」三例里）。
  *
- * 依据 ADR-0010 决策 8：地址用**工作区相对路径**拼（`<书文件夹名>/work/chapter-01.md`），
+ * 依据 ADR-0010 决策 8：地址用**工作区相对路径**拼（`<书文件夹名>/工作区/chapter-01.md`），
  * 不是绝对路径——保住「这个会话只能看自己工作区」的约束。
  * 书夹不在工作区内（老书留在 ~/.dsh/textbook/projects）时退回绝对路径形态，
  * 与上游同一取舍：此时由宿主按会话读权限判定，读不到就由右栏正文报错，不静默。
+ *
+ * ── interface 只有 `bookFileAddress` 一个（票 `deep-module-scan/08` 乙）────────────────
+ * 下面 `sessionFileAddress` / `fileAddressFor` 是**地址串拼装的中间两步**，本地没有第二个
+ * caller（生产侧唯一 caller 就是 `bookFileAddress`），曾为让一条测试够得着而导出——那是
+ * 「interface 被测试撑宽」。⇒ 二者收回成 module 内部，**地址语法那四条断言改穿
+ * `bookFileAddress`**，期望值一个没改。它们的名字与上游 API 同名是**有意**的：规则照抄上游，
+ * 但**导出面不照抄**——我们够不到上游那个包，就不该替它维护一份公共表面。
  */
 
 const FILE_ADDRESS_PREFIX = "dsh-resource://file/";
@@ -26,7 +33,7 @@ function encodeSegment(segment) {
  * @param {string} path - 反斜杠会被归一为 `/`，开头的 `./` 会被去掉。
  * @returns {string} `dsh-resource://file/session/<id>/<path>`
  */
-export function sessionFileAddress(sessionId, path) {
+function sessionFileAddress(sessionId, path) {
 	const normalized = String(path ?? "")
 		.replace(/\\/g, "/")
 		.replace(/^(?:\.\/)+/, "");
@@ -44,7 +51,7 @@ export function sessionFileAddress(sessionId, path) {
  * @param {string} path - 绝对路径或工作区相对路径。
  * @returns {string} `dsh-resource://file/…` 地址。
  */
-export function fileAddressFor(sessionId, cwd, path) {
+function fileAddressFor(sessionId, cwd, path) {
 	const normalized = String(path ?? "").replace(/\\/g, "/");
 	const root =
 		typeof cwd === "string" && cwd !== ""
@@ -58,11 +65,11 @@ export function fileAddressFor(sessionId, cwd, path) {
 }
 
 /**
- * 书文件夹里的一个产物（`work/chapter-01.md` 这种书内相对路径）→ 预览地址。
+ * 书文件夹里的一个产物（`工作区/chapter-01.md` 这种书内相对路径）→ 预览地址。
  *
  * 书夹在会话工作区内时结果为**工作区相对路径**（ADR-0010 决策 8）：
- *   fileAddressFor("s1","D:\\code","D:\\code\\演示书", "work/chapter-01.md")
- *     → dsh-resource://file/session/s1/演示书/work/chapter-01.md
+ *   fileAddressFor("s1","D:\\code","D:\\code\\演示书", "工作区/chapter-01.md")
+ *     → dsh-resource://file/session/s1/演示书/%E5%B7%A5%E4%BD%9C%E5%8C%BA/chapter-01.md
  * 书夹在工作区外（老书留在 ~/.dsh/textbook/projects）时退回绝对路径形态，
  * 读不读得到交给宿主按该会话的读权限判，不由前端猜。
  *

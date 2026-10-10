@@ -18,7 +18,7 @@
  * 两条硬边界（承 ADR-0010）：
  *  1. 产物一律由写着「打开」的显式按钮交给 DSH 右栏（`onOpen`，只读、不进模型上下文）；
  *     **导航本身不开任何文件**。
- *  2. 机器产物（`work/audit-NN.md`）与走卡片内联的（知识地图、章节安排 `work/outline.md`）
+ *  2. 机器产物（`工作区/audit-NN.md`）与走卡片内联的（知识地图、章节安排 `工作区/outline.md`）
  *     都不进"文件"清单——判据见 `view-rules.openableArtifacts`；后两者的可读形态由本文件的
  *     `KnowledgeMapBlock` / `OutlineBlock` 就地折叠承担（票 pipeline-wiring-gaps/09）。
  *
@@ -37,13 +37,25 @@ import {
 	stepWord,
 	PHASE_UI,
 	materialConversionActivityText,
+	convertedIcon,
+	convertedState,
+	originalPreviewOpenable,
+	originalSourceRel,
+	// 票 `demo-flow-fidelity/06`：演示书那句提示（与终检认可卡**同一句**）与它的判据。
+	demoQualityChecksNote,
+	isDemoBook,
 } from "./view-rules.js";
 // 「打开这份文件」按钮：票 09 起住中性模块（章节卡也要用它，直接从本文件 import 会成环，
 // 理由见那一件顶部的注释）——本文件原样**再导出**它，票 02 的导出表面不变。
 import { OpenArtifactButton } from "./open-artifact-button.js";
-// 知识地图（机器产物）的人读折叠：与阶段页里就地展开它的 `KnowledgeMapBlock` 共用一份，
-// 别让同一样东西两处两种读法。
-import { foldKnowledgeMap, foldOutline } from "./chapters-map.js";
+// 机器产物（知识地图 / 章节安排 `工作区/outline.md`）的人读折叠：**中性模块**，零 react 依赖、
+// 零域词，形状知识只此一份（原来住在 `chapters-map.js` 尾部而该文件内部零调用——票
+// `depth-review-2026-10/03` 收编）。同源、但**措辞各自成篇**：下面 `KnowledgeMapBlock` 与
+// `OutlineBlock` 用折叠那一份，源探查确认卡另有一份自己的说法（既有裁决，不许统一）。
+import { foldKnowledgeMap, foldOutline } from "./machine-product-folds.js";
+// 票 02（`workbench-card-contract`）：「这张卡吃什么」写在**卡旁边**，不写在壳里。声明式本身
+// 住在中性 module `card-view.js`（零 react 依赖、零域词）——见下面 `phasePageView`。
+import { defineCardView } from "./card-view.js";
 
 // 每个阶段用哪套布局（用户裁决的那张表；改它等于改设计，别顺手改）。
 const PHASE_LAYOUT = Object.freeze({
@@ -122,9 +134,16 @@ function StepDetailLines(props) {
 }
 
 /**
- * 票 09：`OpenArtifactButton` 已搬去中性模块 `./open-artifact-button.js`（章节卡也要用它，
- * 而本文件已经 import 了 `chapters-map.js`——反向 import 会成环）。这里**原样再导出**，
- * 票 02 的导出表面（`test-phase-page.mjs` 与 `client-entry.js` 都按本文件取它）保持不变。
+ * 票 09：`OpenArtifactButton` 已搬去中性模块 `./open-artifact-button.js`。这里**原样再导出**，
+ * 票 02 的导出表面（`test-phase-page.js` 的测试与 `client-entry.js` 都按本文件取它）保持不变。
+ *
+ * 📌 **它当初搬走的那条理由已经不存在了**（票 `depth-review-2026-10/03`）：当时本文件为了
+ * `foldKnowledgeMap` import 了 `chapters-map.js`，反向 import 会成环。那两个折叠函数今天住在
+ * 第三个文件——中性模块 `./machine-product-folds.js`（零 import、不认识任何一张卡），
+ * 于是 `phase-page → chapters-map` 这条边已经撤掉，环本来就不存在了。
+ * ⚠️ 本文件**继续**不 import `chapters-map.js`：那是界面层另一个域的渲染件，与本页无关；
+ * 真要引它的理由也不会是「防成环」——是「这个域的东西真的进得来吗」。`test-phase-page.mjs`
+ * 的「依赖方向」那条源码级断言钉住这一条。
  */
 export { OpenArtifactButton };
 
@@ -474,6 +493,53 @@ function MaterialsBody(props) {
 	const sources = props.sources ?? [];
 	const step = props.step;
 	const conversionText = materialConversionActivityText(props.meta, props.events);
+	/**
+	 * 一行材料上的**入口**（票 `mineru-formats/11` / `ADR-0029`）：
+	 *   - 「打开原件」：**非 PDF** 的原件给（`ADR-0011` 决策 2 的**按格式例外**，不是推翻它——
+	 *     照片的原件就是最好的核对对象，而 14 种格式里 9 种转换质量未标定）。判据读
+	 *     `originalPreviewOpenable`（`family` 派生），**不在这层判后缀**；
+	 *   - 「打开」：转换稿那一份（票 10 的行的形状＝[名字] + [打开]，文案一个字不动）。
+	 *
+	 * ⚠️ **两个入口都是纯导航**（承 `ADR-0010` 决策 1/6）：点一下只把工作区相对路径交给
+	 * `props.onOpen` → DSH 右栏，**不落账、不发动作、不建旁路**——用户在这里读到的东西永不
+	 * 进入模型请求。⚠️ 通道是**宿主的**阅读器，它在图片／PPTX 上的渲染能力属宿主事实（本仓
+	 * 没有随库的契约快照可查，见票 11 的 `## Comments`）；本层只管给不给这个入口。
+	 */
+	const entriesFor = (source) => {
+		const buttons = [];
+		if (originalPreviewOpenable(source.file))
+			buttons.push(
+				h(OpenArtifactButton, {
+					item: { path: originalSourceRel(source.file) },
+					// 与转换稿**同一个** `onOpen`（同一个 DSH 右栏通道），不另写第二条打开路径。
+					onOpen: props.onOpen,
+					// 词仍只来自登记词表：「打开」＋「原件」。⚠️ 这一行有两个入口了，两颗都只写
+					// 「打开」分不清谁是谁——转换稿那颗按票 10 保持原样（一个字不动），新那颗自带
+					// 限定语。tooltip 由 `artifactName` 出（「x 的原件」，`CONTEXT.md`「产物名」）。
+					label: "打开原件",
+					style: { marginLeft: 0 },
+				}),
+			);
+		// 只有真转成了才给「打开」——没转成/转失败的压根没有转换稿可开。
+		if (convertedState(source) === "ok" && typeof source.md === "string" && source.md !== "")
+			buttons.push(
+				h(OpenArtifactButton, {
+					item: { path: `材料/转换稿/${source.md}` },
+					onOpen: props.onOpen,
+					// 票 10（判定一 #14）：行的形状是 **[名字] + [打开]**（CONTEXT.md「产物名」）
+					// ——左边那格已经是这份材料的名字（`source.file`），所以按钮只说动词「打开」，
+					// 不再自造「查看转换内容」这种说法；这一份叫什么由按钮 tooltip 给出
+					// （`artifactName` →「x 的转换稿」）。
+				}),
+			);
+		return buttons.length === 0
+			? null
+			: h(
+					"div",
+					{ style: { display: "flex", gap: "8px", alignItems: "center", marginLeft: "auto" } },
+					...buttons,
+				);
+	};
 	return h(
 		"div",
 		{ style: S.card },
@@ -524,23 +590,27 @@ function MaterialsBody(props) {
 							h(
 								"span",
 								{ style: { flex: 1, fontSize: "13px", wordBreak: "break-all" } },
-								`${source.converted === true ? "✅" : "⏳"} ${source.file}（${source.role ?? ""}）`,
+								`${convertedIcon(source)} ${source.file}（${source.role ?? ""}）`,
 							),
-							source.converted === true &&
-								typeof source.md === "string" &&
-								source.md !== ""
-								? h(OpenArtifactButton, {
-										item: { path: `sources-md/${source.md}` },
-										onOpen: props.onOpen,
-										// 票 10（判定一 #14）：行的形状是 **[名字] + [打开]**（CONTEXT.md「产物名」）
-										// ——左边那格已经是这份材料的名字（`source.file`），所以按钮只说动词「打开」，
-										// 不再自造「查看转换内容」这种说法；这一份叫什么由按钮 tooltip 给出
-										// （`artifactName` →「x 的转换稿」）。
-									})
-								: null,
+							entriesFor(source),
 						),
 					),
 				),
+		// 票 `mineru-formats/03`：红源在阶段页也要**说清是什么事**（只呈现，不给动作）。
+		// 阶段页是只读的（ADR-0012 决策 6）——那两个可点的出口在「材料准备」那一步的卡上
+		// （`MaterialGapList`），这里只把去处指出来，不摆一个点不动的按钮。
+		...sources
+			.filter((source) => convertedState(source) === "failed")
+			.map((source) =>
+				h(
+					"p",
+					{
+						key: `gap-${source.file}`,
+						style: { margin: "6px 0 0", fontSize: "12px" },
+					},
+					`${source.file}：这一份没转成，这本书暂时缺它；到「材料准备」那一步补传或删掉它。`,
+				),
+			),
 	);
 }
 
@@ -556,8 +626,9 @@ export function KnowledgeMapBlock(props) {
 			{ style: S.card },
 			h("p", { style: { margin: 0, fontSize: "12px", opacity: 0.7 } }, "还没有挑重点的结果。"),
 		);
-	// 机器产物（原始 JSON）折成人读清单：与 FileViewer 走同一份 foldKnowledgeMap（F38）——
-	// 这份知识地图有两条展示路径，读法不能两样。解析失败/无内容时回退原文（不假装读懂了）。
+	// 机器产物（原始 JSON）折成人读清单（F38）：解析失败/无内容时回退原文（不假装读懂了）。
+	// ⚠️ 这里的折叠**只管形状**，措辞归这个折叠自己——源探查确认卡读同一份 JSON、用它自己的
+	// 说法（既有裁决「数据同源、措辞各自成篇」）。这两处不许互相改文案。
 	const folded = foldKnowledgeMap(text);
 	const body = folded ?? text;
 	return h(
@@ -577,7 +648,7 @@ export function KnowledgeMapBlock(props) {
 	);
 }
 
-/** 拍板定方案：章节安排（`work/outline.md` 是机器 JSON，人读形态是**就地折叠清单**）。 */
+/** 拍板定方案：章节安排（`工作区/outline.md` 是机器 JSON，人读形态是**就地折叠清单**）。 */
 export function OutlineBlock(props) {
 	const [open, setOpen] = useState(false);
 	const text = typeof props.text === "string" && props.text !== "" ? props.text : null;
@@ -587,8 +658,8 @@ export function OutlineBlock(props) {
 			{ style: S.card },
 			h("p", { style: { margin: 0, fontSize: "12px", opacity: 0.7 } }, "还没有章节安排。"),
 		);
-	// 机器产物（原始 JSON）折成人读清单：与知识地图同一条路（`chapters-map.foldOutline`）——
-	// 解析失败/无内容时回退原文（不假装读懂了）。`work/outline.md` 判 `'inline'` 不开右栏
+	// 机器产物（原始 JSON）折成人读清单：与知识地图同一条路（同一个中性模块里的 `foldOutline`）——
+	// 解析失败/无内容时回退原文（不假装读懂了）。`工作区/outline.md` 判 `'inline'` 不开右栏
 	// （票 pipeline-wiring-gaps/09），所以**这里就是它回看时唯一的人读出口**。
 	const folded = foldOutline(text);
 	const body = folded ?? text;
@@ -657,7 +728,16 @@ export function GoldBlock(props) {
 	);
 }
 
-/** 最后检查：机器逐项检查 + AI 检查报告（都来自账本，客户端本来就有）。 */
+/**
+ * 最后检查：机器逐项检查 + AI 检查报告（都来自账本，客户端本来就有）。
+ *
+ * ⚠️ 票 `demo-flow-fidelity/06`：演示书在这一块上也比真书少两块（机器检查只跑前 6 项、
+ * 没有 AI 检查报告），所以这里明说差在哪——句子出自 `view-rules.demoQualityChecksNote()`，
+ * 与终检认可卡（`event-cards.js` 的 `FinalApprovalCard`）**同一个函数**，不许各拼一份。
+ * `demo` 由调用方（本文件的 `PhasePage`）用 `isDemoBook(meta)` 算好递进来：这一块只负责摆字。
+ * ⚠️ 票 06 收口（2026-10-08）：递进去的是**这一屏真的列出来的** `checks`（那句提示的
+ * 「前 N 项」的 N 从它现算），不是拿条数反推演示与否——演示与否仍只看 `props.demo`。
+ */
 export function FinalChecksBlock(props) {
 	const checks = props.checks ?? [];
 	const report =
@@ -666,6 +746,13 @@ export function FinalChecksBlock(props) {
 		"div",
 		{ style: S.card },
 		h("strong", { style: { fontSize: "13px" } }, "机器逐项检查"),
+		props.demo === true
+			? h(
+					"p",
+					{ style: { margin: "4px 0 0", fontSize: "12px", opacity: 0.75 } },
+					demoQualityChecksNote(checks),
+				)
+			: null,
 		checks.length === 0
 			? h("p", { style: P.empty }, "还没有检查结果。")
 			: h(
@@ -721,6 +808,94 @@ function UndoButton(props) {
 	);
 }
 
+/**
+ * `PhasePage` 的 props 契约（票 `workbench-card-contract` 02）。
+ *
+ * 阶段页有两个 mount 点（壳 `client-entry.js`：浏览态那一处 ＋ 阶段页态那一处），**两个
+ * mount 点共用这一份契约**（两个 slot 注册同一个 builder 是刻意的，见 `card-view.js`）。
+ * 它们今天共用一个 `renderPhasePage(overrides)` helper，**差异只在那三个键上**：
+ *
+ *   浏览态那一处   ＋ `focusedStep`（`browsing`）、`key`；**没有** `events`
+ *   阶段页态那一处 ＋ `events`；**没有** `focusedStep`、**没有** `key`
+ *
+ * ⚠️ **`key` 不在本袋里——它由 React 消费，从不到达组件体**（React 建元素时把它摘走，
+ * 组件 `props` 上永远没有它）。所以它**绝不许**列 `required`，壳也不许 `.with({key})`
+ * （delta 的闭集是 `fromBook` ∪ `defaults`，会当场抛「契约没声明的键」）；壳要把它写在
+ * `createElement` 的 props 里、与袋并列。
+ *
+ * ⚠️ **那三个键登记在 `defaults` 而不是 `fromBook`／`derive`**：它们是**每个 mount 点各自
+ * 说的值**（浏览态给 `viewPhaseOfBrowsing`／`browsing`，阶段页态给 `viewPhase`／`events`），
+ * 不是「这本书」的数据。`defaults` 是 `.with()` 闭集的一部分 ⇒ 两个 mount 点能各自覆盖它；
+ * 走 `derive` 就既覆盖不了、也会让「键」与「整形出来的结果」脱节。
+ *
+ * **必填一项**：`projector`——它在**每次渲染**都被无条件调用（`project({kind:"phase"})`），
+ * 缺了它这张卡当场渲不出来。
+ * ⚠️ 它的来源是壳里的 `stageStepProjector`（**不是**模块级单例：`useMemo` 的三个依赖之一
+ * `runningSubagentCount` 来自宿主会话状态、**不在 `book` 里** ⇒ book 引用没动它也会换身份）。
+ * 别拿它当记忆化 key。
+ *
+ * ⚠️ **刻意不列必填的那几个**，逐条都有卡内的证据（列了必填就是在说「缺了是接线事故」，
+ * 而卡内明写着它们可以没有）：
+ *   · `processToken` —— 卡内是 `props.processToken ?? null`（票 11/ADR-0021 决策 15 的清除信号）。
+ *   · `onDeepModify` —— 卡内是 `props.onDeepModify?.(…)`；**提交后不换屏**那一支（票 11）。
+ *   · `onDeepUndo`  —— 卡内是 `props.onDeepUndo?.()`（`UndoButton` 里），且撤销入口本身
+ *     受「10 分钟窗 ＋ 账面无新进展」两道判据控制，不给入口时整颗按钮不渲染。
+ *   · `checks` / `goldDrafts` —— 卡内是 `props.checks ?? []` / `props.goldDrafts ?? []`。
+ *   · `meta` —— 全程 `meta?.… ?? 兜底`（老账本字段可以没有）。
+ *   · `events` / `focusedStep` —— 上表：两个 mount 点本来就不都给。
+ *
+ * ⚠️ **`.with()` 改不动 `derive` 整形出来的那一位**（`onOpen`）：delta 的闭集
+ * `= fromBook ∪ defaults`，「一个名字一处来源」在 `card-view.js` 里是**闸**不是纪律。
+ */
+export const phasePageView = defineCardView({
+	card: "PhasePage",
+	fromBook: [
+		// ⚠️ 壳里写的是 `projector: stageStepProjector`——**原样转发**，不经 derive。
+		"projector",
+		// 票 11 + ADR-0021 决策 15：乐观 redo 的清除信号 ＝ 当前 `segments` 数组的 commit token。
+		"processToken",
+		"meta",
+		"checks",
+		"aiReport",
+		"knowledgeMapText",
+		"outlineText",
+		"goldDrafts",
+		"goldDraftVersion",
+		"busy",
+		// ⚠️ 壳里写的是 `onOpen: openInSidebar`。**book 侧刻意用壳里那个标识符**：同一个
+		//    「打开」语义在这份壳里还有别的闭包（事件行那颗 `onOpen: () => viewWork(product)`、
+		//    源探查卡的 `onViewReport`），一个扁平的 book 上撞了名就说不清谁是谁。
+		"openInSidebar",
+		// 这两个是壳里的就地箭头（`postAction({action:"deep-modify"|"deep-undo"})`），没有自己的
+		// 局部标识符，prop 名就是它们在壳里写的名字。
+		"onDeepModify",
+		"onDeepUndo",
+	],
+	required: ["projector"],
+	defaults: {
+		// 三个「每个 mount 点各自说」的键（见上方那张表）。壳的两个 mount 点都**显式**给，
+		// 这里的缺省只是让「没给」有话说，而不是让它安静地渲出一页空阶段。
+		phase: null,
+		focusedStep: null,
+		events: null,
+	},
+	// book 侧键 → 卡片 prop 名。壳里是 `onOpen: openInSidebar`，卡里叫 `onOpen`。
+	derive: (bag) => ({ onOpen: bag.openInSidebar }),
+});
+
+/**
+ * 卡片体内 16 个 prop 名的**完整清单**（`:816` 解构 3 个 ＋ `props.某名` 直读 13 个）——
+ * 「这张卡吃什么」写在**卡旁边**，这一串就是它的全部。改任何一处都要回来改上面的契约。
+ *
+ *   解构（`:816`）      `phase` `meta` `onOpen`
+ *   直读 `props.某名`   `processToken`(:825) `onDeepModify`(:834) `busy`(:836)
+ *                       `projector`(:843) `focusedStep`(:846) `events`(:890)
+ *                       `knowledgeMapText`(:899) `outlineText`(:902) `goldDrafts`(:908)
+ *                       `goldDraftVersion`(:909) `checks`(:919) `aiReport`(:919)
+ *                       `onDeepUndo`(:958) `busy`(:958)
+ *
+ * ⚠️ 卡体内**一个字不改**（spec 不变量 1：袋是扁平的，`test-phase-page.mjs` 那 32 例照旧跑）。
+ */
 export function PhasePage(props) {
 	const { phase, meta, onOpen } = props;
 	// 票 11：提交「✍️ 就这么改，重做下游」后**不换屏**（热区表判"提交后替用户换屏"不合法），
@@ -825,7 +1000,14 @@ export function PhasePage(props) {
 		);
 	if (phase === 6)
 		extras.push(
-			h(FinalChecksBlock, { key: "checks", checks: props.checks, aiReport: props.aiReport }),
+			h(FinalChecksBlock, {
+				key: "checks",
+				checks: props.checks,
+				aiReport: props.aiReport,
+				// 票 `demo-flow-fidelity/06`：演示与否只有 `meta.demo` 一个来源（`card-view.js` 的
+				// 契约里 `meta` 早就在 `fromBook` 里），**不**拿检查条数去猜。
+				demo: isDemoBook(meta),
+			}),
 		);
 
 	if (steps.length === 0 && layout !== "materials") {

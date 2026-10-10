@@ -16,7 +16,17 @@ import { readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { jsonrepair } from "jsonrepair";
-import { ROLES, guessRoleFromName } from "./domain-rules.js";
+import {
+	ROLES,
+	guessRoleFromName,
+	// 探查报告的**必做小节名**（票 `demo-flow-fidelity/04`）——演示夹具那份 `工作区/explore.md`
+	// 必须逐字含这几个词：验货是 `includes` 子串匹配（`src/workflow/actions/chapters.js:447-452`），
+	// 这里抄一份字面量就等于第二份会漂的词表（词表改名 → 夹具静默失配 → 演示书第一份报告
+	// 按真实口径当场 400）。小节名只此一处，派生面＝下面 `demoExplore()` 的 `index`。
+	EXPLORE_ITEM_CODE_TABLE,
+	EXPLORE_ITEM_TRUTH_CALIBRATION,
+	EXPLORE_ITEM_COMMON_ANCHORS,
+} from "./domain-rules.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const RESOURCES_DIR = join(HERE, "..", "resources");
@@ -142,6 +152,105 @@ function parseJsonLoose(raw) {
 
 // ── 演示模式 · 流水线占位产出（仅 demo 书） ────────────────────────────────
 
+// ── 演示夹具的**叙述口径**（票 demo-flow-fidelity/03、02）────────────────────
+//
+// ⚠️ 这是**演示夹具的用词／结构口径**，不是产品词表（产品词表在 `src/ui/` 与 `resources/`，
+//    界面判定线见 `CONTEXT.md`「界面用词表」）。它只服务这一件事：演示书里几处叙述面
+//    本来各写各的字面量，改一处必漏另一处（2026-10-07 只读审计 C3/C4/C7/C8，票 03；
+//    以及 C1/C2/C5 的**章数**那一半（C6「低于 4 章下限」那条走登记豁免，见票 08），票 02——
+//    见下面 `DEMO_CHAPTERS`）。
+//    所以下面每一处字面量都从这几个常量派生，派生面＝demoExplore / demoGateProposal /
+//    demoGoldChapter / demoOutline 这四个函数。
+//
+// 共用判据件的期望值也从这里取（`test-demo-fixtures.mjs` import 本文件），
+// 不另抄一份口径。
+//
+// 票 `demo-flow-fidelity/04` 再补一件：`demoExplore()` 的 `index` 要含**探查必做小节**那三节
+// （名字从 `domain-rules.js` 的 `EXPLORE_ITEM_*` import，见文件头的 import 注释）。
+
+/** 演示夹具里材料的叫法。跟**知识地图**那一侧（`materials[]` 是产物、也是给主笔看的交办文本）。 */
+export const DEMO_MATERIAL_TERM = "资料";
+
+/** 演示夹具里唯一那份源的编号（与 demoExplore 的 `materials[].num:1` 同一份，票 01 的 Q6＝甲）。 */
+export const DEMO_MATERIAL_NUM = 1;
+
+/** 「资料1」/「资料1：数的认识部分」——演示夹具里每一处 source 引用都走这一个出口。 */
+export function demoMaterialRef(part) {
+	const head = `${DEMO_MATERIAL_TERM}${DEMO_MATERIAL_NUM}`;
+	return part === undefined || part === "" ? head : `${head}：${part}`;
+}
+
+/** 章节板块链的**唯一**顺序（关卡 2 提案标题／关卡 3 提案摘要／`styleSpec` 三处共用）。 */
+export const DEMO_SECTION_STEPS = Object.freeze(["概念", "例题", "易错点", "小练习"]);
+
+/** 板块链的箭头写法（三处逐字相同，判据按子串比对）。 */
+export const DEMO_SECTION_CHAIN = DEMO_SECTION_STEPS.join(" → ");
+
+/** 每段的分钟数——和上面同一份 steps 走，`DEMO_CHAPTER_MINUTES` 由它求和派生。 */
+export const DEMO_SECTION_MINUTES = Object.freeze({
+	概念: 10,
+	例题: 10,
+	易错点: 5,
+	小练习: 15,
+});
+
+/** 一章的总时长＝各段之和（**派生**，不手写第二份数）。 */
+export const DEMO_CHAPTER_MINUTES = DEMO_SECTION_STEPS.reduce(
+	(sum, step) => sum + DEMO_SECTION_MINUTES[step],
+	0,
+);
+
+/** 「概念（10分钟）→ 例题（10分钟）→ ……」——关卡 3 提案摘要里的分段时长那半句。 */
+export function demoSectionMinutesText() {
+	return DEMO_SECTION_STEPS.map((step) => `${step}（${DEMO_SECTION_MINUTES[step]}分钟）`).join(" → ");
+}
+
+/**
+ * 演示书的**章级骨架**——「这本书有几章、各叫什么、各写什么」的**唯一**一份事实
+ * （票 `demo-flow-fidelity/02`；2026-10-07 只读审计 C1「四处章数不同」、C2「关卡 3 列的
+ * 第 3／4／5 章 乘法／除法／混合运算既不在知识地图、也不在章节安排里」）。
+ *
+ * 派生面（改这里，下面这几处跟着走，**别在别处再抄一份章名或章数**）：
+ *   - `demoOutline().chapters`（章节安排：逐字段；`source` 仍走 `demoMaterialRef()`）
+ *   - `demoExplore()` 的 `index`（落成 `工作区/explore.md`，正文那句「共 N 章」）
+ *   - `demoExplore()` 的 `knowledgeMap.chapterSuggestion`（条数与章名）
+ *   - `demoGateProposal(3)` 的标题（「全书 N 章」）与摘要（「第1章 … → 第N章 …」那串，
+ *     以及末章自查清单那句的章号——它原先写死「第 6 章」，是同一个数的第五处写法）
+ *
+ * ⚠️ 有意**不**把知识地图的 `knowledgePoints[].title` 也收到这份骨架里：那是**另一处**事实，
+ * `test-collab-replay.mjs` 的 `checkDemoPointsCaliber` 正是拿两边互对（`chapterSuggestion[].points`
+ * 逐字命中 `knowledgePoints[].title`）。两边同源＝判据变成自证（`dev-gate-scan/17` 那个病）。
+ * 今天两边的字面量恰好相同——那是这条判据要**守着**的，不是要**抹平**的。
+ */
+export const DEMO_CHAPTERS = Object.freeze([
+	Object.freeze({
+		title: "数的认识",
+		outline: "什么是数、数的读写、大小比较",
+		sourcePart: "数的认识部分",
+		targetWords: 4000,
+	}),
+	Object.freeze({
+		title: "加减法",
+		outline: "不进位/进位加法、不退位/退位减法",
+		sourcePart: "加减法部分",
+		targetWords: 5000,
+	}),
+	Object.freeze({
+		title: "应用题综合",
+		outline: "读懂题意、分步列式、检查答案",
+		sourcePart: "应用题部分",
+		targetWords: 6000,
+	}),
+]);
+
+/** 演示书的章数——**派生**自 `DEMO_CHAPTERS`，不手写第二份数（票 01 裁决：骨架维持 3 章）。 */
+export const DEMO_CHAPTER_COUNT = DEMO_CHAPTERS.length;
+
+/** 「第1章 数的认识 → 第2章 加减法 → …」——关卡 3 提案摘要里那串章名（派生自 `DEMO_CHAPTERS`）。 */
+export function demoChapterChainText() {
+	return DEMO_CHAPTERS.map((chapter, index) => `第${index + 1}章 ${chapter.title}`).join(" → ");
+}
+
 function demoExplore() {
 	return {
 		index: `${DEMO_MARK}
@@ -150,14 +259,23 @@ function demoExplore() {
 ## 材料清单
 - 《示例教材》全文（由 MinerU 转换的 Markdown）
 
+## ${EXPLORE_ITEM_CODE_TABLE}
+- ${String(DEMO_MATERIAL_NUM).padStart(2, "0")} ＝《示例教材》（学生用书）：本报告唯一一份源，正文按"概念 → 例题 → 练习"组织，权威层级最高。
+
+## ${EXPLORE_ITEM_TRUTH_CALIBRATION}
+- 本报告是**演示占位**：数值与结论都不作真伪判断，也不代表真翻过源文件。真实书里这一节写的是"哪些说法只是转述、哪些在源里有出处"。
+
 ## 结构观察
-1. 全书按"概念 → 例题 → 练习"组织，共 6 章。
+1. 全书按"概念 → 例题 → 练习"组织，共 ${DEMO_CHAPTER_COUNT} 章。
 2. 权威层级：教材正文 > 例题 > 练习。
 3. 角色标签：学生用书（正文）、教师用书（讲解提示）。
 
 ## 教学线索
 - 知识点密度中等，公式较少。
 - 每章末有小结与习题，适合直接复用为"自查清单"。
+
+## ${EXPLORE_ITEM_COMMON_ANCHORS}
+- 贯穿案例"小明学数学"跨全书各章复用；每章按"${DEMO_SECTION_CHAIN}"四段式组织（板块链与关卡提案同一份口径）。
 `,
 		knowledgeMap: {
 			materials: [
@@ -172,19 +290,48 @@ function demoExplore() {
 					],
 				},
 			],
+			// 票 pipeline-wiring-gaps/14：`points` 全仓统一按票 01 裁决的 **title 口径**——
+			// 每一项逐字命中本夹具 `knowledgePoints[].title`（id 留在 knowledgePoints 上，
+			// 但不接进比对环；把 points 写成 id 会被 test-collab-replay 的 points 口径判据点名）。
 			knowledgePoints: [
 				{
 					id: "kp-1",
 					title: "数的认识",
-					source: "资料1：数的认识",
+					source: demoMaterialRef("数的认识"),
 					summary: "数与运算的基础概念",
-					difficulty: "低",
+					// 票 pipeline-wiring-gaps/06：difficulty 有登记取值域（domain-rules
+					// .KNOWLEDGE_POINT_DIFFICULTY：基础/重点/难点/进阶）——夹具原写「低」是出域值
+					// （只靠界面兜底灰兜着），改成域内值；顺带给「重点」「难点」两格补知识地图语境样本
+					//（原先这两格全仓零样本，钉在 test-knowledge-difficulty.mjs）。
+					difficulty: "基础",
+				},
+				{
+					id: "kp-2",
+					title: "加减法",
+					source: demoMaterialRef("加减法"),
+					summary: "不进位/进位加法、不退位/退位减法",
+					difficulty: "重点",
+				},
+				{
+					id: "kp-3",
+					title: "应用题综合",
+					source: demoMaterialRef("应用题"),
+					summary: "读懂题意、分步列式、检查答案",
+					difficulty: "难点",
 				},
 			],
 			teachingFocus: ["重点：概念清晰", "难点：应用题理解"],
-			chapterSuggestion: [
-				{ title: "数的认识", source: "资料1", points: ["kp-1"] },
-			],
+			// 票 demo-flow-fidelity/02：原先只有 1 条（审计 C5：知识点 3 条、outline 3 章，
+			// 这里只建议 1 章；也低于 CHAPTER_SUGGESTION_MIN=4——那是**另一件事**，见
+			// `src/domain-rules.js` 的登记豁免面，本票不做）。补齐到与 `DEMO_CHAPTERS` 同构的
+			// 3 条：条数与章名都从那份骨架派生，不再手写第二份章名清单。
+			// `points` 走票 01 的 **title 单键口径**——这里写的是 `DEMO_CHAPTERS[].title`，
+			// 它是否逐字命中 `knowledgePoints[].title` 由回放测试逐条互对（有意不在这里同源）。
+			chapterSuggestion: DEMO_CHAPTERS.map((chapter) => ({
+				title: chapter.title,
+				source: demoMaterialRef(),
+				points: [chapter.title],
+			})),
 		},
 	};
 }
@@ -198,14 +345,16 @@ function demoGateProposal(_runtime, params) {
 				'这本书的目标是：学完能独立做对教材配套的基础题，并说出每个概念"是什么、为什么、怎么用"。\n最大难点：概念记住了但不会用，例题看得懂、变个形式就不会。',
 		},
 		2: {
-			title: 'AI 提议：用"概念 → 例子 → 易错点 → 小练习"的固定板块',
+			title: `AI 提议：用"${DEMO_SECTION_CHAIN}"的固定板块`,
 			summary:
 				'每章按四段式组织：先讲清概念（配生活例子），再给 2-3 个由浅入深的例题，然后专门讲"最容易错的地方"，最后放 5 道小练习（带答案）。\n叙述上用一个"小明学数学"的贯穿案例串起全书，降低理解门槛。',
 		},
 		3: {
-			title: "AI 提议：全书 6 章、每章约 15 分钟学完",
+			// 票 demo-flow-fidelity/02：章数与章名串从 `DEMO_CHAPTERS` 派生（原先写死「6 章」＋
+			// 「第3／4／5章 乘法／除法／混合运算」六章，而章节安排只有 3 章，审计 C1／C2）。
+			title: `AI 提议：全书 ${DEMO_CHAPTER_COUNT} 章、每章约 ${DEMO_CHAPTER_MINUTES} 分钟学完`,
 			summary:
-				'第1章 数的认识 → 第2章 加减法 → 第3章 乘法 → 第4章 除法 → 第5章 混合运算 → 第6章 应用题综合。\n每章内部：概念（10分钟）→ 例题（10分钟）→ 易错提醒（5分钟）→ 小练习（15分钟）。\n第 6 章末尾附"全书自查清单"。',
+				`${demoChapterChainText()}。\n每章内部按「${DEMO_SECTION_CHAIN}」组织，四段时长：${demoSectionMinutesText()}。\n第 ${DEMO_CHAPTER_COUNT} 章末尾附"全书自查清单"。`,
 		},
 	};
 	const entry = base[String(gate)];
@@ -226,7 +375,7 @@ function demoGoldChapter(_runtime, params) {
 			? ""
 			: `\n\n## 本稿按你的意见改了（演示）\n\n已照以下意见调整：${redoNote}\n`;
 	return {
-		styleSpec: `${DEMO_MARK}\n# style-spec（演示）\n板块：概念 → 例题 → 易错点 → 小练习。叙述口吻：像老师讲课，用"你"。`,
+		styleSpec: `${DEMO_MARK}\n# style-spec（演示）\n板块：${DEMO_SECTION_CHAIN}。叙述口吻：像老师讲课，用"你"。`,
 		chapter: `${DEMO_MARK}\n# 第1章 数的认识（最佳范例·演示）\n\n## 概念\n数是用来数东西的符号……\n\n## 例题\n例1 ……\n\n## 易错点\n不要把 0 和"没有"搞混……\n\n## 小练习\n1. ……（答案：……）${redoSection}`,
 		audit: {
 			passed: true,
@@ -268,27 +417,23 @@ function demoMergeBook(_runtime, params) {
 }
 
 function demoOutline() {
+	// 票 pipeline-wiring-gaps/14：outline 提交按 engine.js outline 段 brief 带 `points`，
+	// 每项按票 01 裁决的 **title 单键口径**（`knowledgePoints[].id` 不接进比对环）。
+	// 票 demo-flow-fidelity/02：章名/章数/细目全部从 `DEMO_CHAPTERS` 派生（原先这份清单是
+	// 第二处手写的章名事实，与 `explore.md`「共 6 章」、关卡 3 的六章串三处不同口径）。
+	// `points` 取的是 `DEMO_CHAPTERS[].title`，与知识地图 `knowledgePoints[].title` 是**两份**
+	// 字面量——靠 `test-collab-replay.mjs` 的 `checkDemoPointsCaliber` 逐项互对（缺字段/id 口径即红），
+	// 有意不从知识地图派生（同源即自证，理由见 `DEMO_CHAPTERS` 的注释）。
+	// `source` 仍走 `demoMaterialRef()`（票 03 收口的引用出口：本书只有 1 份源，票 01 的 Q6＝甲；
+	// 原先第 3 章那句「材料2：应用题部分」是凭空来的编号，审计 C3）。
 	return {
-		chapters: [
-			{
-				title: "数的认识",
-				outline: "什么是数、数的读写、大小比较",
-				source: "材料1：数的认识部分",
-				targetWords: 4000,
-			},
-			{
-				title: "加减法",
-				outline: "不进位/进位加法、不退位/退位减法",
-				source: "材料1：加减法部分",
-				targetWords: 5000,
-			},
-			{
-				title: "应用题综合",
-				outline: "读懂题意、分步列式、检查答案",
-				source: "材料2：应用题部分",
-				targetWords: 6000,
-			},
-		],
+		chapters: DEMO_CHAPTERS.map((chapter) => ({
+			title: chapter.title,
+			outline: chapter.outline,
+			source: demoMaterialRef(chapter.sourcePart),
+			points: [chapter.title],
+			targetWords: chapter.targetWords,
+		})),
 	};
 }
 
@@ -420,7 +565,8 @@ export function buildRolePrompt(listText, roles) {
 			return hint === undefined ? `- ${role}` : `- ${role}：${hint}`;
 		})
 		.join("\n");
-	return `你是教材分类助手。用户一次性上传了几本 PDF 教材，请根据"文件名"判断每本属于哪一类，只能从这 ${roles.length} 类里选 1 个：
+	// 票 09：这段是发给识别子代理的**界面措辞**——退役「教材 PDF」，数材料说「份」。
+	return `你是教材分类助手。用户一次性上传了几份材料，请根据"文件名"判断每份属于哪一类，只能从这 ${roles.length} 类里选 1 个：
 ${choices}
 
 文件名列表：

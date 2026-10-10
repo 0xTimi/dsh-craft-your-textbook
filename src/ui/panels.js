@@ -9,7 +9,7 @@ import { createElement, useState } from "react";
 import { S } from "./styles.js";
 import { formatTime, humanDuration } from "./rules.js";
 // 界面用词表（批 2）：六阶段在界面上的字只此一份。
-import { phaseUi, gateHuman } from "./view-rules.js";
+import { phaseUi, gateHuman, goldDraftDisplayed } from "./view-rules.js";
 
 // ── 协作状态条：现在轮到谁 ───────────────────────────────────────────────────
 
@@ -228,6 +228,12 @@ export function ActivityLine(props) {
 	// 正是最需要它的时候），把整条收掉等于把那一格唯一可操作的出口一起收走。
 	// 收掉的只是那半句没有支撑的状态词——留下的是**纯事实**（多久没动静）与那颗按钮。
 	const detailEmpty = activityClaimUnsupported(pendingStage, progressDetail);
+	// 票 `walkthrough-2026-10/04`（2026-10-06 裁决甲）：**展示期**（稿已落盘、这一步还没交工）
+	// 不是「轮到你」——下面那一支原来只看 `status !== "running"`，于是展示期照样喊「⚡ 轮到你」，
+	// 与状态条同改（状态条那一侧走 `humanTurn`，判据同一个函数），否则同屏两个词打架。
+	// 那一格此刻该说的是「🤖 我正在做」（验收面卡内的定稿键正禁着，详见 `gold-table.js` 的
+	// `goldDisplayPeriod`）。
+	const goldDisplayed = goldDraftDisplayed(meta, pendingStage);
 	const idlePrefix = detailEmpty
 		? `${humanDuration(stall?.idleMs)}没动静了 `
 		: `🤖 我正在做 · ${humanDuration(stall?.idleMs)}没动静了 `;
@@ -238,7 +244,7 @@ export function ActivityLine(props) {
 				// 已交付的《工业大数据分析》活性行还写着「⚡ 轮到你」，同一屏却在大喊「🎉 书做好了」）。
 				meta?.status === "delivered"
 				? "✅ 已完成"
-				: meta?.status !== "running"
+				: meta?.status !== "running" && !goldDisplayed
 					? "⚡ 轮到你"
 					: stalled
 						? createElement(
@@ -303,6 +309,64 @@ export const INTERRUPT_NOTE_TEXT =
 	"💡 已记下；不打断正在写的这一章，AI 到下个停靠点会照办";
 export const INTERRUPT_NOTE_TEXT_BREAKS_CHAPTER =
 	"💡 已记下；这一章交给 AI 去改了，过目先收起来了——AI 改完会把这一章重新摊开给你过目。";
+
+/**
+ * 谈判桌那两档措辞（票 `gold-display-period/01`）——与上面两档**并列**，不是它们的替身。
+ *
+ * 上面那两句管**铺章**（phase 5）：提交那一刻机器没停、或者恰恰打断了正在写的那一章。
+ * 谈判桌活在 **phase 4**（`awaiting-gold`），两件都成立不了：那里没有「正在写的这一章」，
+ * 而意见的消费方是**下一轮**——正在跑的那一轮检查**读不到**它（审计的必读矩阵里没有意见通道），
+ * 正在跑的主笔 AI 也读不到它（意见透给 AI 的唯一出口是 brief 构造时刻）。
+ * 所以原样复用「不打断正在写的这一章」这一档是说反话：用户读到一句与屏幕上发生的事相反的话，
+ * 下一步就是「我是不是点坏了」。
+ *
+ * ⚠️ 与卡内那句常驻提示（`gold-table.DISPLAY_PERIOD_PENDING_HINT`）**说的是同一件事实**，
+ * 措辞必须一致（两处都在说「这一轮检查不会读它」＋「等检查收工」）——**不许**一处说「没人读」、
+ * 另一处说「AI 马上改」。分工是：这一句答「**记下了**」（6 秒自清），卡内那句答
+ * 「**什么时候会被读到、下一步点什么**」（常驻）。
+ */
+export const GOLD_NOTE_DISPLAY_PERIOD =
+	"💡 记下了；这一轮检查不会读它，等检查收工再点【让 AI 照这些改】。";
+export const GOLD_NOTE_AWAITING_SEAL =
+	"💡 记下了；点【让 AI 照这些改】，AI 才会照它改。";
+
+/**
+ * 这一次提交该弹哪一档提示条（纯函数，唯一出口）——票 `gold-display-period/01`。
+ *
+ * 原式把这份判据**内联**在 `client-entry.js` 的 `postAction` 里，且相位那一格写死
+ * `meta?.phase === 5`。票 `walkthrough-fixes/30②` 打开过它一轮——**只打开了动作名单那一半**
+ * （把 `gold-opinion` 加进名单，注释逐字记着「动作名单**漏了一支**」），**相位那一半没动**；
+ * 而谈判桌只活在 phase 4 ⇒ gold 的意见**结构上**拿不到提示条。这不是文案漏写，
+ * 是**判据的枚举面比现实窄了一格**。
+ *
+ * ⚠️ **调用方先过「这一次动作值不值得回一句」那一关**：那串名单
+ * （`["style-note", "intervene", "review"]` ＋ 单独比较的 `gold-opinion`）**必须留在
+ * `client-entry.js`**——契约面动作目录那条静态闸把「文件 ＋ 这一串名字 ＋ 写法」绑成一条豁免
+ * （见 `test/test-contract-action-catalog.mjs` 的 `UI_RULE_LITERALS`），搬到本文件会让它当场红。
+ * 所以本函数只吃「名字里**单独一个** `gold-opinion`」这一位（单个名字的比较不是「第二份动作名
+ * 清单」，那条闸管的是成串的 ≥3 个）。
+ *
+ * ⚠️ **我的枚举面比现实窄在哪里**：本函数只认「哪一相位 ＋ 哪一状态」这几位，
+ * **不认**「这一次提交是不是真成功了」——那一半留在壳里（`json !== null` 才出条），
+ * 也不认「用户有没有在看这一屏」（横幅自己会自清，那是另一件事）。
+ *
+ * @param {{ action?: string, meta?: object | null, pendingStage?: unknown }} facts
+ * @returns {string | null} `null`＝这一次不弹（不是「弹一句空话」）
+ */
+export function interruptNoteText({ action, meta, pendingStage } = {}) {
+	if (action === "gold-opinion") {
+		// 展示期（章稿在盘、这一步还没交工）：立刻回一句「记下了」，并且**如实说**这一轮没人读它。
+		if (goldDraftDisplayed(meta, pendingStage)) return GOLD_NOTE_DISPLAY_PERIOD;
+		// 交工之后（`awaiting-gold` 而待办已清）：此刻 AI 不会自己动，改不改由用户点那颗键决定。
+		if (meta?.status === "awaiting-gold") return GOLD_NOTE_AWAITING_SEAL;
+		// 其余（**带 chapter 的** `gold-opinion`：它走 `pendingReviews` 那条路，不是谈判桌）
+		// 落到下面铺章那一档，照旧。
+	}
+	if (meta?.phase !== 5) return null;
+	if (meta?.status === "awaiting-chapters-review") return INTERRUPT_NOTE_TEXT_BREAKS_CHAPTER;
+	if (meta?.status === "running") return INTERRUPT_NOTE_TEXT;
+	return null;
+}
 
 /**
  * 不打断提示条。`text` 缺省就是「不打断」那一档（**铺章途中的行为一个字不变**）；

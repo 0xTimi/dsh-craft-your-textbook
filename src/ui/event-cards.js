@@ -1,20 +1,58 @@
 /**
- * 造书工作台 · 流程卡片群
+ * 造书工作台 · 焦点区主卡族
  *
  * 焦点区按流水线状态切换的那组卡片：进度条、向导卡、上传区、状态/错误卡、
  * 交付卡、关卡拍板卡，以及 MinerU Token 常驻入口。
- * 还包括事件账本的人话文案映射（cardText/cardIcon）——「之前的过程」列表也用它。
+ *
+ * 账本回放列表（「之前的过程」那块）连同它的**人话文案映射**（`cardText` / `cardIcon`）已整体
+ * 搬进 `src/ui/replay-list.js`（票 `depth-review-2026-10/09`）——那是**另一群观众**，与本文件
+ * 零内部共享。搬走之后本文件回到「一件事」的深度。
  */
 
 import { createElement, useEffect, useRef, useState } from "react";
 import { S } from "./styles.js";
-// 双端共享领域件：六阶段全称、素材角色、角色识别兜底、事件含义表、范例章号（单一事实来源）。
-import { PHASES, ROLES, guessRoleFromName, EVENT_META, MAX_UPLOAD_BYTES, uploadTooLargeMessage, goldChapterNo } from "../domain-rules.js";
+// 逐源表态面（票 mineru-formats/03）：材料不齐时这一张卡就是那个红的唯一可行动出口。
+import { MaterialGapList } from "./material-gap.js";
+// 工作台内「连续正文块」的量宽上限**唯一出处**（票 `walkthrough-fixes/17` 的 2026-10-06 裁决）：
+// 交付卡与终检认可卡上那两块报告正文（`aiReport`）直接吃它，不自己再写一份字面量
+// （那份常量与它的适用范围／红线见 md-render.js）。
+import { BODY_MEASURE_MAX_WIDTH } from "./md-render.js";
+// 双端共享领域件：六阶段全称、素材角色、角色识别兜底、范例章号（单一事实来源）。
+// （事件含义表 `EVENT_META` 随回放域搬进 `./replay-list.js`——焦点卡族不读它。）
+// 票 10：上传前那道**按格式**的体积预检走 `judgeMaterialUploadSize`（500MB 与 200MB 两道
+// 分别说、PDF 与非 PDF 分别说），所以这里**不再**直接摸 `MAX_UPLOAD_BYTES`／
+// `uploadTooLargeMessage` —— 那两个仍归服务端 413 与 domain-rules 那一节所有。
+import { PHASES, ROLES, guessRoleFromName, goldChapterNo, materialFormatAccept, judgeMaterialUploadSize } from "../domain-rules.js";
 // 界面用词表（批 2）：阶段片不再各写一套短标签，取词只此一处。
-import { PHASE_UI, phaseUi, gateHuman, stageLabelHuman, segmentHuman, eventHuman, checkHuman, materialConversionActivityText, STAGE_HUMAN } from "./view-rules.js";
+// 票 `demo-flow-fidelity/06`：演示书那句提示（`demoQualityChecksNote`）与它的判据
+// （`isDemoBook`）都住这里——阶段页第 6 阶段那块调的是**同一句**（句子只此一份）。
+import { PHASE_UI, gateHuman, stageLabelHuman, checkHuman, materialConversionActivityText, convertedIcon, demoQualityChecksNote, isDemoBook } from "./view-rules.js";
 // 章完成度的唯一一份口径（票 14）：章级「交工通过」事件（含最佳范例章那一步）+ 该章无未处置意见。
 // 章节卡与状态卡的数字都取它，界面里不许有第二份推导。
-import { deriveDoneSet, hasPendingReview, humanDuration, formatTime } from "./rules.js";
+import { deriveDoneSet, hasPendingReview, humanDuration, materialFormatHint, materialFormatCalibrationNote } from "./rules.js";
+// 卡片 props 契约（票 `workbench-card-contract` 02）：本文件里 5 张焦点区主卡的「吃什么」写在
+// **各自紧邻的卡旁**，壳只负责递「当前这本书」。`card-view.js` 是零域 import、零 react import 的
+// 中性 module——它不认识任何一张卡，加卡不必回来改它（locality 就是这么保住的）。
+import { defineCardView } from "./card-view.js";
+// 📌 **票 `depth-review-2026-10/05` 收尾**：票 09 搬回放域时在这里留了一行**过渡再导出**
+// （`cardText` / `cardIcon` / `collapseConversionRuns` / `replayRowSummary` / `replayRowDetail` /
+// `REPLAY_SUMMARY_MAX` / `replayListView` / `ReplayList` 共 8 个），让壳与四组测试零改动取词。
+// 今天壳与那四组测试全部改指 `./replay-list.js`，那行连同自陈「改指之后即可删」的注释一并撤掉——
+// 留着就是一处能引到旧路径的死入口，而注释还写着收尾没做，正是本仓点名要治的那类漂移。
+// ⚠️ 本文件因此与 `./replay-list.js` **零内部共享**（两个方向都由 `test-card-views-coverage.mjs`
+// 钉住：回放域不许反向 import 本文件，本文件不许声明或消费任何一个回放符号）。
+
+/**
+ * 上传卡「还没传过任何材料」时的空清单（缺省规则 3：空引用必须是**模块级同一个引用**）。
+ *
+ * ⚠️ 壳调用点原先写的是 `meta.sources ?? []`——**每帧新建一个数组**：props 袋于是每装配一次
+ * 就换一个引用，袋的「记忆」（`createCardView` 两次取同一 slot 拿同一引用）在这一位上失效，
+ * 任何按它做依赖的东西都得跟着重算。
+ * ⚠️ 这里**只换空缺省，不动数组本身**：`meta.sources` 是宿主写的活对象，取到时原样传下去，
+ * 卡里读到的仍是真清单。已核实 `UploadArea` 对 `sources` **只读**（`sources.length` ×2、
+ * `sources.map` ×1，全卡无 `.push` / `.sort` / `.splice` 这类就地改写），共享引用因此安全。
+ */
+const NO_SOURCES = Object.freeze([]);
 
 // ── 机器检查清单（批 2，2026-09-20 用户拍板）─────────────────────────────────
 // 原来 12 条 ✅ 平铺在卡里，加上 AI 自查 6 条 = 18 行绿勾，把唯一的决策按钮挤出首屏。
@@ -91,327 +129,6 @@ export function MachineChecks({ checks }) {
 	);
 }
 
-function cardText(event) {
-	const data = event.data ?? {};
-	switch (event.type) {
-		case "textbook/phase-start":
-			// ⚠️ data.label 是服务端 PHASE_LABELS（源探查/铺章/终检与交付…）——机器词，
-			// 界面按阶段号取词表；取不到才回落服务端 label。
-			return `阶段 ${data.phase} 开始：${phaseUi(data.phase) || data.label || ""}`;
-		case "textbook/phase-end":
-			return `阶段 ${data.phase} 完成：${phaseUi(data.phase) || data.label || ""}`;
-		case "textbook/agent-start":
-			return `AI 开始：${stageLabelHuman(data.label)}`;
-		case "textbook/agent-end":
-			return `AI 完成：${stageLabelHuman(data.label)}`;
-		case "textbook/gate-proposal":
-			return `AI 提案（${gateHuman(data.gate ?? "?")} · v${data.version ?? "?"}）：${data.title ?? ""}`;
-		case "textbook/gate-decision":
-			return data.approved === true
-				? `${gateHuman(data.gate ?? "?")}通过（v${data.version ?? "?"}）`
-				: `${gateHuman(data.gate ?? "?")}驳回（v${data.version ?? "?"}）${data.reasons?.length > 0 ? `：${data.reasons.join("、")}` : ""}`;
-		case "textbook/mineru-progress":
-			return `转换 ${data.file ?? ""}：${data.stage ?? ""}`;
-		case "textbook/rollback":
-			return `↩️ 已回退到快照 ${data.snapshot ?? "?"}`;
-		case "textbook/source-added":
-			return `已上传材料：${data.file ?? ""}（${data.role ?? ""}）`;
-		case "textbook/hint":
-			return `💡 ${data.text ?? ""}`;
-		case "textbook/error":
-			// data.task 是**机器 label**（引擎传的是「设计提案·关卡N」「源探查」这类），
-			// 与《过程记录.md》/播报出口同源，必须过同一层翻译（判定线①；票 01 复审 M1）。
-			return `⚠️ 出错（${stageLabelHuman(data.task ?? "")}）：${data.message ?? ""}`;
-		case "textbook/quality":
-			return `机器检查：${(data.checks ?? []).filter((c) => c.ok === true).length}/${(data.checks ?? []).length} 项通过`;
-		case "textbook/delivery":
-			return "🎉 交付完成";
-		case "textbook/stage-start":
-			return `🎯 交给 AI 动手：${stageLabelHuman(data.label ?? data.stage ?? "")}`;
-		case "textbook/progress":
-			return `⏳ ${data.label ?? ""}${data.detail ? `：${data.detail}` : ""}`;
-		case "textbook/review":
-			return `👀 抽查意见（${data.title ?? `第${data.chapter ?? "?"}章`}）：${data.comment ?? ""}`;
-		case "textbook/ai-report":
-			// 票 10（判定三 #10）：界面一律说「检查」，「自查」是机器视角（谁查谁？）。
-			return `🛡️ AI 检查报告：${data.report ?? ""}`;
-		case "textbook/deep-modify":
-			// 票 10（判定三 #3）：`data.segment` 是 seg.key（`gate-1` / `chapter-03`）——机器身份词，
-			// 出口处过 `segmentHuman`（domain-rules 的同一份译法，UI 由 view-rules 再导出）。
-			return `✏️ 定点修改：${segmentHuman(data.segment)}`;
-		case "textbook/deep-undo":
-			return `↩️ 撤销定点修改：${segmentHuman(data.segment)}`;
-		case "textbook/pattern-added":
-			return `📇 已加自定义模式：${data.name ?? ""}`;
-		case "textbook/gold-chapter":
-			return `👑 最佳范例章：第 ${data.chapter ?? "?"} 章`;
-		case "textbook/chapters-review":
-			return `🔍 章节过目确认（${data.approved === true ? "通过" : "驳回"}）`;
-		case "textbook/final-approve":
-			return `✅ 最后检查认可${data.approved === true ? "" : `：${data.note ?? ""}`}`;
-		case "textbook/submit-rejected":
-			// 交工/提审被拒（票 audit-matrix-contract/01 (d)）：界面上要读得到「交工被拒：<原因>」，
-			// 不能只留 label 一行（这正是用户被「机器报错、AI 说没事」卡住的那条信息）。
-			//
-			// ⚠️ **这里不印阶段**（票 `audit-matrix-contract/06`，2026-09-29 用户拍板选 ②）。
-			// 四个出口的逐个点名结论是「三个不印、只有 `replayRowDetail` 印」；这里是**第一个**
-			// 不印的出口。**不印的理由**：这一行是**概览行**——同一屏的横幅与状态条已经说出了
-			// 「此刻在哪一步」，这里再加一个阶段标签只是多一处要跟着改的真相；而且票 02 铺满的
-			// 20 条拒收里绝大多数 `reason` 本身就带着阶段线索（「范例章审计不合格」「合并前缺跨章
-			// 审计记录」…），少数不带的那几条由展开详情补上。**这不是漏了，是有意的不对称。**
-			return `🚫 交工被拒：${data.reason ?? ""}`;
-		default:
-			// 兜底读 EVENT_META（label/emoji 双端共用）——绝不回落到 raw 机器串。
-			// label 是「机器怎么称呼这件事」，界面仍过一遍词表（关卡/质量门/金标准/终检那几条）。
-			return `${EVENT_META[event.type]?.emoji ?? ""} ${eventHuman(event.type, EVENT_META[event.type]?.label ?? event.type)}`.trim();
-	}
-}
-
-function cardIcon(event) {
-	// 「通过/驳回」变体按 data.approved 覆盖基准 emoji（EVENT_META 只放基准）。
-	if (event.type === "textbook/gate-decision" || event.type === "textbook/outline-decision")
-		return event.data?.approved === true ? "✅" : "↩️";
-	return EVENT_META[event.type]?.emoji ?? "•";
-}
-
-// ── 「之前的过程」回放行：摘要 / 全文 / 重复聚合（票 07，P11·P23·P25·P28·P29·P57）──
-//
-// 病灶是**渲染缺口**不是采集缺口：账本 `data` 里早就写好了原因文案（`engine.js` 里的
-// 「交工被拒：<原因>」「出错：<message>」「驳回理由」），人话映射 `cardText()` 早就在，
-// 而回放行体只出 `EVENT_META.label` 兜底、**根本不渲染 `data`**。故这里**不新增任何采集**，
-// 只把已有的字段露出来。
-//
-// 🔴 硬天花板（团队踩过一次，`smoke-test.mjs` 的行首探针）：**行首不许换成 `cardText`**——
-// 行首只出客户端词表的事件类型词，摘要作为 `<strong>` **之后**的一个 span 追加。
-// 下面每条取词都遵守同一条取向：服务端 label 一律经 `stageLabelHuman` 译，**译不动就不出**
-// （宁可这一格不出词，也不把 `源探查`／某个没登记的机器串摆到人眼前——与行首同一口径）。
-
-/** 摘要的字数上限：同口径收窄（`smoke-test.mjs` 靠行文本长度唯一定位那两条样张行，
- *  摘要不收窄会把它们顶出那个上限、让定位失败）。 */
-export const REPLAY_SUMMARY_MAX = 60;
-
-/** 压成一行、超长截断（截断号即 `engine.js` 那句 `.slice(0, 200)` 的同一口径）。 */
-const clipText = (raw, max = REPLAY_SUMMARY_MAX) => {
-	const oneLine = String(raw ?? "").replace(/\s+/g, " ").trim();
-	return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max)}…`;
-};
-
-/** 交办阶段标签 → 界面词；**译不动（未登记）就不出**——不猜、不露机器串。 */
-const stageNameFromLabel = (label) => {
-	const raw = String(label ?? "");
-	if (raw === "") return "";
-	const human = stageLabelHuman(raw);
-	// `stageLabelHuman` 对未登记的原样返回（那一句是它自己的既定取向：宁可露机器词也不猜错）；
-	// 但在**回放摘要**这一层我们反过来：出错了就整格不出，别让机器串混进行首那一行里。
-	return human === raw ? "" : human;
-};
-
-const goldOpinionVerbs = { dislike: "不喜欢", drop: "不需要", change: "要改成" };
-
-/**
- * 连续同型的转换进度 → 一条（票 07 的 P23：16 条一模一样的「材料转换」占满前 20 行）。
- * 只合并**相邻**的连续段（别的类型夹在中间就断开）；每条仍带 `events`，供摘要与展开用。
- * 合成一行不是把中间那些进度丢掉——`event` 取首条、`events` 留全部，展开看得到每一条。
- */
-export function collapseConversionRuns(events) {
-	const list = Array.isArray(events) ? events : [];
-	const rows = [];
-	let run = null;
-	for (const event of list) {
-		if (event?.type === "textbook/mineru-progress") {
-			if (run !== null) run.events.push(event);
-			else run = { event, events: [event] };
-			continue;
-		}
-		if (run !== null) {
-			rows.push(run);
-			run = null;
-		}
-		rows.push({ event, events: [event] });
-	}
-	if (run !== null) rows.push(run);
-	return rows.map((row, index) => ({ ...row, isLast: index === rows.length - 1 }));
-}
-
-/**
- * 回放行的摘要（`<strong>` 行首**之后**的那一段）。
- * 逐条对应走查 P29 的对照表：账本 `data` 里早有的字段，这里只负责露出来。
- */
-export function replayRowSummary(row, ctx = {}) {
-	const event = row?.event ?? null;
-	if (event === null || typeof event !== "object") return "";
-	const data = event.data ?? {};
-	const run = Array.isArray(row.events) ? row.events : [event];
-	// 转换进度聚合成一条：给时间跨度 + 次数（不说"已完成"——那一段若是被打回后重来的，
-	// 说"已完成"就是句假话；只说机器自己的 `converting` 仍为真的那一次还在进行）。
-	if (event.type === "textbook/mineru-progress") {
-		if (run.length < 2) return clipText(String(data.stage ?? ""));
-		const from = formatTime(run[0].time);
-		const to = formatTime(run[run.length - 1].time);
-		const tail = ctx.converting === true && row.isLast === true ? "，进行中" : "";
-		return clipText(`（${from}–${to}，${run.length} 次进度${tail}）`);
-	}
-	switch (event.type) {
-		// 阶段名按**阶段号**取词表（`data.label` 是服务端 PHASE_LABELS，机器词）——
-		// 走查 P29 记的「连阶段名都丢了」就是这里。取不到号就整格不出，不回落机器 label。
-		case "textbook/phase-start":
-		case "textbook/phase-end":
-			return phaseUi(data.phase);
-		case "textbook/stage-start":
-		case "textbook/agent-start":
-		case "textbook/agent-end":
-			return stageNameFromLabel(data.label ?? data.stage);
-		// 进度叙述：这一行原来只有「⏳ 进度」三个字，叙述本身没人看得见。
-		case "textbook/progress":
-			return clipText(
-				`${data.label ?? ""}${data.detail ? `：${data.detail}` : ""}`,
-			);
-		// 拍板结果：通过的那一档行首已经说完了；驳回要把**理由与用户整段 note**露出来。
-		case "textbook/gate-decision":
-		case "textbook/outline-decision":
-			if (data.approved === true) return "";
-			return clipText(
-				[...(data.reasons ?? [])].join("、") + (data.note ? `：${data.note}` : ""),
-			);
-		// P11：交工被拒的原因（机器解析到的行键/样例/契约行形状都在这一句里）。
-		//
-		// ⚠️ **这里也不印阶段**（票 `audit-matrix-contract/06`，2026-09-29 用户拍板选 ②）。
-		// **不印的理由**：摘要是**折叠行**——60 字上限、且行首那截类型词已经在说「这是一次交工被拒」；
-		// 阶段词塞进来要么把真正要说的原因挤出上限，要么逼它另起一段前缀，折叠态下读起来更挤。
-		// 阶段词落在**展开详情**那一层（`replayRowDetail`），那里用户是主动点开要读全文的。
-		// **这不是漏了，是有意的不对称。**
-		case "textbook/submit-rejected":
-			return clipText(data.reason);
-		// P57：机器兜底那一次的 `message` 本身就以「机器兜底发现 N 项没过：」开头
-		//（`workflow/actions/chapters.js` 落账时的原话），整句露出来＝这一行自己就说清了
-		// 是机器兜的底；不再另加一句前缀，免得同一行里把「机器兜底」说两遍。
-		case "textbook/error":
-			return clipText(data.message);
-		case "textbook/hint":
-			return clipText(data.text);
-		case "textbook/review":
-			return clipText(data.comment);
-		case "textbook/ai-report":
-			return clipText(data.report);
-		case "textbook/deep-modify":
-			return clipText(data.note);
-		case "textbook/quality": {
-			const checks = Array.isArray(data.checks) ? data.checks : [];
-			const failed = checks.filter((check) => check.ok !== true);
-			if (failed.length === 0) return "";
-			return clipText(
-				`${failed.length} 项没过：${failed
-					.map((check) => `${checkHuman(check.name)}（${check.note ?? "没写原因"}）`)
-					.join("；")}`,
-			);
-		}
-		// P25：意见的落点/类型/内容都在 `data.opinion` 里（原来的渲染读错了字段、印出 #undefined）。
-		case "textbook/gold-opinion": {
-			const opinion = data.opinion ?? {};
-			const verb = goldOpinionVerbs[opinion.kind] ?? opinion.kind ?? "";
-			return clipText(
-				`${opinion.target ?? "笼统"}·${verb}${opinion.wish ? `：${opinion.wish}` : ""}`,
-			);
-		}
-		case "textbook/style-note":
-			return clipText(data.styleNote?.text);
-		case "textbook/intervention":
-			return clipText(data.text);
-		default:
-			// 没登记取法的类型整格不出摘要——宁可少说一句，也不摆一句猜出来的话。
-			return "";
-	}
-}
-
-/**
- * 账本 `data.stage`（**机器阶段名**：`explore`／`gate`／`outline`／`gold`／`chapters`／`merge`／`final`）
- * → 界面人话阶段词。
- *
- * ⚠️ 票 `audit-matrix-contract/06`（2026-09-29 用户拍板选 ②）**唯一的印字出口**就是下面
- * `replayRowDetail` 这一处；`cardText`／`replayRowSummary`／引擎侧 `announceText` 三处一律不印
- * （各处理由写在那三处的注释里，**别当成漏了去补**）。
- *
- * 取词只用**票 05 补齐的那张表**（`view-rules.STAGE_HUMAN` ＝ domain-rules「界面词」区再导出的
- * 同一份），**不另建一份**、也不走 `stageHuman()` 的兜底：
- *   · `stageHuman()` 对**未登记**的阶段**原样返回那个机器串**（那是 `client-entry.js` 渲染路径上
- *     「宁可露出机器词，也不猜错」的有意取向，见 view-rules 注释）；但这一格是**拼给人看的正文**，
- *     摆一个 `gates` 进去就是把机器身份词端上屏——与同文件 `stageNameFromLabel()`「译不动就整格不出」
- *     同一口径。⇒ 这里查表查不到就**不出这一格**。
- *   · 于是「把 `STAGE_HUMAN.gate` 改回 `gate`」这类改坏**两条判据都会红**（票 05 逐格那条 + 票 06
- *     正向那条），不存在「改坏了照样出词」的缝。
- */
-const stageWordForEvent = (data) => {
-	const raw = typeof data?.stage === "string" ? data.stage : "";
-	if (raw === "") return "";
-	return Object.hasOwn(STAGE_HUMAN, raw) ? STAGE_HUMAN[raw] : "";
-};
-
-/** 展开详情的第一行补上「这一步卡在哪个阶段」——票 06 的全部落点就是这里。 */
-const withStageWord = (body, data) => {
-	const word = stageWordForEvent(data);
-	if (word === "") return String(body ?? "");
-	const text = String(body ?? "").trim();
-	return `阶段：${word}${text === "" ? "" : `\n${text}`}`;
-};
-
-/**
- * 回放行的**全文**（行内那颗纯展开控件展开后给的东西）。
- * 「有超出摘要之外的全文才给展开控件」：没有全文的行（阶段开始、豁免放行……）一个控件都不长，
- * 既不摆死按钮，也不撞「同一排可点性一致」。
- */
-export function replayRowDetail(row) {
-	const event = row?.event ?? null;
-	if (event === null || typeof event !== "object") return "";
-	const data = event.data ?? {};
-	const run = Array.isArray(row.events) ? row.events : [event];
-	// 聚合行展开＝那 N 条进度逐条（票面：至少折叠成「展开 N 条进度」）。
-	if (event.type === "textbook/mineru-progress")
-		return run
-			.map(
-				(item) =>
-					`${formatTime(item.time)}　${String(item.data?.stage ?? "")}${
-						item.data?.file ? `（${item.data.file}）` : ""
-					}`,
-			)
-			.join("\n");
-	switch (event.type) {
-		case "textbook/submit-rejected":
-			// 票 06：**唯一印阶段词的那一格**。票 02 把 `rejectSubmit(stage, reason)` 铺到 20 条
-			// 拒收路径，其中 6 条 `reason` 本身不带阶段线索（「章节缺少 title」「需要 preface」
-			// 「需要 report」「方案不完整…」「styleCheck 的 status 只能…」「conflict（冲突）必须写一句
-			// 理由…」）——用户在概览行看到这几条，看不出卡在合并还是最后检查。展开详情里补上人话
-			// 阶段词，缺口就在那里补齐；概览行维持现状（理由见上面 `cardText` / `replayRowSummary`
-			// 两处注释）。**印的是人话词、不是机器阶段名**——判据在 `test-wording-invariants.mjs`。
-			return withStageWord(data.reason, data);
-		case "textbook/error":
-			return String(data.message ?? "");
-		case "textbook/hint":
-			return String(data.text ?? "");
-		case "textbook/review":
-			return String(data.comment ?? "");
-		case "textbook/ai-report":
-			return String(data.report ?? "");
-		case "textbook/deep-modify":
-			return String(data.note ?? "");
-		case "textbook/gold-opinion":
-			return String(data.opinion?.wish ?? "");
-		case "textbook/gate-decision":
-		case "textbook/outline-decision":
-			return [data.note ?? "", [...(data.reasons ?? [])].join("、")]
-				.filter((part) => String(part).trim() !== "")
-				.join("\n");
-		case "textbook/quality":
-			return (Array.isArray(data.checks) ? data.checks : [])
-				.filter((check) => check.ok !== true)
-				.map((check) => `${checkHuman(check.name)}：${check.note ?? "没写原因"}`)
-				.join("\n");
-		default:
-			return "";
-	}
-}
-
-export { cardText, cardIcon };
-
 // ── 进度条 ──────────────────────────────────────────────────────────────────
 
 // 进度条窄格标签：一律取界面用词表（原来这里另有一套 { 3:"设计", 5:"铺章", 6:"交付" } 短标签，
@@ -423,6 +140,8 @@ export { cardText, cardIcon };
 //   - 可点性不再看产物：有 `onSelect` 就可点（没有则纯指示器，静态渲染/测试走这条）；
 //   - `📄` 的含义从"能点开"改成"这一步已经有产物"（只在已完成格出现，纯信息）；
 //   - hover 交代**目的地**：去「写完整本」这一步 · 这一步有 3 份文件；
+//     **阶段 1 例外**：那一格数的是材料，说「这一步有 N 份材料」/「还没有材料」
+//     （票 walkthrough-2026-10/03——它没有分段，按产物累计恒为 0，旧话恒说"还没有文件"）；
 //   - `viewed`＝正在看哪一页，用一圈深色描边标出来——与"书走到哪一步"（蓝底，`S.seg`）区分开。
 //
 // 2026-09-22 票 12（不变量 13 / ADR-0012 决策 2 同日定稿）：那排六格**常驻**，回看态下
@@ -433,6 +152,13 @@ export { cardText, cardIcon };
 //     阶段名仍在（那是这一格的房间身份），另加一个看得见的「回到现在」affordance。
 // `viewed` 在这里同时承担"回看态"这一信号：被看的那一步所属的阶段由 `client-entry.js` 传进来
 // （浏览态传 `viewPhaseOfBrowsing`，阶段页态传 `viewPhase`），两者非空即"用户不在现在"。
+
+/**
+ * 数**材料**的那一阶段（「材料准备」）。它那一格与其余五格吃的不是同一份读数：
+ * 它在宿主分段表里没有分段，产物计数结构上恒为 0（票 walkthrough-2026-10/03）。
+ */
+const MATERIAL_PHASE = 1;
+
 export function PhaseBar(props) {
 	const { phase, gate, status, onSelect, viewed, artifactCountOf } = props;
 	const doneUpTo = phase - 1;
@@ -442,6 +168,10 @@ export function PhaseBar(props) {
 		"div",
 		{ style: S.bar },
 		PHASES.map((item) => {
+			// ⚠️ **阶段 1 那一格数的不是产物**（票 walkthrough-2026-10/03）：它没有分段，按分段
+			// 累计恒为 0，于是那一格恒说「还没有文件」而同屏卡上列着材料。材料有它自己的量词
+			// （`CONTEXT.md`「量词『份』」：数材料用「份」），读数走 `materialCount`。
+			const isMaterialPhase = item.n === MATERIAL_PHASE;
 			let state = "pending";
 			if (
 				item.n < phase ||
@@ -458,9 +188,15 @@ export function PhaseBar(props) {
 			// 那一格只剩「⚡轮到你」，看不出是哪个阶段（用户要的恰恰是"知道自己到哪一步"）。
 			// 状态词要带出来，但名字不能丢：用前缀图标，与步清单同款。
 			if (item.n === phase && humanTurn) label = `⚡ ${label}`;
-			const count =
-				typeof artifactCountOf === "function" ? (artifactCountOf(item.n) ?? 0) : 0;
-			if (count > 0 && state === "done") label = `${label} 📄`;
+			const count = isMaterialPhase
+				? (Number.isSafeInteger(props.materialCount) ? props.materialCount : 0)
+				: typeof artifactCountOf === "function"
+					? (artifactCountOf(item.n) ?? 0)
+					: 0;
+			// `📄` 的含义是"这一步已经有产物"（ADR-0012 决策 1）。材料**不是产物**——它与产物
+			// 是两个轴的事实（`CONTEXT.md`「素材角色」「材料分量」与「有正文的产物」那一族分轴），
+			// 所以阶段 1 那一格**不借它顶上**（本票二选一：给材料自己的标记／那一格不加标记 ⇒ 选后者）。
+			if (count > 0 && state === "done" && !isMaterialPhase) label = `${label} 📄`;
 			const clickable = typeof onSelect === "function";
 			const isViewed = viewed === item.n;
 			// 回看态＝用户手里不是"现在"（`viewed` 非空）；此刻「当前阶段」那一格就是「回到现在」。
@@ -476,11 +212,17 @@ export function PhaseBar(props) {
 						outline: isViewed ? "2px solid var(--dsw-alias-label-primary)" : "none",
 						outlineOffset: isViewed ? "-2px" : "0",
 					},
-					// hover 文案**两态同形**（都写「去「X」这一步 · 有几份文件」）：目的地信息一致，
+					// hover 文案**两态同形**（都写「去「X」这一步 · 有几份…」）：目的地信息一致，
 					// 回看态下"点它其实是回到现在"由那一格脸上的可见文字承担（不靠 hover 才说得清），
 					// 也免得同一条 hover 前缀随态变脸（既有断言按 `去「X」` 前缀选格，别让选择器碎掉）。
+					// ⚠️ 量词按阶段分：阶段 1 说「份材料」，其余说「份文件」（票 walkthrough-2026-10/03）——
+					// 「份」是材料的量词，说阶段 1「还没有文件」是把材料说成了产物。
 					title: clickable
-						? `去「${PHASE_UI[item.n] ?? item.label}」这一步${count > 0 ? ` · 这一步有 ${count} 份文件` : " · 还没有文件"}`
+						? `去「${PHASE_UI[item.n] ?? item.label}」这一步${
+								count > 0
+									? ` · 这一步有 ${count} ${isMaterialPhase ? "份材料" : "份文件"}`
+									: ` · 还没有${isMaterialPhase ? "材料" : "文件"}`
+							}`
 						: undefined,
 					onClick: clickable ? () => onSelect(item.n) : undefined,
 				},
@@ -779,7 +521,97 @@ export function WizardCard(props) {
 	);
 }
 
+// ── 错误正文（唯一判据） ─────────────────────────────────────────────────────
+
+/**
+ * 「这一次出错的正文是什么」的**唯一判据**——`StatusCard`（兜底臂）与 `UploadArea`（Phase 1
+ * 的焦点主卡）共用这一份，**不许各写一份**。
+ *
+ * 优先后端落账的人话 `meta.lastErrorHuman`（页数超限／Token 失效已由 `humanizeMineruError`
+ * 归一成人话），没有它才回退账本那边给来的原文（老书就是这个形状）。
+ */
+const ERROR_HEADING = "⚠️ 这一步出错了";
+const TOKEN_HINT =
+	"💡 MinerU Token 可能失效，可到工作台「MinerU Token」处点「重新设置」换新 Token。";
+function humanErrorOf(meta, fallbackMessage) {
+	if (typeof meta?.lastErrorHuman === "string" && meta.lastErrorHuman !== "")
+		return meta.lastErrorHuman;
+	if (typeof fallbackMessage === "string" && fallbackMessage !== "") return fallbackMessage;
+	return "未知错误";
+}
+/** 同一句的另一个来路：账本里**最后一条** `textbook/error` 的原文（`UploadArea` 手上只有 `events`）。 */
+function lastErrorEventMessage(events) {
+	const list = Array.isArray(events) ? events : [];
+	for (let i = list.length - 1; i >= 0; i -= 1) {
+		const one = list[i];
+		if (one?.type === "textbook/error") return one?.data?.message;
+	}
+	return undefined;
+}
+const isTokenIssueOf = (text) => text.includes("Token") || text.includes("token");
+
 // ── 上传区（Phase 1） ───────────────────────────────────────────────────────
+
+/**
+ * 上传卡吃什么：材料清单与转换状态（都从**书**的 `meta` 上现算）+ 三个动作回调 + 事件账本。
+ *
+ * · `sources` / `converting` / `conversionStartedAt` —— 壳调用点上原本是三条现算表达式
+ *   （`meta.sources ?? []` / `meta.converting === true` / `meta.updatedAt`），取值与形状**逐字**
+ *   搬进 `derive`；`meta` 因此要进 `fromBook`（连同下面那条 `errorText`，四条的唯一来源）。
+ *   `sources` 的空缺省同时换成模块级 `NO_SOURCES`（见它的定义处）：壳那边 `?? []` 每帧新建
+ *   一个数组，违反缺省规则 3。
+ * · ⚠️ **`errorText`（2026-10-08 修）**：phase 1 出错时焦点区主卡**就是这张上传卡**
+ *   （`view-rules.focusCardKey` 的 `if (meta?.phase === 1) return "upload"` 排在所有 `status`
+ *   判断之前），而错误正文原先**只有 `StatusCard` 会印** ⇒ 状态条那句「⚠️ 轮到你 · 出错了，
+ *   请看下面的提示」指向一张**一个字都没有**的卡（真机：书夹 `project.json` 里
+ *   `{"phase":1,"status":"error","lastErrorHuman":"fetch failed"}`，屏上零提示）。
+ *   它由 `derive` 从**已经在袋里**的 `meta` + `events` 现算（`humanErrorOf` +
+ *   `lastErrorEventMessage`，与 `StatusCard` 同一份判据）：非 error 态给 `null`＝这一格整条
+ *   不出声，**不在卡里另写一句标题或取数**。
+ * · `meta` 必填 —— 漏了它，上面三条会一起塌成「一本书都没传过 / 没在转」，那是对用户说假话的
+ *   静默降级。（`null` 放行：`required` 只拦 `undefined`，与缺省规则 2「`null` 是显式的『没有』」
+ *   同一条。）
+ * · `onUpload` / `onIdentify` / `onConvert` 必填 —— 三处都是裸调用（`await onUpload(...)`、
+ *   `await onIdentify(...)`、`onClick: onConvert`）。漏了 `onUpload`，用户点「上传这 N 本」
+ *   什么都不发生；漏了 `onConvert`，「② 开始转换」那颗键点下去静默无反应。按钮在、动作没了，
+ *   就是票 01 查出的那种静默降级 ⇒ 装配期就抛，并点名是哪张卡、缺哪个字段。
+ * · `busy` / `events` **不**必填：前者只当 `disabled`（undefined 与 false 同义）；后者喂
+ *   `materialConversionActivityText`，而它下游 `currentConversionProgress` 自己
+ *   `Array.isArray(events) ? events : []` 兜底（`view-rules.js:1018`），读不到只会少报一句活动明细。
+ * · ⚠️ **票 `mineru-formats/03` 在这张卡上又加了三个输入**（材料不齐时逐个表态：「补传这一份」
+ *   /「删掉这份」，以及上传前的按格式体积预检）。收编（票 02）与那笔**在 main 上并行发生过**，
+ *   所以这里补登记：`autoSplit` 由**内层**组件消费（不是顶层解构，靠透传），另两个是顶层解构。
+ *   若当初只按顶层解构点名，这三个会被当成「卡不消费」而漏掉——记在这里，因为同一个坑对
+ *   `phase-page.js`（13 个 `props.某名` 直读）也成立。
+ */
+export const uploadAreaView = defineCardView({
+	card: "UploadArea",
+	fromBook: [
+		"meta",
+		"events",
+		"onUpload",
+		"onConvert",
+		"onIdentify",
+		// 票 `mineru-formats/03`：补传这一份（沿用上传写面，但**以缺口那一格的名字**落上去）。
+		"onReplaceSource",
+		// 票 `mineru-formats/03`：删掉这一份（走 `source-remove`；只对 `failed` 的那一格开放）。
+		"onRemoveSource",
+		// 票 10：上传前那道按格式的体积预检（`false` = 不许承诺会自动拆）。**由内层组件消费**。
+		"autoSplit",
+		"busy",
+	],
+	required: ["meta", "onUpload", "onConvert", "onIdentify"],
+	derive: (book) => ({
+		sources: book.meta?.sources ?? NO_SOURCES,
+		converting: book.meta?.converting === true,
+		conversionStartedAt: book.meta?.updatedAt,
+		// 见上方契约注释：非 error 态给 `null`（整条不出声），error 态给那一句正文。
+		errorText:
+			book.meta?.status === "error"
+				? humanErrorOf(book.meta, lastErrorEventMessage(book.events))
+				: null,
+	}),
+});
 
 export function UploadArea(props) {
 	const {
@@ -787,20 +619,31 @@ export function UploadArea(props) {
 		converting,
 		conversionStartedAt,
 		events,
+		errorText = null,
 		onUpload,
 		onConvert,
 		onIdentify,
+		onReplaceSource,
+		onRemoveSource,
 		busy,
+		// 票 10：本机**真探到**了自动切分能力（Python + PyMuPDF）吗？由 `/textbook/settings`
+		// 下发（`mineru-lib` 的探针）。⚠️ 缺省是 **false** —— 「探不到」必须落到「不许承诺会自动拆」
+		// 那一档，写成 true 就等于给一句没人验过的承诺。
+		autoSplit = false,
 	} = props;
 	const [pending, setPending] = useState([]); // [{ name, file, role }]
 	const [identifying, setIdentifying] = useState(false);
 	const [uploading, setUploading] = useState(false);
 	const [error, setError] = useState(null);
+	// 票 10：**不拦**但要说的一句（PDF 超 200MB 而本机切得开/切不开时的说明）。
+	// 与 `error` 分开两格：拦路的话是错色，说明的话不该长得像一次失败。
+	const [notice, setNotice] = useState(null);
 	const dirtyRef = useRef({});
 
 	// 选择文件（可多选）：先按文件名秒猜角色，再让 AI 精识别。
 	const pick = (e) => {
 		setError(null);
+		setNotice(null);
 		const files = Array.from(e.target.files ?? []);
 		e.target.value = "";
 		if (files.length === 0) return;
@@ -846,22 +689,34 @@ export function UploadArea(props) {
 
 	const uploadAll = async () => {
 		if (pending.length === 0) {
-			setError("请先选择 PDF 文件");
+			// 票 09：数材料说「材料」，不把上传入口按扩展名说成 PDF 入口。
+			setError("请先选择材料文件");
 			return;
 		}
 		setUploading(true);
 		setError(null);
+		setNotice(null);
 		const failed = [];
+		// 票 10：**不拦**但要说的那几句（PDF 超 200MB）。与 `failed` 分开：拦与说是两件事。
+		const notes = [];
 		for (const item of pending) {
-			// 超限直接标记失败（服务端 413 同一文案），不发起注定失败的大请求。
-			if (item.file.size > MAX_UPLOAD_BYTES) {
+			// 上传前预检：超限直接标记失败（服务端 413 同一文案），不发起注定失败的大请求。
+			// ⚠️ 判据由 `judgeMaterialUploadSize` 一处给出（`src/domain-rules.js`）：**按格式**分档，
+			//  ① 500MB 那道（仓门）与 ② 200MB 那道（MinerU 云端）**分别说**，不合成一句；
+			//  ② 那一道对**非 PDF** 是拦（`page_ranges` 官方只对 PDF 生效、本机物理切也只对 PDF
+			//  跑得起来 ⇒ 一律请用户自己拆），对 PDF 是不拦、只如实说会不会先切。
+			const verdict = judgeMaterialUploadSize({ name: item.name, size: item.file.size, autoSplit });
+			if (verdict.blocked) {
 				failed.push({
 					item,
-					message: uploadTooLargeMessage(),
+					message: verdict.message,
 					retryable: false,
 				});
 				continue;
 			}
+			// 只有**没拦**的那几份才进 `notes`：被拦的那句已经由红字那条说了，
+			// 两处各说一遍＝同一件事在屏上响两次。
+			if (verdict.message !== "") notes.push(`${item.name}：${verdict.message}`);
 			try {
 				await onUpload(item.file, item.role);
 			} catch (err) {
@@ -880,17 +735,19 @@ export function UploadArea(props) {
 			const failedNames = new Set(failed.map((f) => f.item.name));
 			setPending((prev) => prev.filter((i) => failedNames.has(i.name)));
 			const first = failed[0];
-			// 票 10（判定一 #10）：单本与多本两条分支原来说两句话（「；重试只会重传这一本」/
+			// 票 10（判定一 #10）：单份与多份两条分支原来说两句话（「；重试只会重传这一份」/
 			// 「，将仅重试失败项」）——同一件事收敛成同一句，两条分支都用它。
+			// 票 09：量词收窄到材料（「份」），「本」留给「书」。
 			const retryHint =
-				first.retryable === false ? "" : "；只会重试失败的那几本";
+				first.retryable === false ? "" : "；只会重试失败的那几份";
 			const anyRetryable = failed.some((f) => f.retryable !== false);
 			setError(
 				failed.length === 1
 					? `上传失败：${first.item.name}（${first.message}${retryHint}）`
-					: `有 ${failed.length} 本上传失败（如 ${first.message}）${anyRetryable ? "；只会重试失败的那几本" : ""}`,
+					: `有 ${failed.length} 份上传失败（如 ${first.message}）${anyRetryable ? "；只会重试失败的那几份" : ""}`,
 			);
 		}
+		if (notes.length > 0) setNotice(notes.join("\n"));
 		setUploading(false);
 	};
 
@@ -902,26 +759,69 @@ export function UploadArea(props) {
 	return createElement(
 		"div",
 		{ style: S.focus },
+		// ⚠️ 出错这一段**排在①之前**：状态条那句「出错了，请看下面的提示」指的就是它，
+		// 而 phase 1 的焦点主卡就是这张卡（错不到 `StatusCard` 去——见上方契约注释）。
+		// 非 error 态 `errorText` 是 `null` ⇒ 整条不渲染，不上屏一个空框。
+		errorText === null
+			? null
+			: createElement(
+					"div",
+					{
+						style: {
+							margin: "0 0 10px",
+							padding: "8px 10px",
+							borderRadius: "8px",
+							border: "1px solid var(--dsw-alias-state-error-primary)",
+						},
+					},
+					createElement(
+						"strong",
+						{ style: { color: "var(--dsw-alias-state-error-primary)" } },
+						ERROR_HEADING,
+					),
+					createElement("p", { style: { margin: "6px 0 0" } }, errorText),
+					isTokenIssueOf(errorText)
+						? createElement(
+								"p",
+								{ style: { margin: "4px 0 0", fontSize: "13px", opacity: 0.9 } },
+								TOKEN_HINT,
+							)
+						: null,
+				),
 		createElement(
 			"strong",
 			{ style: { fontSize: "14px" } },
-			"① 上传教材 PDF（可一次选多本）",
+			"① 上传材料（可一次选多份）",
 		),
 		createElement(
 			"p",
 			{ style: { margin: "4px 0 8px", fontSize: "12px", opacity: 0.7 } },
 			// 票 10（判定四③）：原句 76 字压到 90 字内——删掉与上方 📁 路径行重复的「见上方 📁 路径」
 			// 与「都保存在里面」这类可从"文件夹＝书名"推出来的话。
-			"书文件夹建在当前工作区目录里（文件夹名＝书名），上传的 PDF 都放里面。每本是什么角色由 AI 自动识别。",
+			// 票 09：退役「教材 PDF／上传的 PDF」，数材料说「份」。
+			"书文件夹建在当前工作区目录里（文件夹名＝书名），上传的材料都放里面。每份是什么角色由 AI 自动识别。",
 		),
-		createElement("label", { style: S.label }, "选择 PDF（可多选）"),
+		createElement("label", { style: S.label }, "选择材料（可多选）"),
 		createElement("input", {
 			type: "file",
-			accept: ".pdf",
+			// ⚠️ 票 07：由 `MATERIAL_FORMATS` 派生（与**服务端那道受理闸门同一份常量**）。
+			// 原来这里写死 `".pdf"`，用户连 docx 都选不到；写死与后端手抄的 `/\.pdf$/i`
+			// 各改一处就会分叉（前端放行、后端拒收）。改名单时这一行自动跟随。
+			accept: materialFormatAccept(),
 			multiple: true,
 			style: S.input,
 			onChange: pick,
 		}),
+		createElement(
+			"p",
+			{ style: { margin: "6px 0 0", fontSize: "12px", opacity: 0.7 } },
+			materialFormatHint(),
+		),
+		createElement(
+			"p",
+			{ style: { margin: "2px 0 0", fontSize: "12px", opacity: 0.7 } },
+			materialFormatCalibrationNote(),
+		),
 		pending.length > 0
 			? createElement(
 					"div",
@@ -939,7 +839,7 @@ export function UploadArea(props) {
 						createElement(
 							"span",
 							{ style: { fontSize: "12px", fontWeight: 600 } },
-							`待上传 ${pending.length} 本：`,
+							`待上传 ${pending.length} 份：`,
 						),
 						identifying
 							? createElement(
@@ -998,6 +898,15 @@ export function UploadArea(props) {
 					),
 				)
 			: null,
+		// 票 10：说明与错是两件事——`notice`（不拦，只说）用中性色，`error`（拦）用错色。
+		// 把「不拦但要说」的那几句混进红字里，用户会以为上传失败了。
+		notice !== null
+			? createElement(
+					"p",
+					{ style: { margin: "6px 0 0", fontSize: "12px", whiteSpace: "pre-line", opacity: 0.85 } },
+					`ℹ️ ${notice}`,
+				)
+			: null,
 		error !== null ? createElement("p", { style: S.error }, error) : null,
 		createElement(
 			"div",
@@ -1016,7 +925,7 @@ export function UploadArea(props) {
 					onClick: uploadAll,
 					disabled: busy || uploading || pending.length === 0,
 				},
-				pending.length > 0 ? `上传这 ${pending.length} 本` : "上传",
+				pending.length > 0 ? `上传这 ${pending.length} 份` : "上传",
 			),
 		),
 		sources.length > 0
@@ -1026,7 +935,7 @@ export function UploadArea(props) {
 					createElement(
 						"div",
 						{ style: { margin: "0 0 4px" } },
-						`已上传 ${sources.length} 本：`,
+						`已上传 ${sources.length} 份：`,
 					),
 					sources.map((source) =>
 						createElement(
@@ -1035,7 +944,7 @@ export function UploadArea(props) {
 								key: source.file,
 								style: { wordBreak: "break-all", margin: "2px 0" },
 							},
-							`${source.converted === true ? "✅" : "⏳"} ${source.file}`,
+							`${convertedIcon(source)} ${source.file}`,
 						),
 					),
 				)
@@ -1062,10 +971,62 @@ export function UploadArea(props) {
 						: null,
 				)
 			: null,
+		// 票 `mineru-formats/03`：材料不齐时书**停在这一步**（ADR-0028 决策 3），于是这一张
+		// 卡片就是那个红的**唯一可行动出口**——每一份红源在这里有补传／删掉两条路。
+		// 没有缺口时整块不渲染（不是渲染一块空的）。
+		createElement(MaterialGapList, {
+			sources,
+			busy,
+			onReplaceSource,
+			onRemoveSource,
+			// 票 10：补传那颗选择器背后那道**按格式**的体积预检与上传卡**用同一个事实**
+			// （`/textbook/settings` 的 `autoSplitAvailable` 经 `client-entry` 透传下来）。
+			// 不透传的话它只能取缺省 false＝「探不到」，那句话会与上传卡那一屏不一致。
+			autoSplit,
+		}),
 	);
 }
 
 // ── 状态卡 / 错误卡 ─────────────────────────────────────────────────────────
+
+/**
+ * 兜底状态卡吃什么：整份书级快照 + 活性行**已经算好的**那一份判定 + 删书两步确认的回调。
+ *
+ * 它是焦点区路由的 `default:` 臂——没被专门路由走的状态全落在这一张卡上，所以它是本文件里
+ * props 最宽的一张：12 位里 9 位是**只读快照**，每位的消费点都写在卡内（`meta.status` 决定
+ * 三条分支、`events` 算写章进度与这一步的起点、`lastEvent` 取人话错误），没有第二份推导。
+ * · `meta` 必填 —— 漏了它在第一条分支就崩（`meta.status`，无 `?.`）。`spec.md` 的 error modes
+ *   也把「缺 `meta`」列为这 12 个 slot 的真错：没有书时它们一个都不渲染。
+ * · `onResume` 必填 —— 两颗键（「🔁 让 AI 接着干」「我配好了，继续」）都是 `onClick: onResume`
+ *   裸接，漏了就是用户点下去**什么都不发生**、界面零变化——票 01 查出的静默降级那种形状
+ *   （`dead-gates` 不变量 7 禁的就是它）。
+ * · `onDeleteStart` / `onDeleteConfirm` / `deletingId` **不**必填 —— F28 的删书入口是**有意
+ *   可选**的（卡内注释逐字写着「仅在父级传入删除回调时显示」），`typeof onDeleteStart ===
+ *   "function"` 是这条功能的判据，不是防「壳忘了传」的守卫。契约不该把有意可选改成必填。
+ * · 其余 `lastEvent` / `events` / `needsConfig` / `busy` / `pendingStageLabel` /
+ *   `progressDetail` / `stall` **不**必填：每一位都有 `?.` / `??` / `typeof` 兜底，缺了只少一截
+ *   显示，不丢动作。其中 `needsConfig` 值得单说：壳里 `needsConfigText` 两个分支都带兜底文案、
+ *   恒为非空串，而它在卡内是**纯显示值**（`createElement("p", …, needsConfig)`）——真缺了也
+ *   只是那一行空着，不该为它白屏。
+ */
+export const statusCardView = defineCardView({
+	card: "StatusCard",
+	fromBook: [
+		"meta",
+		"lastEvent",
+		"events",
+		"needsConfig",
+		"onResume",
+		"busy",
+		"pendingStageLabel",
+		"progressDetail",
+		"stall",
+		"onDeleteStart",
+		"onDeleteConfirm",
+		"deletingId",
+	],
+	required: ["meta", "onResume"],
+});
 
 export function StatusCard(props) {
 	const {
@@ -1093,22 +1054,21 @@ export function StatusCard(props) {
 	}, []);
 	if (meta.status === "error") {
 		// F26（2026-08-20 走查）：优先显示后端落账的人话错误（meta.lastErrorHuman，页数超限/Token 失效
-		// 已归一成人话），否则回退事件消息；下方给「拆 PDF / 换一本 / 删掉重来」引导，错误含 Token
+		// 已归一成人话），否则回退事件消息；下方给「拆开 / 换一本 / 删掉重来」引导，错误含 Token
 		// 关键词时补 Token 重设提示（入口见 F20 的 MinerU Token 常驻卡）。
-		const rawError = lastEvent?.data?.message ?? "未知错误";
-		const humanError =
-			typeof meta?.lastErrorHuman === "string" && meta.lastErrorHuman !== ""
-				? meta.lastErrorHuman
-				: rawError;
-		const isTokenIssue =
-			humanError.includes("Token") || humanError.includes("token");
+		// ⚠️ 票 07：引导句按**格式中立**写。受理闸门放开后原件可能是 docx/pptx/图片，
+		// 写死「把 PDF 拆成几份」对它们就是假话。
+		// ⚠️ 2026-10-08：取数（`humanErrorOf`）与那句标题／Token 提示搬到模块级共用件上了——
+		// `UploadArea` 也印同一句（phase 1 出错时焦点主卡是它，见那张卡的契约注释）。
+		const humanError = humanErrorOf(meta, lastEvent?.data?.message);
+		const isTokenIssue = isTokenIssueOf(humanError);
 		return createElement(
 			"div",
 			{ style: { ...S.focus, borderColor: "var(--dsw-alias-state-error-primary)" } },
 			createElement(
 				"strong",
 				{ style: { color: "var(--dsw-alias-state-error-primary)" } },
-				"⚠️ 这一步出错了",
+				ERROR_HEADING,
 			),
 			createElement("p", { style: { margin: "6px 0" } }, humanError),
 			createElement(
@@ -1117,13 +1077,15 @@ export function StatusCard(props) {
 				// 票 10（判定一 #9）：两条上限是**两件事**——500MB 是单份上传体积上限
 				// （domain-rules.MAX_UPLOAD_BYTES，前后端共用同一常量），200 页是 MinerU 单次解析的页数上限。
 				// 原来这句只说页数、不说体积，用户按 200 页拆完仍可能撞 500MB。这里一并说清。
-				"你可以：把 PDF 拆成几份（每份 <200 页、<500MB）后分别上传，或换一本更薄的书，或删掉这本书重新开始。",
+				// 票 09：原件不再被叫成「教材 PDF」，材料按份数说；「换一本更薄的书」
+				// 里的「本」是数**书**，保留（CONTEXT.md「量词『份』」）。
+				"你可以：把这份材料拆成几份（每份 <200 页、<500MB）后分别上传，或换一本更薄的书，或删掉这本书重新开始。",
 			),
 			isTokenIssue
 				? createElement(
 						"p",
 						{ style: { margin: "4px 0 0", fontSize: "13px", opacity: 0.9 } },
-						"💡 MinerU Token 可能失效，可到工作台「MinerU Token」处点「重新设置」换新 Token。",
+						TOKEN_HINT,
 					)
 				: null,
 			createElement(
@@ -1361,10 +1323,34 @@ export function StatusCard(props) {
 
 // ── 交付卡 ──────────────────────────────────────────────────────────────────
 
+/**
+ * 交付卡吃什么：一个下载地址函数 + 三份只读快照 + 两个动作回调。
+ *
+ * · `downloadHref` 必填 —— 卡内是 `downloadHref("工作区/book.md")` 裸调用。票 03 把地址拼装收进
+ *   `ui/artifact-read.js` 之后，`project` / `session` 两个身份 prop 随之退休（原先**只**被用于
+ *   那一条 href）。「没有当前书」的正确表达是**这个函数返回 `null`**（那一支不渲染下载键），
+ *   不是这个函数不存在——后者今天会在渲染期抛。
+ * · `onPreview` 必填 —— `onClick: onPreview` 裸接，漏了「👀 打开成书」点下去静默无反应。
+ * · `meta` 必填 —— 它在这张卡里只被用在一处：书名 `(meta?.name ?? "").trim() || "BOOK"`。
+ *   取不到就把用户要下的书**报错名字**（渲染成《BOOK》）——那是拿缺省盖住问题，所以这里
+ *   **不**给 `defaults`，宁可装配期点名。
+ * · `checks` / `aiReport` / `styleNotes` / `busy` **不**必填：前三者卡内自带兜底
+ *   （`MachineChecks` 自己 `checks ?? []`，`aiReport` 显式判 `null`/`undefined`/`""`，
+ *   `styleNotes` 走 `?? []`），`busy` 只当 `disabled`。
+ *   ⚠️ 旧账本没有 `styleNotes` 这个字段是真事（壳调用点那行注释写着「内部 ?? [] 兜底」），所以
+ *   它由壳按 `meta.styleNotes` 原样递下来，契约**不**给它任何缺省。
+ */
+export const deliveryCardView = defineCardView({
+	card: "DeliveryCard",
+	fromBook: ["downloadHref", "checks", "onPreview", "busy", "meta", "aiReport", "styleNotes"],
+	required: ["downloadHref", "onPreview", "meta"],
+});
+
 export function DeliveryCard(props) {
 	const {
-		project,
-		session,
+		// 票 03：下载地址的拼装归 `ui/artifact-read.js`（`downloadHref`），本卡只给一个 `rel`。
+		// `project` / `session` 两个身份 prop 随之退休——它们原先**只**被用于下面那一条 href。
+		downloadHref,
 		checks,
 		onPreview,
 		busy,
@@ -1420,9 +1406,18 @@ export function DeliveryCard(props) {
 						},
 					},
 					createElement("strong", null, "🤖 AI 检查说的："),
+					// 报告正文那一块：它是**连续正文**（`pre-wrap` 的整篇报告），套工作台唯一那条
+					// 量宽上限（票 `walkthrough-fixes/17`）。⚠️ 只给这块**正文**加上限，
+					// **卡盒宽度一点不动**（票 16 的「工作台＝输入框」那条式子照旧）。
 					createElement(
 						"p",
-						{ style: { margin: "4px 0 0", whiteSpace: "pre-wrap" } },
+						{
+							style: {
+								margin: "4px 0 0",
+								whiteSpace: "pre-wrap",
+								maxWidth: BODY_MEASURE_MAX_WIDTH,
+							},
+						},
 						aiReport,
 					),
 				)
@@ -1476,7 +1471,7 @@ export function DeliveryCard(props) {
 				// 批 3 视觉权重：交付屏的"主操作"是下载（用户要的是那本书），预览是次级的。
 				// 票 03：预览改成在 DSH 右栏打开成品——卡片里不再灌整本 <pre>，故没有「收起」态。
 				{ style: S.ghostBtn(false), onClick: onPreview, disabled: busy },
-				// 票 10（判定一 #13）：与终检认可卡统一——同一份 `work/book.md`，名字用产物词表的
+				// 票 10（判定一 #13）：与终检认可卡统一——同一份 `工作区/book.md`，名字用产物词表的
 				// 「成书」（票 05），动词只有「打开」。
 				"👀 打开成书",
 			),
@@ -1488,7 +1483,12 @@ export function DeliveryCard(props) {
 						textDecoration: "none",
 						display: "inline-block",
 					},
-					href: `/textbook/download?session=${encodeURIComponent(session)}&project=${encodeURIComponent(project)}&path=work/book.md`,
+					// 票 03：地址由 `ui/artifact-read.js` 拼（`/textbook/download`）。
+		// ⚠️ 「导航 vs 读取」是**两件不同的事**：这里是 `<a href>`——浏览器导航，**没有** `res.ok`
+		// 检查、**不产生**错误条，下载失败由浏览器自己那一屏负责。别顺手给它补一套 fetch 语义。
+		// 「无当前书」时 `downloadHref` 返回 null ⇒ 不渲染那颗下载键（这一支在生产里走不到：
+		// 本卡只在 `case "delivered"` 渲染，而那要求 `meta.status === "delivered"` ⇒ 有书）。
+		href: downloadHref("工作区/book.md") ?? null,
 				},
 				`⬇️ 下载《${bookName}》.md`,
 			),
@@ -1592,6 +1592,33 @@ export function DeliveryCard(props) {
 
 // ── 终检结果认可卡（2026-08-26 用户拍板：终检 = AI 对全书整体调整 + 用户对整体的最终认可） ──
 
+/**
+ * 终检认可卡吃什么：机器检查结果 + 两份产物视图（AI 报告、风格线清单）+ 三颗动作键的回调
+ * ＋ 这本书的状态投影（只为读 `meta.demo`）。
+ *
+ * ⚠️ 取证口径（范围＝本文件 `export function FinalApprovalCard` 起至下一个顶层 `export function`
+ * 为止）：`project` / `session` 这两个名字在函数体内**各 0 命中**（按子串匹配，比词匹配更严）
+ * ——它们仍是壳在传、卡在从不读的死 prop，本契约**不声明**它们。票 03 收 `DeliveryCard` /
+ * `ChaptersCard` / `ExploreConfirmCard` 的身份 prop 时漏掉了这一处。
+ * ⚠️ **`meta` 从票 `demo-flow-fidelity/06` 起不再是死 prop**：卡要读 `meta.demo` 才决定说
+ * 不说那句演示提示（`view-rules.demoQualityChecksNote()`），所以它进了 `fromBook`——这正是
+ * 票面「与 `PhasePage` 那条路对齐」的做法（`phasePageView.fromBook` 早就有 `meta`）。
+ * **不许**改成拿 `checks` 条数或有没有 AI 报告来反推演示与否（票面明令：那是把显示逻辑建在
+ * 别人家的判据上）。`test-card-views-coverage.mjs` 按卡体内真实消费点核覆盖率，所以这一位
+ * 进契约的同时，卡体里必须真的读它。
+ * · `onApprove` / `onReject` / `onPreview` 必填 —— 三颗都是裸调用（`onApprove()`、
+ *   `onReject(note)`、`onClick: onPreview`）。⚠️ `onReject` 最阴：它藏在「先写一句意见、
+ *   再点不满意」那段守卫后面，用户写完意见点下去**什么都不会发生**。
+ * · `checks` / `aiReport` / `styleNotes` / `busy` / `meta` **不**必填：前者与交付卡同判
+ *   （三者卡内自带兜底，`busy` 只当 `disabled`），`meta` 走 `isDemoBook(meta)` 的 `?.` 兜底
+ *   （老账本可以不带这一位 ⇒ 那就是一本真书，不显示演示提示）。
+ */
+export const finalApprovalCardView = defineCardView({
+	card: "FinalApprovalCard",
+	fromBook: ["checks", "onPreview", "busy", "aiReport", "styleNotes", "onApprove", "onReject", "meta"],
+	required: ["onPreview", "onApprove", "onReject"],
+});
+
 export function FinalApprovalCard(props) {
 	const {
 		checks,
@@ -1601,6 +1628,7 @@ export function FinalApprovalCard(props) {
 		styleNotes,
 		onApprove,
 		onReject,
+		meta,
 	} = props;
 	const [note, setNote] = useState("");
 	// 批 3：把「不满意」从「看着能点却点不动」改成「点了告诉你为什么还不能走」。
@@ -1623,11 +1651,34 @@ export function FinalApprovalCard(props) {
 						},
 					},
 					createElement("strong", null, "🤖 AI 检查说的："),
+					// 报告正文那一块：它是**连续正文**（`pre-wrap` 的整篇报告），套工作台唯一那条
+					// 量宽上限（票 `walkthrough-fixes/17`）。⚠️ 只给这块**正文**加上限，
+					// **卡盒宽度一点不动**（票 16 的「工作台＝输入框」那条式子照旧）。
 					createElement(
 						"p",
-						{ style: { margin: "4px 0 0", whiteSpace: "pre-wrap" } },
+						{
+							style: {
+								margin: "4px 0 0",
+								whiteSpace: "pre-wrap",
+								maxWidth: BODY_MEASURE_MAX_WIDTH,
+							},
+						},
 						aiReport,
 					),
+				)
+			: null,
+		// 票 `demo-flow-fidelity/06`（票 01 Q5＝乙：卡上明写，**不**伪造 AI 检查报告与五份分查）：
+		// 演示书在这张卡上比真书少两块（机器检查只跑前 6 项、没有 AI 检查报告），所以在这一屏上
+		// 明说差在哪。句子的出处只此一处（`view-rules.demoQualityChecksNote()`，阶段页那块调
+		// 同一个函数），演示与否只看 `meta.demo`（`isDemoBook`），**不拿检查条数反推**
+		// ——递进去的 `checks` 只用来叙述「这一屏真的列了几项」（票 06 收口，2026-10-08）。
+		// ⚠️ 它必须留在下面三键那一排**之前**：票 24 的滚动判据以「卡的最后一行是那颗定案键」
+		// 为承重前提（`test-layout-anchors.mjs` 源码级钉着这个顺序）。
+		isDemoBook(meta)
+			? createElement(
+					"p",
+					{ style: { margin: "8px 0 0", fontSize: "12px", opacity: 0.75 } },
+					demoQualityChecksNote(checks),
 				)
 			: null,
 		// 票 26：机器检查清单（失败项显示 ❌，票 20 成果）。原票 20 的修复按钮已收——
@@ -1776,6 +1827,31 @@ export function rejectPayload(mode, reasons, note, styleText) {
 		note: `${String(note ?? "")}${extraNote}`.trim(),
 	};
 }
+
+/**
+ * 关卡卡吃什么：待拍板那一份关卡快照 + 三个动作回调，外加两个壳级装饰输入。
+ *
+ * · `gate` 是**唯一**的数据来源：卡内三条分支（`gate === null` 直接不渲 / `status !== "awaiting"`
+ *   出结果条 / 其余出拍板屏）都直接读它，没有第二份推导，也没有任何守卫。`null` 是有意义的值
+ *   （「这一屏没有待拍板的关卡」），`required` 只拦 `undefined`，两者不打架。
+ * · `onDecide` / `onRollback` 必填 —— 两处都是裸调用（`onClick: () => onDecide({ approved: true })`、
+ *   `onClick: () => { …; onRollback(); }`）。漏了它们，用户点「✅ 通过，继续」「⏪ 回退到最近一次
+ *   存档」「确认回退」**什么都不会发生**：按钮在、界面不报错、也没人看得见——正是票 01 查出的
+ *   那种静默降级（`.scratch/dsh-contract-drift/` 那两次「界面零变化、通路悄悄死掉」的形状）。
+ *   收编后它在**装配期**抛，原文点名是哪张卡、缺哪个字段。
+ * · `busy` / `onAddPattern` **不**必填：前者只当 `disabled: busy`（`undefined` 与 `false` 同义）；
+ *   后者卡内自己判 `typeof onAddPattern === "function"` 才有那步「记成这本书的自定义模式」——
+ *   那是 2026-08-21 需求里的**有意可选**，不是防「壳忘了传」的守卫，契约不该把它收紧。
+ * · `error` 是壳调用点上写死的 `null`（壳今天没有关卡级错误状态），故走 `defaults`：缺省成
+ *   `null` 是**安全**的而非掩盖——卡内是 `error !== null ? … : null`，`null` 就是「不渲染错误条」
+ *   这个真值。哪天壳真有了关卡错误，这一位会是真值，缺省（只在 `undefined` 时生效）**不再登场**。
+ */
+export const gatePanelView = defineCardView({
+	card: "GatePanel",
+	fromBook: ["gate", "onDecide", "onRollback", "busy", "onAddPattern"],
+	required: ["gate", "onDecide", "onRollback"],
+	defaults: { error: null },
+});
 
 export function GatePanel(props) {
 	const { gate, onDecide, onRollback, busy, error, onAddPattern } = props;
@@ -2174,7 +2250,7 @@ export function MineruTokenCard(props) {
 			createElement(
 				"p",
 				{ style: { margin: "4px 0" } },
-				"PDF 转换需要 MinerU 的 Token（在 mineru.net 申请；免费额度以对方规则为准）。填在这里即可：",
+				"材料转换需要 MinerU 的 Token（在 mineru.net 申请；免费额度以对方规则为准）。填在这里即可：",
 			),
 			createElement("input", {
 				style: S.input,

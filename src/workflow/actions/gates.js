@@ -1,10 +1,33 @@
 /**
  * 动作族模块（架构评审候选 3，2026-09-01 拆分）：actGates
- * 从 src/workflow.js 平移，接口 (ctx, req, res, action, sessionId, project, body) 不变。
+ * 从 src/workflow.js 平移（架构评审候选 3，2026-09-01）。
+ *
+ * ⚠️ 票 `workflow-seams/03`：interface 已收窄成**一个请求对象**
+ * （`{ ctx, action, sessionId, project, body }`）并返回 `{status, json}`——
+ * `_req` 与 `res` 两个传输参数都已从 interface 上消失（`res` 由 `handleAction` 那一次
+ * `sendJson` 写出，落盘边界随它）。
+ *
+ * ⚠️ **本文件不许删、不许合、不许改名**：动作族 id ≡ 本文件名这一点被
+ * `test-contract-action-catalog.mjs` 从**源码文本**锚定（它正则抠 `workflow.js` 的
+ * `HANDLER_OF_FAMILY` 字面量表并要求 handler 绑定名匹配 `act[A-Z]\w*`）；
+ * 另有 `test-context-vocabulary.mjs` 把「探查」钉在 `gates.js`、
+ * `test-gate-write-points.mjs` 点名读本目录下的族文件。
+ * ⇒ 改完之后本文件会变得**近乎空壳**——**那是承重件不是忘了删**。
  * 共享工具来自 ../engine.js。
  */
+// 章节正文路径的构造只此一份（票 `depth-review-2026-10/05`）：住在 `src/domain-rules.js`，
+// 与识别侧（`NUMBERED_CHAPTER_FILE_RE` / `productOpenMode`）同居。
+import { chapterRel, readingName, knowledgeShardName, WORK_DIR_NAME, DETAIL_DIR_REL } from '../../domain-rules.js'
 import {
   assertSessionOwned,
+  // 票 `premature-announce/01`：源探查「盘上产物齐没齐」的唯一一份判据（置态/放行/交工三处共用）。
+  exploreArtifactProblems,
+  // 同票：章节骨架那一段的就绪判据（比探查那份窄，窄处写在它自己的注释里）。
+  outlineArtifactProblems,
+  // 同票：交付不可撤回 ⇒ 放行那一刻当场重算一次硬检查（不拿账上那份快照当现状）。
+  runQualityChecks,
+  // 同票：`countRunningSubagents` 搬进了 engine（暂停与「重做/归档前」两处共用同一份实现）。
+  countRunningSubagents,
   readMeta,
   updateMeta,
   appendEvent,
@@ -13,13 +36,17 @@ import {
   foldGate,
   workDir,
   workFile,
+  projectDir,
   chapterGateMiss,
-  gateWaiters,
-  handoff,
+  resolveGateDecision,
+  handoffAndDrive,
   advance,
   kick,
-  sendJson,
 } from '../engine.js'
+// payload 字段词汇层（票 `deep-module-scan/18` 层一）。本文件三个 case（拍板 / 两条重做）
+// 读的是**同一个** `note` 字段、同一个 500 字上限 ⇒ 共用 `GATE_NOTE_MAX` 一个常量。
+import { textField, GATE_NOTE_MAX } from './payload-fields.js'
+import { familyOf, reject, accept } from '../action-runner.js'
 import { mkdirSync, existsSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
@@ -43,21 +70,104 @@ export function gateAlreadyDecidedError(current) {
 /**
  * 探查重做要归档的两件产物（归档与清点都只认这一份清单，不在别处再抄一遍文件名）。
  * `knowledge-map.json` 可能压根没生成（那一版探查没写知识地图），循环里按存在性跳过。
+ *
+ * ⚠️ 票 03 之后它只管**两份固定名**的件；精读派发按材料落下的 `reading-NN.md` /
+ * `knowledge-map-NN.json` 由 {@link exploreRedoArtifactNames} 现场枚举（份数随材料数变，
+ * 写死清单装不下）——重做那一圈两份都不搬的话，新旧分片会混在同一本书的 `工作区/` 里。
  */
 const EXPLORE_REDO_ARTIFACTS = Object.freeze(['explore.md', 'knowledge-map.json'])
 
 /**
+ * 票 03 · ADR-0030 决策 2：精读派发落下的两族**按材料分号**的产物（`NN` = 材料序号，两位）。
+ * 这一条正则同时认两种形状：`工作区/` 原位的裸件、`_旧版产物/` 里带 base36 时间戳的归档件。
+ *
+ * ⚠️ **形状从 `domain-rules` 的两个出口派生**（`readingName` / `knowledgeShardName`），不另写一份
+ * （code-review S2）：这里原先手抄 `reading-\d{2}\.md|knowledge-map-\d{2}\.json`，于是
+ * 「改名」变成**静默失配**——生产者（brief 的 `parallelReads`）已经按新名写了，认领这一族
+ * 归档的正则却还认旧名，重做时 `工作区/` 原位那几片搬不走、`_旧版产物/` 里那几片清不掉，
+ * 而新旧的混账一直长胖。派生的做法把这一族钉回它的单一出处：
+ * **改 `domain-rules` 那两个函数就同时改了这里**。
+ *
+ * 派生方式：基名逐字转义后，把那个**两位序号**换成 `\d{2}`——序号位可匹配，其余一个字都不动。
+ * （`escapeRegExp` 不转义数字，所以转义后的字符串里 `01` 仍以原样出现。）
+ */
+function escapeRegExp(literal) {
+  return literal.replace(/[.*+?^${}()|[\]\\-]/g, (c) => `\\${c}`)
+}
+const shardNameShape = (name) => escapeRegExp(name).replace(/\d{2}/g, String.raw`\d{2}`)
+const EXPLORE_SHARD_ARTIFACT_RE = new RegExp(
+  `^(?:${shardNameShape(readingName('01'))}|${shardNameShape(knowledgeShardName('01'))})(?:\\.[0-9a-z]+)?$`,
+)
+
+/**
+ * 本次探查重做要归档的产物全集 = 两份固定件 ∪ 盘上现存的精读分片件／细目件。
+ *
+ * ⚠️ **票 11：精读细目换家了**（工作区根 → `工作区/细目/`），所以这一族现在**跨两个目录**，
+ * 只扫 `工作区/` 会让细目留在原位、和新一轮混在同一本书里——而 `stage-submit(explore)`
+ * 的细目存在性断言会把上一轮的旧细目当这一轮的交账（正是探查笔记 §6.9 说的那个静默失配）。
+ * 于是这里扫**两个源目录**，并把每一件的**书夹相对路径**一起交出去（`rel`）：
+ * 动作层若靠 `workFile(project, name)` 反推，它只会拼工作区根、对细目恒 miss。
+ *
+ * 三处各答一个问题：
+ * - `work`：这一轮留下什么（要搬走的正是这些）；
+ * - `detail`：细目那一族（票 11 起在子目录里）；
+ * - `archive`：清理策略认得哪些产物名（某一轮材料比现在多时，早先搬走的那几片照样归
+ *   `ARCHIVE_KEEP` 管，否则 `_旧版产物/` 会随着材料数单调长胖——那正是这族当初「只进不出」的病）。
+ *
+ * 归档件那边的名字要**还原成基名**（`精读-01.md.m3fk2` → `精读-01.md`）：归档件的真名
+ * 是「基名 + 时间戳」，直接把整个 entry 当产物名会让 {@link trimExploreArchive} 的
+ * `<名>.<时间戳>` 匹配对不上（等于没纳入清理）。
+ *
+ * @param {string} work 该书的 `工作区/` 目录
+ * @param {string} archive `工作区/_旧版产物/` 目录（可与 `work` 同一个，默认如此）
+ * @returns {Array<{name: string, rel: string}>} 文件名（不含目录）＋ 它的书夹相对路径
+ */
+export function exploreRedoArtifactEntries(work, archive = work) {
+  const detail = join(work, ...DETAIL_DIR_REL.split('/').slice(1))
+  // 键＝产物基名（清理策略按它归堆），值＝那一件在书夹里的相对路径（动作层按它搬）。
+  const out = new Map(EXPLORE_REDO_ARTIFACTS.map((name) => [name, `${WORK_DIR_NAME}/${name}`]))
+  for (const [dir, relDir, inArchive] of [
+    [work, `${WORK_DIR_NAME}`, false],
+    [detail, DETAIL_DIR_REL, false],
+    [archive, `${WORK_DIR_NAME}/_旧版产物`, true],
+  ]) {
+    let entries = []
+    try { entries = readdirSync(dir) } catch { continue }
+    for (const entry of entries) {
+      if (!EXPLORE_SHARD_ARTIFACT_RE.test(entry)) continue
+      const name = inArchive ? entry.slice(0, entry.lastIndexOf('.')) : entry
+      if (!out.has(name)) out.set(name, `${relDir}/${name}`)
+    }
+  }
+  return [...out].map(([name, rel]) => ({ name, rel }))
+}
+
+/**
+ * 本次探查重做要归档的**文件名**全集——{@link exploreRedoArtifactEntries} 的一份投影
+ * （`trimExploreArchive` 与判据要的只是名字；动作层要的是来处，那份用 entries）。
+ *
+ * ⚠️ 签名保持 `(work, archive = work)`：它是判据直调的那一个出口，别为了加第三个参数改形状。
+ *
+ * @param {string} work 该书的 `工作区/` 目录
+ * @param {string} archive `工作区/_旧版产物/` 目录（可与 `work` 同一个，默认如此）
+ * @returns {string[]} 文件名（不含目录）
+ */
+export function exploreRedoArtifactNames(work, archive = work) {
+  return exploreRedoArtifactEntries(work, archive).map((entry) => entry.name)
+}
+
+/**
  * 归档保留份数：每种产物只留**最近这么多份**归档，更早的在下一次归档时清掉
- * （票 pipeline-wiring-gaps/08 的「归档件不再只进不出」）。取 10 是「够回看、又不至于让 work/ 无界长胖」的折中：
+ * （票 pipeline-wiring-gaps/08 的「归档件不再只进不出」）。取 10 是「够回看、又不至于让 工作区/ 无界长胖」的折中：
  * 一次驳回只多两件，用户真要回看十份之前的报告，回退（快照）那条路才是正经去处。
  */
 const ARCHIVE_KEEP = 10
 
 
 /**
- * 归档清理的越界守卫（也是删除点唯一的放行判据）：只认 `work/_旧版产物/` **直接**底下、
+ * 归档清理的越界守卫（也是删除点唯一的放行判据）：只认 `工作区/_旧版产物/` **直接**底下、
  * 形如 `<产物名>.<base36 毫秒时间戳>` 的**文件**。定点修改写下的 `深改-<id>/` 目录、
- * 别的族（最佳范例章/章节安排/重置重做）写下的归档，以及 `work/` 原位的产物都不在射程内。
+ * 别的族（最佳范例章/章节安排/重置重做）写下的归档，以及 `工作区/` 原位的产物都不在射程内。
  */
 function assertArchiveEntry(name, entry, archive) {
   if (entry === '.' || entry === '..') return false
@@ -103,24 +213,21 @@ export function trimExploreArchive(archive, names, keep) {
 
 
 /** 动作族 · 关卡拍板：'gate-decide' / 'explore-confirm' / 'outline-confirm' / 'chapters-review-confirm' / 'final-approve' / 'rollback'。 */
-export async function actGates(ctx, _req, res, action, sessionId, project, body) {
+export const actGates = familyOf('gates', async ({ ctx: ctx, action: action, sessionId: sessionId, project: project, body: body }) => {
   switch (action) {
     case 'gate-decide': {
       const { gate, version, approved, mode, reasons, note } = body
       const gateId = String(gate)
       if ((gateId === '' || gateId === 'undefined') || typeof version !== 'number' || typeof approved !== 'boolean') {
-        sendJson(res, 400, { ok: false, error: 'gate-decide 需要 gate/version/approved' })
-        return
+        return reject(400, 'gate-decide 需要 gate/version/approved')
       }
       assertSessionOwned(project, sessionId)
       const current = foldGate(project)
       if (current === null || current.gate !== gateId || current.version !== version) {
-        sendJson(res, 409, { ok: false, error: gateMismatchError(current) })
-        return
+        return reject(409, gateMismatchError(current))
       }
       if (current.status !== 'awaiting') {
-        sendJson(res, 409, { ok: false, error: gateAlreadyDecidedError(current) })
-        return
+        return reject(409, gateAlreadyDecidedError(current))
       }
       const event = appendEvent(project, 'textbook/gate-decision', {
         gate: gateId,
@@ -132,24 +239,37 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
       })
       // 原先这里还「读状态 → meta.updatedAt = event.time → 整份写回」：那个写回纯属多余
       // （appendEvent 已经把 updatedAt 记成 event.time），却会把账高带回读状态那一刻的旧值（票 02）。已删。
-      const waiter = gateWaiters.get(project)
-      if (waiter !== undefined && waiter.gate === gateId && waiter.version === version) {
-        gateWaiters.delete(project)
-        waiter.resolve()
-      }
+      // ⚠️ 票 `deep-module-scan/10`：原先这里直接 `gateWaiters.get(project)`、比对 `gate`/`version`
+      // 两个字段、再 `.resolve()`——也就是 `gateWaiters` 的三字段协议**有一半住在这个文件里**。
+      // 现在只说「兑现这一次的拍板」，比对与兑现都在 engine 内（`resolveGateDecision`）。
+      resolveGateDecision(project, gateId, version)
       void kick(ctx, project)
-      sendJson(res, 200, { ok: true, project, event })
-      return
+      return accept({ project, event })
     }
     case 'explore-confirm': {
       // 用户确认探查结果：true → 进设计；false → 归档重做（可带一句"哪里不满意"，重做时 AI 必看）。
       assertSessionOwned(project, sessionId)
       const exMeta = readMeta(project)
       if (exMeta === null || exMeta.status !== 'awaiting-explore') {
-        sendJson(res, 409, { ok: false, error: '当前没有等待确认的探查结果' })
-        return
+        return reject(409, '当前没有等待确认的探查结果')
       }
       const approved = body.approved === true
+      if (approved) {
+        // ── 票 `premature-announce/01`：**放行那一跳过同一份就绪判据**────────────────────
+        // 病（2026-10-10 实跑）：这一段还没做完就点「满意」，原先会 200 并 `advance(2,3)` 把书推过去，
+        // 而 `工作区/knowledge-map.json` 只在交工成功支里诞生 ⇒ 它**永久缺位**；回去的路又被
+        // `stage-submit` 的 pendingStage 闸焊死（那条 400 指着「先补探查交工」，而那一跳当天走不通）。
+        // ⚠️ 判据与置态、交工验货**同一份**（`exploreArtifactProblems`）——⛔ 不许在这里另抄一份枚举。
+        // ⚠️ 这不是「调用方把请求写错了」那类 409：是**用户的一次真实动作被系统挡住**，所以照本文件
+        //    「归档没生效」那条先例**落一条账再拒收**（`CONTEXT.md`「验货」词条 2026-10-10 的例外条）。
+        const notReady = exploreArtifactProblems(project, exMeta).problems
+        if (notReady.length > 0) {
+          appendEvent(project, 'textbook/hint', {
+            text: `⛔ 还不能确认探查结果：${notReady.join('；')}。这几件是机器验过的产物——等它们落齐再确认；要重来就点「🔁 让 AI 重做」。`,
+          })
+          return reject(409, `还不能确认探查结果：${notReady.join('；')}`)
+        }
+      }
       if (approved) {
         updateMeta(project, (meta) => {
           meta.exploreConfirmed = true
@@ -163,25 +283,46 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
         appendEvent(project, 'textbook/hint', { text: '✅ 探查结果已确认，开始做教学设计。' })
         advance(project, 2, 3)
         void kick(ctx, project)
-        sendJson(res, 200, { ok: true, project, approved: true })
+        return accept({ project, approved: true })
       } else {
+        // ── 票 `premature-announce/01`：**重做前先看还有几个小助手在写**（反向那一支）──────────
+        // 病：这一段还在被写的时候点「让 AI 重做」，下面那段归档会把小助手**正在写**的产物一起搬进
+        // `_旧版产物/`（搬走的那一份它再也写不回来）。
+        // ⚠️ 处置**不是**去收回它们：`ctx.subagents.interrupt` 在本仓是登记过的禁读成员
+        //（`dev/host-contract-gate/catalog/web-chat.js` 的 `forbiddenMemberReads`），
+        //「收回小助手是主笔 AI 自己的事」——所以这里只**拒收 ＋ 说明**。
+        // ⚠️ `null` ＝ 数不出来 ⇒ **不拦人**（「不知道」不是「有人在跑」；同「读不出不判旧」那条口径）。
+        const running = await countRunningSubagents(ctx, sessionId)
+        if (running !== null && running > 0) {
+          appendEvent(project, 'textbook/hint', {
+            text: `⛔ 现在还不能重做：还有 ${running} 个小助手在写这一段的产物，这一刻归档会把它们正在写的东西一起搬走。等它们回来再点「让 AI 重做」；想马上重做，先在对话里让 AI 停掉它们。`,
+          })
+          return reject(409, `还有 ${running} 个小助手在写这一段的产物，现在归档会把它们正在写的东西一起搬走——等它们回来再重做。`)
+        }
         // 用户意见（可选）：理由点选 + 一句话，随重做交办带给 AI（重做唯一的改进方向）。
         const reasons = Array.isArray(body.reasons)
           ? body.reasons.filter((r) => typeof r === 'string' && r.trim() !== '').slice(0, 5)
           : []
-        const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : ''
+        const note = textField(body.note, GATE_NOTE_MAX)
         const feedback = [...reasons, note].filter((t) => t !== '')
         const archive = join(workDir(project), '_旧版产物')
         mkdirSync(archive, { recursive: true })
         const stamp = Date.now().toString(36)
         // 票 pipeline-wiring-gaps/08：归档不再「尽力」——逐件记成败，**任一件没搬走就当场回错误**。
-        // 旧件留在原位时，下一轮 `runPhase2`（engine.js:1518「产物已存在 → 等人确认」）见到
+        // 旧件留在原位时，下一轮 `runPhase2`（engine.js:1583「产物已存在 → 等人确认」）见到
         // `explore.md` 还在就直接短路返回，于是用户点完「让 AI 重做」看到的还是上一轮那份
         // 一模一样的报告，他写的意见又会在点「满意」时被删掉——那一次重做从来没发生过，
         // 而整条路径全程静默。`mkdirSync` 在 try 之外（它抛就是 500，本来就响）。
         const archiveMisses = []
-        for (const name of EXPLORE_REDO_ARTIFACTS) {
-          const target = workFile(project, name)
+        // 票 03：清单是**算出来的**（固定两件 + 盘上现存的精读分片件／细目件），不是写死的那两个字面量。
+        // 票 11：取 entries 而不是 names——细目在 `工作区/细目/` 子目录里，
+        // `workFile(project, name)` 对它恒 miss（那会拼成 `工作区/<name>`），所以来处要一起带上。
+        const redoEntries = exploreRedoArtifactEntries(workDir(project), archive)
+        // 源这一端按**书夹相对路径**拼（`工作区/…`），不拿扫描目录的绝对路径兜着——
+        // 「这一件长在书夹里」由 `projectDir` 那一层（PROJECT_ID_RE 限定）兑现。
+        const bookRoot = projectDir(project)
+        for (const { name, rel } of redoEntries) {
+          const target = join(bookRoot, ...rel.split('/'))
           if (!existsSync(target)) continue
           try {
             renameSync(target, join(archive, `${name}.${stamp}`))
@@ -198,13 +339,9 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
               + (feedback.length > 0 ? `你的意见（${feedback.join('；')}）已经记在这条账里，不会丢。` : '')
               + '请把正在占用这些文件的程序关掉（编辑器、同步盘、杀毒软件都可能占着）再点一次。',
           })
-          sendJson(res, 409, {
-            ok: false,
-            error: `旧报告没能归档（${archiveMisses.join('、')}），这次「让 AI 重做」没有生效：旧报告还留在原位，直接重做会拿它当新结果。请关掉占用这些文件的程序后重试。`,
-          })
-          return
+          return reject(409, `旧报告没能归档（${archiveMisses.join('、')}），这次「让 AI 重做」没有生效：旧报告还留在原位，直接重做会拿它当新结果。请关掉占用这些文件的程序后重试。`)
         }
-        const trimmed = trimExploreArchive(archive, EXPLORE_REDO_ARTIFACTS, ARCHIVE_KEEP)
+        const trimmed = trimExploreArchive(archive, redoEntries.map((entry) => entry.name), ARCHIVE_KEEP)
         let redoCount = 0
         updateMeta(project, (meta) => {
           meta.status = 'running'
@@ -235,10 +372,8 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
             text: `探查已经来回 ${redoCount} 次了。如果一直不满意，可以在对话里调整目标或换一种思路，或者用「定点修改」回到源探查重新来。`,
           })
         }
-        handoff(ctx, project, 'explore', null, '驳回探查结果、重做之前')
-        // demo 无主 AI 可唤醒：仅 demo 补 kick 驱动重做（真实模式靠主 AI，加了反而会提前触发 runPhase 重推导）。
-        if (exMeta.demo === true) void kick(ctx, project)
-        sendJson(res, 200, { ok: true, project, approved: false })
+        handoffAndDrive(ctx, project, 'explore', null, '驳回探查结果、重做之前')
+        return accept({ project, approved: false })
       }
       return
     }
@@ -246,10 +381,22 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
       assertSessionOwned(project, sessionId)
       const meta = readMeta(project)
       if (meta === null || meta.status !== 'awaiting-outline') {
-        sendJson(res, 409, { ok: false, error: '当前没有等待确认的章节安排' })
-        return
+        return reject(409, '当前没有等待确认的章节安排')
       }
-      const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : ''
+      if (body.approved === true) {
+        // ── 票 `premature-announce/01`：放行那一跳过一遍**这一段自己的**就绪判据 ──────────────
+        // 与探查那两跳同一条纪律：不拿「状态已经推到 awaiting-outline」当「这一段真做完了」。
+        // ⚠️ 这一份判据比探查那份窄（它只断盘上那两件）——窄处写在 `engine.outlineArtifactProblems`
+        //    的注释里，别在这里另立一份。
+        const notReady = outlineArtifactProblems(project, meta)
+        if (notReady.length > 0) {
+          appendEvent(project, 'textbook/hint', {
+            text: `⛔ 还不能确认章节安排：${notReady.join('；')}。`,
+          })
+          return reject(409, `还不能确认章节安排：${notReady.join('；')}`)
+        }
+      }
+      const note = textField(body.note, GATE_NOTE_MAX)
       const pick = Number(body.goldChapter)
       // 改选最佳范例章也要改在改法里（当场新读那份状态）：下面两笔事件之间原先夹着一次整份写回，
       // 会把账高带回读状态那一刻的旧值（票 02）。
@@ -296,21 +443,16 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
             ? `↩️ 章节安排已驳回，你的意见（${note}）已带给 AI，它正在重新安排。`
             : '↩️ 章节安排已驳回（没写具体意见），AI 会重新安排；想给方向随时在对话里说。',
         })
-        handoff(ctx, project, 'outline')
-        // demo 无主 AI 可唤醒：仅 demo 补 kick 驱动重排（真实模式靠主 AI——加了会在关卡未通过的书上
-        // 提前触发 runPhase3 重新 handoff 到 gate，覆盖 pendingStage）。
-        if (meta.demo === true) void kick(ctx, project)
+        handoffAndDrive(ctx, project, 'outline')
       }
-      sendJson(res, 200, { ok: true, project, approved: body.approved === true })
-      return
+      return accept({ project, approved: body.approved === true })
     }
     case 'chapters-review-confirm': {
       // 全章过目确认：true → 开始合并；false → 记账 chaptersReviewed=false（可继续改意见，不会并发合并）。
       assertSessionOwned(project, sessionId)
       const meta = readMeta(project)
       if (meta === null || meta.status !== 'awaiting-chapters-review') {
-        sendJson(res, 409, { ok: false, error: '当前没有等你过目的章节' })
-        return
+        return reject(409, '当前没有等你过目的章节')
       }
       // 票 10 的服务端收口（死条件收口 · 票 14 的连带）：**确认过目时重验全书 chapterDone**。
       // 原先这里只看 status，于是「用户点翻案（review-revoke 把意见写回 pending）」之后书仍停在
@@ -324,9 +466,12 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
         if (misses.length > 0) {
           const why = misses.slice(0, 3).map((row) => {
             const title = row.chapter?.title ?? ''
+            // 正文那一项取 `chapterRel`（书夹相对路径，票 depth-review-2026-10/05）；
+            // `audit-NN.md` 是 audit 族的同款契约、本票不收，仍用本地补零。
+            // 两者同属一句人话、同一族词，所以正文用相对路径形（前面带 `工作区/`）。
             const pad = String(row.n).padStart(2, '0')
             const what = row.miss.reason === 'artifact'
-              ? `缺产物（work/chapter-${pad}.md / work/audit-${pad}.md）`
+              ? `缺产物（${chapterRel(row.n)} / 工作区/audit-${pad}.md）`
               : row.miss.reason === 'stale'
                 ? '检查记录比正文旧（正文改过之后没重新审计，那份「审过」是旧稿的）'
                 : row.miss.reason === 'review'
@@ -334,16 +479,12 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
                   : '没有机器记下的交工通过（还没按章交工）'
             return `第${row.n}章${title === '' ? '' : `《${title}》`}：${what}`
           })
-          sendJson(res, 409, {
-            ok: false,
-            error: `还没到能交工的时候：${why.join('；')}。逐章处置完（改稿 → 重新审计 → 交工点名）机器才会放行过目。`,
-          })
-          return
+          return reject(409, `还没到能交工的时候：${why.join('；')}。逐章处置完（改稿 → 重新审计 → 交工点名）机器才会放行过目。`)
         }
       }
       // 过目记账与「开始合并」的置态一次收进改法（原先分两次整份写回，后一次还落在
       // 「记一笔」之后——账高会被带回旧值，票 02）。
-      const after = updateMeta(project, (state) => {
+      updateMeta(project, (state) => {
         state.chaptersReviewed = body.approved === true
         if (body.approved === true) {
           state.status = 'running'
@@ -353,22 +494,48 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
       appendEvent(project, 'textbook/chapters-review', { approved: body.approved === true })
       if (body.approved === true) {
         appendEvent(project, 'textbook/hint', { text: '✅ 全章过目通过，开始合并成书。' })
-        handoff(ctx, project, 'merge')
-        // demo 无主 AI 可唤醒：仅 demo 补 kick 让状态机自驱动合并（真实模式靠主 AI 交工推进）。
-        if (after.demo === true) void kick(ctx, project)
+        handoffAndDrive(ctx, project, 'merge')
       }
-      sendJson(res, 200, { ok: true, project })
-      return
+      return accept({ project })
     }
     case 'final-approve': {
       // 终检结果认可（2026-08-26 用户拍板）：approved=true → 交付；false + note → 交办终检修订（原地循环）。
       assertSessionOwned(project, sessionId)
       const meta = readMeta(project)
       if (meta === null || meta.status !== 'awaiting-final-approval') {
-        sendJson(res, 409, { ok: false, error: '当前没有等你认可的最后检查结果' })
-        return
+        return reject(409, '当前没有等你认可的最后检查结果')
       }
       if (body.approved === true) {
+        // ── 票 `premature-announce/01`：交付**撤不回**，所以放行那一刻**当场重算**一次硬检查 ──────
+        // 原先这一支只判 `meta.status === 'awaiting-final-approval'`，一条产物、一项检查都不验；
+        // 而那个状态另有别的写入点（演示支就在不判检查结果的情况下置它）。
+        // ⚠️ **演示书是这条闸的分叉**（登记在 `src/demo-exemptions.js` 的 `final-approve-hard-checks`）：
+        //    演示通道的 `awaiting-final-approval` 由 `engine.js` 的演示支置下、**有意不判检查结果**
+        //    （它跑的是内置回放夹具，硬检查里那几项在它身上没有来源）——这是登记过的结构性到不了，
+        //    不是本闸放水；真书一律当场重算。
+        // ⚠️ 这里**不列**失败项的名字：检查名的界面译法住在前端（`src/ui/view-rules.js` 的 `CHECK_UI`），
+        //    服务端不 import 前端模块；账上那条 hint 只说件数，逐项结论仍由工作台那一屏呈现。
+        // ⚠️ **重跑本身会抛**（实测：盘上什么都没有时 `runQualityChecks` 直接 ENOENT）——那也算「不能交付」，
+        //    所以这里连异常一起收下：**验不了就不放行**（⛔ 不许因为「检查跑不起来」把书放过去）。
+        if (meta?.demo !== true) {
+          let failed = null
+          try {
+            failed = runQualityChecks(project).filter((check) => check.ok !== true)
+          } catch (error) {
+            const why = error instanceof Error ? error.message : String(error)
+            ctx?.logger?.warn?.(`textbook: 交付放行时重跑最后检查出错（按「不能交付」处置）: ${why}`)
+            appendEvent(project, 'textbook/hint', {
+              text: `⛔ 还不能交付：机器当场重跑最后检查时出错（${why}）——验不了就不放行。`,
+            })
+            return reject(409, `还不能交付：机器当场重跑最后检查时出错（${why}）——验不了就不放行，先修好再认可。`)
+          }
+          if (failed.length > 0) {
+            appendEvent(project, 'textbook/hint', {
+              text: `⛔ 还不能交付：机器当场又核了一遍最后检查，有 ${failed.length} 项没过（工作台那一屏逐项看得到是哪几项）。`,
+            })
+            return reject(409, `还不能交付：机器当场又核了一遍最后检查，有 ${failed.length} 项没过`)
+          }
+        }
         const delivered = updateMeta(project, (state) => {
           state.status = 'delivered'
           state.finalApprovedAt = Date.now()
@@ -378,13 +545,11 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
           checks: delivered.finalChecks ?? [],
           note: `交付完成！点「下载《${delivered.name ?? ''}》.md」保存成品。`,
         })
-        sendJson(res, 200, { ok: true, project, delivered: true })
-        return
+        return accept({ project, delivered: true })
       }
-      const note = typeof body.note === 'string' ? body.note.trim().slice(0, 500) : ''
+      const note = textField(body.note, GATE_NOTE_MAX)
       if (note === '') {
-        sendJson(res, 400, { ok: false, error: '不满意最后检查结果必须写一句改进意见（AI 照着改整本后重新做最后检查）' })
-        return
+        return reject(400, '不满意最后检查结果必须写一句改进意见（AI 照着改整本后重新做最后检查）')
       }
       // 原地循环：交办终检修订，AI 按意见改整本 → 重新硬检查 → 再给用户认可。
       updateMeta(project, (state) => {
@@ -394,19 +559,15 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
       })
       appendEvent(project, 'textbook/final-approve', { approved: false, note })
       appendEvent(project, 'textbook/hint', { text: '🔁 最后检查未获认可，AI 将按你的意见修整本后重新做最后检查。' })
-      handoff(ctx, project, 'final')
-      // demo 无主 AI 可唤醒：仅 demo 补 kick 驱动重新终检（真实模式靠主 AI）。
-      if (meta.demo === true) void kick(ctx, project)
-      sendJson(res, 200, { ok: true, project, redo: true })
-      return
+      handoffAndDrive(ctx, project, 'final')
+      return accept({ project, redo: true })
     }
     case 'rollback': {
       assertSessionOwned(project, sessionId)
       const { snapshot } = body
       const seq = Number(snapshot)
       if (!Number.isSafeInteger(seq) || seq < 0) {
-        sendJson(res, 400, { ok: false, error: 'rollback 需要合法的 snapshot 序号' })
-        return
+        return reject(400, 'rollback 需要合法的 snapshot 序号')
       }
       writeSnapshot(project, `回退到快照 ${seq} 之前`)
       const event = restoreSnapshot(project, seq)
@@ -419,8 +580,7 @@ export async function actGates(ctx, _req, res, action, sessionId, project, body)
         meta.status = 'running'
       })
       void kick(ctx, project)
-      sendJson(res, 200, { ok: true, project, event })
-      return
+      return accept({ project, event })
     }
   }
-}
+})

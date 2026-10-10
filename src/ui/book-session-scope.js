@@ -45,6 +45,9 @@
 import { createElement, Fragment, useEffect, useMemo, useRef, useState } from "react";
 // 自动跟随的判据（纯函数，规则域的公开导出；`client-entry.js` 用的是同一份）。
 import { shouldForceBackToNow } from "./rules.js";
+// 「从账本倒着找最近一条某类型的事件」那份模板（票 `depth-review-2026-10/08`：倒找的实现只此
+// 一份，跨域协作走 public export）。⚠️ 这里只共用**判据**，数据源仍是自己这份 `events` prop。
+import { lastEventOfType } from "./view-rules.js";
 
 // 空值必须是**模块级同一个引用**：每帧新建空数组会让下面两条 effect 白跑。
 const NO_SUGGESTIONS = Object.freeze([]);
@@ -161,7 +164,7 @@ export function BookSessionScope({ children, uiRef = null, meta = null, gate = n
 	// 新 = seq 大于开始浏览那一刻记住的进度序号（progressSeqRef），避免一进历史就把旧进展翻出来。
 	useEffect(() => {
 		if (browsing === null) return undefined;
-		const lastProgress = [...events].reverse().find((e) => e.type === "textbook/progress");
+		const lastProgress = lastEventOfType(events, "textbook/progress");
 		if (lastProgress !== undefined && lastProgress.seq > progressSeqRef.current) {
 			progressSeqRef.current = lastProgress.seq;
 			setProgressBanner(true);

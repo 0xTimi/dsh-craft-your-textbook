@@ -5,11 +5,17 @@
  * 归一成 appendEvent 的 data 片段。路径与阶段页 / `/textbook/work` 共用书夹相对形状。
  */
 
+// 章正文路径的构造只此一份（票 `depth-review-2026-10/05`）：住在 `src/domain-rules.js`，
+// 与识别侧（`NUMBERED_CHAPTER_FILE_RE` / `productOpenMode`）同居，两端不再各拼一份。
+// ⚠️ 要**基名**（`chapter-NN.md`）的调用点取 `chapterName`，不是这个——给它们塞相对路径会拼出
+// `工作区/工作区/chapter-01.md`，真的把文件写坏或读坏。
+import { chapterRel } from '../domain-rules.js'
+
 /** 章正文路径（两位序号是产物契约）。 */
 export function artifactDataForChapter(chapter) {
   const n = Number(chapter)
   if (!Number.isSafeInteger(n) || n < 1) return {}
-  return { path: `work/chapter-${String(n).padStart(2, '0')}.md`, chapter: n }
+  return { path: chapterRel(n), chapter: n }
 }
 
 /** 拍板提案路径；v1 与修订件 vM 同形。 */
@@ -17,7 +23,7 @@ export function artifactDataForGate(gate, version) {
   const g = String(gate ?? '').trim()
   const v = Number(version)
   if (!/^[1-9]\d*$/.test(g) || !Number.isSafeInteger(v) || v < 1) return {}
-  return { path: `提案/关卡${g}-v${v}.md` }
+  return { path: `工作区/方案/关卡${g}-v${v}.md` }
 }
 
 /**
@@ -27,16 +33,16 @@ export function artifactDataForGate(gate, version) {
 export function artifactDataForStage(stage, gate, goldChapter = 1) {
   switch (String(stage ?? '')) {
     case 'explore':
-      return { path: 'work/explore.md' }
+      return { path: '工作区/explore.md' }
     case 'gate':
       return artifactDataForGate(gate, 1)
     case 'outline':
-      return { path: 'work/outline.md' }
+      return { path: '工作区/outline.md' }
     case 'gold':
       return artifactDataForChapter(goldChapter)
     case 'merge':
     case 'final':
-      return { path: 'work/book.md' }
+      return { path: '工作区/book.md' }
     default:
       return {}
   }
@@ -48,10 +54,10 @@ export function artifactDataForStage(stage, gate, goldChapter = 1) {
  */
 export function artifactDataForLabel(label, goldChapter = 1) {
   const text = String(label ?? '')
-  if (text.startsWith('源探查')) return { path: 'work/explore.md' }
-  if (text.includes('章节骨架') || text.includes('章节安排')) return { path: 'work/outline.md' }
+  if (text.startsWith('源探查')) return { path: '工作区/explore.md' }
+  if (text.includes('章节骨架') || text.includes('章节安排')) return { path: '工作区/outline.md' }
   if (text.includes('最佳范例章')) return artifactDataForChapter(goldChapter)
-  if (text.startsWith('合并成书') || text.startsWith('最后检查')) return { path: 'work/book.md' }
+  if (text.startsWith('合并成书') || text.startsWith('最后检查')) return { path: '工作区/book.md' }
 
   const write = /写第\s*(\d+)\s*章/.exec(text)
   if (write !== null) return artifactDataForChapter(Number(write[1]))

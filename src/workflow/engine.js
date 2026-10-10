@@ -12,216 +12,46 @@
  * demo 模式（演示书）与真实并轨同一套 runPhaseX 路由器（无独立 auto 通道），
  * 唯一 seam = 内容来源：真实由主 AI 完成 / demo 由内置回放（generateContent）完成；
  * demo 与真实共用全部 6 个确认闸门（源探查/关卡/骨架/范例章/全章过目/终检认可）。
+ *
+ * ── 内部子模块（票 `depth-review-2026-10/10`，**拆分进行中**） ──────────────────
+ * 本文件正按责任簇落成 `src/workflow/engine/*.js`，自己逐步瘦成只做再导出的 facade；
+ * 消费者 import 一行不改（10 个生产消费者 163 个具名绑定全部是 `import { … } from` 具名导入，
+ * 纯再导出对它们零影响）。已搬走的叶子都在依赖图最底层、导出面窄：
+ *   · `engine/labels.js` 领域标签 / 豁免声明表 / 状态条提示文案（零内部依赖）
+ *   · `engine/paths.js`  DSH home、项目根、注册表、每本书的账本与状态与过程记录路径
+ *   · `engine/store.js`  状态缓存与落盘 ＋ ADR-0016 决策 2 那四个写入口
+ * 后面还有 13 簇待搬（进程日志 / 播报 / 事件账本 / 快照 / 质量门 / 六阶段状态机 / 交办说明 …）。
+ * 依赖图无环，按叶子先行逐簇切；**每一步只搬不撤**——撤那 16 个零生产引用导出是另一步、另开票。
  */
 
-import { goldChapterNo, PHASES, EVENT_META, EVENT_TYPES, guessRoleFromName, gateHuman, stageLabelHuman, segmentHuman, CHAPTER_PROGRESS_REQUIREMENT } from '../domain-rules.js'
-import { homedir } from 'node:os'
+// 合并自双方（票 `context-budget/02` 第 1 层带进 manifestRowsFor/SPEC_ROW_BY_PATH/DISCLOSE_MODES/
+// BOOK_PRODUCT_FAMILIES，票 `context-budget/12` 带进 finalAuditSummaryRel）——**并集**，两边都不删。
+import { EVENT_META, EVENT_TYPES, guessRoleFromName, gateHuman, stageLabelHuman, segmentHuman, CHAPTER_PROGRESS_REQUIREMENT, convertedState, chapterRel, chapterName, chapterShardRel, okMaterialShards, okMaterialNumbers, readingRel, readingName, DETAIL_DIR_REL, knowledgeShardRel, knowledgeShardName, FINAL_AUDIT_SCOPES, finalAuditReportRel, finalAuditSummaryRel, auditCoversProduct, stageStateOf, pairedAuditRels, manifestRowsFor, SPEC_ROW_BY_PATH, DISCLOSE_MODES, BOOK_PRODUCT_FAMILIES, PROPOSAL_DIR_REL, exploreDepthTier, CHAPTER_SUGGESTION_MIN, CHAPTER_SUGGESTION_MAX, ROLES } from '../domain-rules.js'
 import { join, resolve, dirname, basename } from 'node:path'
 import { mkdirSync, readFileSync, existsSync, writeFileSync, statSync, appendFileSync, readdirSync, copyFileSync, rmSync, unlinkSync, rmdirSync, renameSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { isWithin } from '../path-guard.js'
-import { convertPdfBatch, readSettings, writeSettings } from '../mineru-lib.js'
-import { generateContent, resourceText } from '../content-lib.js'
+import { convertPdfBatch, readSettings, writeSettings, stripKnownExtension } from '../mineru-lib.js'
+import { generateContent, resourceText, RESOURCES_DIR } from '../content-lib.js'
+import { CROSS_AUDIT_TEMPLATE_REL, CROSS_AUDIT_CONSTRAINTS, CROSS_AUDIT_REPORT_REL } from './cross-audit.js'
+import { refreshFinalAuditSummary } from './final-audit-summary.js'
+// 票 `walkthrough-2026-10/02`：章正文由机器从分片拼——深改归档名单要认得**这一章盘上真有的分片**
+// （只归档正文、把分片留在原地，重做那一路写的若是另一片，旧内容会被机器拼回正文里）。
+import { chapterShardRelsOnDisk } from './chapter-assembly.js'
+// 票 `premature-announce/01`：源探查那一套「盘上产物齐没齐」的判定只有一份，本文件是它的家
+// （置态、放行、交工验货三处共用；模块只 import domain-rules，不成环）。
+import { shardShapeProblems } from './knowledge-map-assembly.js'
 import { artifactDataForStage, artifactDataForLabel, artifactDataForChapter } from './artifact-fields.js'
 import { createHash } from 'node:crypto'
 
-
-const PROJECT_ID_RE = /^[a-z0-9-]{1,64}$/
-
-
-/** 校验项目属于某个会话；不属于则抛错（严格隔离）。 */
-function assertSessionOwned(projectId, sessionId) {
-  const meta = readMeta(projectId)
-  if (meta === null) throw new Error('项目不存在')
-  if (meta.session !== sessionId) {
-    throw new Error('该项目不属于当前会话')
-  }
-  return meta
-}
-
-
-/** 范例章章号（1 基；旧账本/缺省=1）——共享领域规则的本地别名（历史调用点沿用 goldN）。 */
-const goldN = goldChapterNo
-
-/** F39（2026-08-20 走查）：段落级抽查意见的人话说明（给 AI 交办修订 / 事件落账用）。
- *  整章意见（review 动作）带 comment；段落意见（gold-opinion 带 chapter）带 kind/wish/target。 */
-function paragraphReviewText(r) {
-  if (typeof r.comment === 'string' && r.comment !== '') return r.comment
-  const where = r.target === null ? '笼统' : (r.target.hint || `第${r.target.para}段`)
-  const kindText = r.kind === 'dislike' ? '不喜欢' : r.kind === 'drop' ? '不需要' : '要改成'
-  return `段落意见（${where}）${kindText}${r.wish ? `：${r.wish}` : ''}`
-}
-
-/** 可豁免项（内部枚举 -> 大白话标签与风险提示；界面不裸露枚举）。 */
-const WAIVER_ITEMS = {
-  'gate-skip': { label: '跳过「请你拍板」的设计环节', risk: '设计没经你确认就定稿，方向错了要返工' },
-  'outline-skip': { label: '跳过「章节安排」确认', risk: '章节切分没经你确认，可能与预期不符' },
-  'gold-skip': { label: '跳过「最佳范例章」确认', risk: '全书风格基准没经你认可' },
-  'audit-skip': { label: '不要求每章都有独立审查', risk: '章节质量问题可能漏网' },
-  'scaffold-keep': { label: '保留 AI 的笔记不删', risk: '成品里会留下工作痕迹' },
-  // 票 15⑤：`route-override` 已删除声明。判别规则（票 06 的 Answer）：语义是「改变一个已定状态并牵动
-  // 下游产物」→ 全仓没有该状态变更的迁移语义 ＝ 未实现的新能力，只能删声明（要做得另开 effort）。
-  // 此前它只写在声明表与 AI 可见的枚举描述里、全仓没有 waived() 读取点，AI 可能调一个没效果的豁免。
-  'progress-skip': { label: '跳过「进度账本」检查', risk: 'AI 的工作过程没有留账，中途换人/重做时缺参照' },
-  'other': { label: '其他（自己写一句）', risk: '以你的说明为准' },
-}
-
-
-// 账本事件类型清单已收编至 ./domain-rules.js（单一事实来源，appendEvent 校验共用）。
-// 六阶段标签派生自共享 PHASES（canonical 全称见 domain-rules.js，勿在此手写）。
-const PHASE_LABELS = Object.fromEntries(PHASES.map((p) => [p.n, p.label]))
-
-const GATE_LABELS = {
-  '1': '学习目标与难点', '2': '教学方法与板块', '3': '全书架构与章节',
-}
-
-
-/** 交办阶段的人话标签（gate 单独带关卡号）。 */
-const STAGE_LABELS = {
-  explore: '源探查', outline: '章节骨架', gold: '范例章', chapters: '铺章', merge: '合并成书', final: '最后检查',
-}
-
-function stageLabel(stage, gate) {
-  if (stage === 'gate') return `设计提案·第 ${gate ?? '?'} 关`
-  return STAGE_LABELS[stage] ?? String(stage ?? '')
-}
-
-
-/**
- * 用户读到的状态条/提示文案（**界面字**，不是机器身份词——账本 label、文件名、事件 type
- * 才是不动的那一类）。
- * ⚠️ 这两句曾在多处 ensureStatus / hint 里逐字重复，2026-09-20 走查抓到"只改了一半"：
- * 「终检完成了」的孪生件改名成「最后检查完成了」，这份没跟上。抽成常量，一处改、处处改。
- */
-export const EXPLORE_DONE_HINT =
-  '🔍 材料读完了，请在工作台查看：满意点「✅ 满意，继续设计」，不满意点「🔁 让 AI 重做」。'
-export const FINAL_CHECK_DONE_HINT =
-  '🛡️ 最后检查完成了：AI 检查报告与机器检查结果已在工作台。这是你对整本书的最后一次把关——满意点「✅ 认可，交付」，要改的写意见（AI 会按意见修整本后重新做最后检查）。'
-
-/**
- * 最后检查交办说明里的「别写内部词」清单（**元语言例外/豁免一**：指称禁词时只能用禁词）。
- * ⚠️ 这一段**故意保留内部词**（旧词→新词两列照抄），改它等于把给 AI 的指令改成自相矛盾。
- * 因为它是唯一一段"合法含禁词"的 brief 文本，用词不变量断言按**名字**引这个常量把它从被扫
- * 文本里剔掉（见 test-wording-invariants.mjs），而不是"整段跳过"糊过去。
- */
-export const REPORT_WORDING_RULE =
-  '⚠️ 这份报告用户会逐字读：不写"审计文件/进度账本/禁用词/契约项/回源核对/U+FFFD/质量门/终检"这类内部词，改说"检查记录/工作记录/不该用的词/写作规范/标注了出处/乱码/最后检查"。'
-
-
-function dshHome() {
-  const fromEnv = process.env.DSH_HOME
-  if (fromEnv !== undefined && fromEnv.trim() !== '') return fromEnv
-  return join(homedir(), '.dsh')
-}
-
-
-function projectsRoot() {
-  const root = join(dshHome(), 'textbook', 'projects')
-  mkdirSync(root, { recursive: true })
-  return root
-}
-
-
-// ── 书夹位置注册表 ───────────────────────────────────────────────────────────
-// 新书默认建在"会话的工作区目录"里、文件夹名用书名；注册表记录每个项目
-// 当前的实际目录（旧书不动，仍记在默认目录；回收站里的书也记录新位置）。
-
-function registryPath() { return join(dshHome(), 'textbook', 'registry.json') }
-
-
-function readRegistry() {
-  const path = registryPath()
-  if (!existsSync(path)) return {}
-  try {
-    const raw = JSON.parse(readFileSync(path, 'utf8'))
-    return raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
-  } catch { return {} }
-}
-
-
-function writeRegistry(registry) {
-  writeFileSync(registryPath(), JSON.stringify(registry, null, 2) + '\n')
-}
-
-
-function registerProject(projectId, dir) {
-  const registry = readRegistry()
-  registry[projectId] = { dir }
-  writeRegistry(registry)
-}
-
-
-/** 已登记项目的实际目录（没有登记返回 null）。 */
-function registeredDir(projectId) {
-  const entry = readRegistry()[projectId]
-  if (entry !== undefined && typeof entry.dir === 'string' && entry.dir !== '') return entry.dir
-  return null
-}
-
-
-/** 会话的工作区目录（会话头里的 cwd；拿不到返回 null）。 */
-function sessionWorkspace(ctx, sessionId) {
-  try {
-    const session = ctx.get('sessions')?.get?.(sessionId)
-    const cwd = session?.header?.cwd
-    if (typeof cwd === 'string' && cwd.trim() !== '' && existsSync(cwd) && statSync(cwd).isDirectory()) {
-      return cwd
-    }
-  } catch { /* 走下一通道 */ }
-  try {
-    const registrySvc = ctx.get('workspaceRegistry')
-    const list = typeof registrySvc?.list === 'function' ? registrySvc.list() : []
-    for (const ws of list) {
-      const members = ws?.sessionIds
-      if (!Array.isArray(members)) continue
-      const hit = members.find((m) => (m?.id ?? m) === sessionId)
-      if (hit !== undefined && typeof hit?.cwd === 'string' && existsSync(hit.cwd) && statSync(hit.cwd).isDirectory()) {
-        return hit.cwd
-      }
-    }
-  } catch { /* 保持 null */ }
-  return null
-}
-
-
-/** 把书名整理成合法的文件夹名。 */
-function sanitizeFolderName(name) {
-  let out = String(name ?? '')
-    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/[. ]+$/g, '')
-  if (out === '' || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(out)) out = 'book'
-  if (out.length > 60) out = out.slice(0, 60).replace(/[. ]+$/g, '')
-  return out
-}
-
-
-/** 在工作区里找一个没被占用的书夹名（重名自动加 -2、-3…）。 */
-function freeBookDir(workspace, baseName) {
-  let candidate = baseName
-  let n = 2
-  while (existsSync(join(workspace, candidate))) {
-    candidate = `${baseName}-${n}`
-    n += 1
-  }
-  return join(workspace, candidate)
-}
-
-
-function projectDir(projectId) {
-  if (!PROJECT_ID_RE.test(projectId)) throw new Error(`invalid project id: ${JSON.stringify(projectId)}`)
-  const registered = registeredDir(projectId)
-  if (registered !== null) return registered
-  return join(projectsRoot(), projectId)
-}
-
-
-function timelinePath(projectId) { return join(projectDir(projectId), 'timeline.jsonl') }
-
-function metaPath(projectId) { return join(projectDir(projectId), 'project.json') }
-
-function processLogPath(projectId) { return join(projectDir(projectId), '过程记录.md') }
+// ── 内部子模块：三簇叶子从本文件搬出去，而下面的 export 块把它们的导出名原样再导出 ──
+// ⇒ 10 个生产消费者的 163 个 import 绑定与全仓 11 处源码锚都照旧成立，一处都不用改。
+import { PROJECT_ID_RE, goldN, paragraphReviewText, WAIVER_ITEMS, PHASE_LABELS, GATE_LABELS, STAGE_LABELS, stageLabel, EXPLORE_DONE_HINT, FINAL_CHECK_DONE_HINT, REPORT_WORDING_RULE } from './engine/labels.js'
+import { dshHome, projectsRoot, registryPath, readRegistry, writeRegistry, registerProject, sessionWorkspace, sanitizeFolderName, freeBookDir, projectDir, timelinePath, metaPath, processLogPath, workDir, detailDir, reportDir, proposalDir, processDir, archiveDir, materialDir, convertedDir, bookRelOnDisk, legacyDirConflicts } from './engine/paths.js'
+// ⚠️ `writeMeta` **只进不出**：store.js 导出它（appendEvent 至今仍住在本文件，是账高与「最后动静
+//   时刻」的唯一写入者，必须够得着它），但下面那个 export 块**不列**它——ADR-0016 决策 2 的两半。
+//   防回潮断言（`key in engine`）见 test-ledger-seq-integrity.mjs。
+import { assertSessionOwned, readMeta, flushMeta, updateMeta, createMeta, rollbackLedger, writeMeta } from './engine/store.js'
 
 
 /** 阶段事件的人读阶段名：`data.label` 是 PHASES 的 canonical 全称（**机器身份词**，账本里就这么
@@ -230,6 +60,26 @@ function processLogPath(projectId) { return join(projectDir(projectId), '过程�
 function phaseEventHuman(data) {
   const raw = data.label ?? PHASE_LABELS[data.phase] ?? data.phase ?? ''
   return stageLabelHuman(raw)
+}
+
+
+/** 暂停那一笔的附注：这次暂停**停掉了几条编排脚本**（票 `chapter-audit-orchestration/04`）。
+ *
+ *  措辞纪律：说词表登记的「编排脚本」，一个字都不许出现机器词「job」——「job」不在
+ *  `test-wording-fixtures.mjs` 的 `BANNED_WORDS` 里（**机器抓不到**），靠人守；
+ *  「子代理 / subagent」同样不许（`CONTEXT.md`「小助手」的 `_Avoid_`，机器也抓不到）。
+ *
+ *  为什么只有 `jobsStopped > 0` 才开口：`0` 与 `null` 各有各的实话（「确实没有在跑的」与
+ *  「这一个数读不出来」），把它们翻成一句「停了 0 条」既没用、又会把「读不出来」洗成「没有」——
+ *  与 `countRunningSubagents` 不肯把缺席折成 0 是同一条纪律。
+ *
+ *  取值域：`jobsStopped` 是正整数或 `null`（`stopRunningWorkflowJobs` 的返回值），
+ *  非正整数/非整数一律当作「没有这件事实」不开口。
+ */
+function stoppedOrchestrationNote(data) {
+  const stopped = data?.jobsStopped
+  if (!Number.isSafeInteger(stopped) || stopped <= 0) return ''
+  return `；这本书正在跑的编排脚本也停了（${stopped} 条）`
 }
 
 
@@ -242,7 +92,7 @@ function logEntryText(event) {
     case 'textbook/agent-start': return `🤖 AI 开始：${stageLabelHuman(data.label)}`
     case 'textbook/agent-end': return `🤖 AI 完成：${stageLabelHuman(data.label)}`
     case 'textbook/gate-proposal':
-      // ⚠️ 不印「提案/关卡N-vX.md」：文件名与产物路径是**机器身份词**（判定线不改，锚定它的正则
+      // ⚠️ 不印「工作区/方案/关卡N-vX.md」：文件名与产物路径是**机器身份词**（判定线不改，锚定它的正则
       // 见 domain-rules 的提案白名单），印到人读文本里就把「关卡」带出来了。指个真实去处即可。
       return `📋 ${gateHuman(data.gate)} · 方案 v${data.version}：${data.title ?? ''}\n\n${data.summary ?? ''}\n\n（完整方案在书夹的「提案」文件夹里）`
     case 'textbook/gate-decision':
@@ -272,7 +122,7 @@ function logEntryText(event) {
     case 'textbook/intervention-done': return `📮 留言已处理：${data.text ?? ''}`
     case 'textbook/waiver': return `赦 ✅ 已获用户豁免「${WAIVER_ITEMS[data.item]?.label ?? data.item}」：${data.userNote ?? ''}`
     case 'textbook/waiver-revoke': return `赦 ↩️ 豁免已收回「${WAIVER_ITEMS[data.item]?.label ?? data.item}」，机器恢复拦截`
-    case 'textbook/pause': return `⏸ 已暂停（${data.reason ?? '用户在造书工作台点击暂停'}）`
+    case 'textbook/pause': return `⏸ 已暂停（${data.reason ?? '用户在造书工作台点击暂停'}）${stoppedOrchestrationNote(data)}`
     case 'textbook/resume': return `▶ 已继续`
     case 'textbook/outline-decision':
       return data.approved === true
@@ -347,123 +197,41 @@ function styleSpecChangeWhen(data) {
 }
 
 
-/** project.json 内存缓存 + 批量落盘（P2-8，pipeline-perf）
- *  - readMeta 命中缓存返回深拷贝（语义与旧实现一致：每次读到独立对象），避免每事件一次整文件读；
- *  - writeMeta 只更新内存 + 标记脏，setImmediate 收口批量写盘；
- *  - flushMeta 在 setImmediate 与每次 HTTP 响应边界（sendJson）同步落盘并清缓存，
- *    保证外部直读 project.json（工作台/测试）始终看到最新状态；
- *  - timeline.jsonl 事件账本仍逐条同步追加，不受影响。 */
-const metaCache = new Map() // projectId -> 最近一次读/写的深拷贝
-
-const metaDirty = new Set() // projectId -> 待落盘
-
-let metaFlushHandle = null
-
-
-function readMeta(projectId) {
-  const cached = metaCache.get(projectId)
-  if (cached !== undefined) return structuredClone(cached)
-  const path = metaPath(projectId)
-  if (!existsSync(path)) return null
-  try {
-    const meta = JSON.parse(readFileSync(path, 'utf8'))
-    metaCache.set(projectId, meta)
-    return structuredClone(meta) // 与命中路径同语义：调用方拿到独立拷贝，缓存私有副本不受污染
-  } catch (error) {
-    throw new Error(`textbook: corrupt project meta ${projectId}: ${String(error)}`)
-  }
-}
-
-
-/** 把缓存里待写的 project.json 全部同步落盘，然后清空缓存（幂等，无脏可写时是空转）。
- *  清空缓存是刻意的：每次 HTTP 响应（sendJson）后缓存归零，工作流外的 project.json 直写/直读，
- *  下一次读一定命中磁盘最新——这是工作台/测试依赖的契约。
- *  落盘失败的 project 例外：保留副本 + 脏标记，下次 flush 重试（写本地 project.json 失败极罕见）。 */
-function flushMeta() {
-  if (metaFlushHandle !== null) { clearImmediate(metaFlushHandle); metaFlushHandle = null }
-  const retry = new Map() // projectId -> 落盘失败，保留副本下次重试
-  for (const id of metaDirty) {
-    const meta = metaCache.get(id)
-    if (meta === undefined) continue
-    try {
-      writeFileSync(metaPath(id), JSON.stringify(meta, null, 2) + '\n')
-    } catch {
-      retry.set(id, meta)
-    }
-  }
-  metaCache.clear()
-  metaDirty.clear()
-  for (const [id, meta] of retry) {
-    metaCache.set(id, meta)
-    metaDirty.add(id)
-  }
-}
-
-
-/** 底层写入：只更新内存 + 标脏，落盘交给 setImmediate 与 sendJson 边界（见上）。
- *  ⚠️ 它**不再对外导出**（ADR-0016 决策 2）：engine 之外一律走 updateMeta / createMeta /
- *  appendEvent / rollbackLedger 这四个入口——别处的「整份写回」正是票 02 的根因
- *  （写回一份旧状态会把旧账高一起带回来）。 */
-function writeMeta(meta) {
-  metaCache.set(meta.id, structuredClone(meta))
-  metaDirty.add(meta.id)
-  if (metaFlushHandle === null) {
-    metaFlushHandle = setImmediate(() => { metaFlushHandle = null; flushMeta() })
-  }
-}
-
-
 /**
- * 状态写入的**单一入口**（ADR-0016 决策 2）：读 → 改 → 写收成一个动作，改法拿到的是**当场新读**的状态。
+ * 一条「工作台提示」消息（`CONTEXT.md` 词条：机器以 plugin+notice 注入对话流，**不冒充用户说话**）。
  *
- * 为什么要有它：原先的习惯是「先读一份状态 → 中途往账本记了一笔 → 再把手里那份**旧**状态整份写回去」。
- * 状态是内存缓存 + 延迟落盘，读优先命中缓存，所以写回旧状态不只覆盖磁盘，**同一瞬间的下一次读也拿到旧值**
- * ——账高被带回旧值，下一笔事件的序号于是重号或回退，前端「给我序号大于 N 的」增量拉取再也拉不到新事件
- * （票 timeline-seq-integrity/02 的根因）。收成单一入口后，「旧状态写回」这个形状在结构上不再可能。
+ * **纯函数：只造出消息，不发。** 三个出口（`agent.followup` / `agent.inject` / `session.append`）
+ * 各自有**正交的活锁规则**（见 `announceToSession` 上方那段：`status === 'running'` 走 inject、
+ * 只有 idle 才 append、读不到就 warn 并放弃），合并不划算 ⇒ **策略留在调用方，只抽形状**。
  *
- * **账高（`eventCount`）与「最后动静时刻」（`updatedAt`）只归「记一笔」（appendEvent）所有**：
- * 改法里对这两个字段的任何改动一律丢弃（还原成写入前那份）。合法回退要「把账高调小」，
- * 那是 rollbackLedger 的事，不走这里。
+ * ⚠️ 票 `deep-module-scan/09`：这 4 条路径原先**各自手搓一遍**逐字相同的形状
+ * （`announceToSession` / `wakeMainAI` / `nudge` / `resume`），而写错的代价**不是一次报错**——
+ * `announceToSession` 上方那段注释记着 2026-09-23 的真机事故：**畸形历史一旦落盘，之后每个请求都 400，
+ * 压缩也救不回来**。⇒ 同一份知识有四条传播路径，一处写错要改四处。
  *
- * 改法必须**同步**（读到的就是写回的那一份；中间 await 出去，手里那份又成了旧状态）。
- * 返回写进去的那份状态，调用方据此读改完的字段。
+ * ⚠️ **`source.kind` 必须是 v4 的 producer-owned 形状** `{kind: 'plugin:<名字>', form, summary}`——
+ * `{ kind: 'plugin', plugin: '…' }` 那个 v3 包装已被宿主 0.1.7 的会话准入门**明确退役**
+ * （`dsh-session-format-v3-to-v4 source()`：`kind === 'plugin'` 直接抛
+ * `format v4 message requires a producer-owned source kind`，整轮判失败）。完整口径见
+ * `announceToSession` 上方注释（那里讲得更细，**别删那段**，它记的是那次事故与宿主改写口径）。
+ *
+ * ⚠️ **文案一个字都不在这里**：`text` 与 `summary` 由调用方给。唤醒文案的措辞有逐字断言
+ * （`test-startup-recovery.mjs:286-292`），改文案是另一件事。
+ *
+ * @param {{ idPrefix: string, text: string, summary: string }} parts
+ * @returns {{ id: string, role: 'user', content: Array<{type: 'text', text: string}>, source: object }}
  */
-function updateMeta(projectId, mutator) {
-  const meta = readMeta(projectId)
-  if (meta === null) throw new Error(`textbook: unknown project ${JSON.stringify(projectId)}`)
-  const ownedEventCount = meta.eventCount
-  const ownedUpdatedAt = meta.updatedAt
-  mutator(meta)
-  meta.eventCount = ownedEventCount
-  meta.updatedAt = ownedUpdatedAt
-  writeMeta(meta)
-  return meta
-}
-
-
-/** 建档：项目**还不存在**时的那第一笔写入（book-create / demo-run）。
- *  updateMeta 要求「已存在」（读→改→写），这条是「从无到有」，分开写——不让建档借道 updateMeta
- *  （那会逼它先编一份不存在的状态）。已存在时抛错：建档路径不许覆盖别人的书。 */
-function createMeta(meta) {
-  if (readMeta(meta.id) !== null) throw new Error(`textbook: project ${meta.id} already exists`)
-  writeMeta(meta)
-  return meta
-}
-
-
-/** 合法回退 · 账本重写（回退快照 / 深改截断 / 深改撤销共用这一份）：把 `timeline.jsonl` 换成 `events`，
- *  账高随之回到「笔数」——**这是「账高可以变小」的明文例外**（ADR-0016 决策 3），所以它刻意绕过
- *  updateMeta（updateMeta 会挡住对账高的改动，那正是它该做的）。
- *  - 给了 `restoredMeta`：整份换（回退快照 / 深改撤销，恢复到存档那一刻的状态）；
- *  - 没给：在**当场新读**的状态上只改账高（深改截断，其余字段由调用方随后的 updateMeta 改）。 */
-function rollbackLedger(projectId, events, restoredMeta = null) {
-  writeFileSync(timelinePath(projectId), events.map((event) => JSON.stringify(event)).join('\n') + (events.length > 0 ? '\n' : ''))
-  const base = restoredMeta === null ? readMeta(projectId) : { ...restoredMeta }
-  if (base === null) throw new Error(`textbook: unknown project ${JSON.stringify(projectId)}`)
-  base.id = projectId
-  base.eventCount = events.length
-  writeMeta(base)
-  return base
+function noticeMessage({ idPrefix, text, summary }) {
+  return {
+    // id 要唯一：同一毫秒里可能发两条（前缀不同），所以后缀带随机尾巴。
+    // ⚠️ `nudge` / `resume` 原先**只有 base36 时间戳、没有随机尾巴**——统一后多了这一段，
+    //   那只让它更不会撞（id 撞了宿主会当重复消息），不改变任何可观察行为。
+    id: `${idPrefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    role: 'user',
+    // content 恰好一个 text 块（第二个块会被宿主格式准入门拒）。
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin:dsh-craft-your-textbook', form: 'notice', summary },
+  }
 }
 
 
@@ -500,14 +268,21 @@ function announceText(event) {
       return `🛡️ 最后检查：${pass}/${checks.length} 项通过`
     }
     case 'textbook/delivery': return '🎉 书做好了！工作台里可以预览和下载。'
-    case 'textbook/hint': return typeof data.text === 'string' && data.text !== '' ? `💡 ${data.text}` : null
+    case 'textbook/hint': {
+      // ⚠️ **纯机器内部的一步不播报**（票 `walkthrough-2026-10/02` 的 `chapter-assemble` 留痕）：
+      // 那是主笔自己刚叫过的一步（`workbench_act(action=chapter-assemble)`），机器再在对话里
+      // 回一句就是「重复播报主 AI 现场已讲的过程性事件」——那条红线写在 `EVENT_META.announce`
+      // 那段注释里。它照旧进项目时间线与《过程记录.md》（`logEntryText` 不认这一枚标记）。
+      if (data.machine === 'chapter-assemble') return null
+      return typeof data.text === 'string' && data.text !== '' ? `💡 ${data.text}` : null
+    }
     case 'textbook/style-note':
       // 收回才值得告知；新增的意见是用户自己刚点的，不播。
       if (data.revoked !== true) return null
       return `🎨 风格线收回了一条意见（${String(data.styleNote?.text ?? '').slice(0, 40)}）`
     case 'textbook/intervention': return `📮 已留言：${String(data.text ?? '').slice(0, 60)}（不打断 AI 手里的活，下个停靠点处理）`
     case 'textbook/waiver': return `✅ 已按你的特殊要求放行：${WAIVER_ITEMS[data.item]?.label ?? data.item}`
-    case 'textbook/pause': return `⏸ 已暂停（${data.reason ?? '用户在造书工作台点击暂停'}）`
+    case 'textbook/pause': return `⏸ 已暂停（${data.reason ?? '用户在造书工作台点击暂停'}）${stoppedOrchestrationNote(data)}`
     case 'textbook/resume': return `▶ 已继续`
     case 'textbook/outline-decision':
       return data.approved === true
@@ -561,12 +336,11 @@ function announceToSession(ctx, sessionId, text) {
     // `source()`：`kind === 'plugin'` 直接抛 `format v4 message requires a producer-owned
     // source kind`，整轮判失败）。宿主自己的改写口径见同文件 `producerKind()`：
     // kind 变成 `plugin:<名字>`，且 **`plugin` 键被丢掉**，form/summary 原样保留。
-    const message = {
-      id: `tb-note-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-      role: 'user',
-      source: { kind: 'plugin:dsh-craft-your-textbook', form: 'notice', summary: `工作台：${firstLine.slice(0, 60)}` },
-      content: [{ type: 'text', text }],
-    }
+    const message = noticeMessage({
+      idPrefix: 'tb-note',
+      text,
+      summary: `工作台：${firstLine.slice(0, 60)}`,
+    })
     const agent = ctx.get('agents')?.get?.(sessionId)
     if (agent !== undefined) {
       const status = typeof agent.status === 'string' ? agent.status : undefined
@@ -843,10 +617,16 @@ function trashProject(projectId) {
 
 // ── 快照与回退 ──────────────────────────────────────────────────────────────
 
+/**
+ * 存档目录（`过程/存档/`）——票 `13` 从书夹根下平级的一层搬进 `过程/`。
+ *
+ * ⚠️ **旧名那段无斜杠**（spec 实现决策 25 点名的那个坑）：定义点原先是
+ * `join(projectDir(id), <段名>)`、段名后面**不带斜杠**，按「带斜杠」去数命中会**漏掉定义点本身**。
+ * 现在它经 `paths.archiveDir()` 拼，段名住在 `domain-rules.js` 的 `ARCHIVE_DIR_NAME`——
+ * **本文件一个字都不许再写死目录名**。
+ */
 function snapshotsDir(projectId) {
-  const dir = join(projectDir(projectId), 'snapshots')
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return archiveDir(projectId)
 }
 
 
@@ -983,13 +763,11 @@ function foldGate(projectId, wanted = null) {
 
 
 // ── 项目文件 ────────────────────────────────────────────────────────────────
-
-function workDir(projectId) {
-  const dir = join(projectDir(projectId), 'work')
-  mkdirSync(dir, { recursive: true })
-  return dir
-}
-
+//
+// ⚠️ `workDir`（工作区目录）**不在这里**：它是书夹形状的位置，已搬进 `./engine/paths.js`
+// 与 `projectDir`／`timelinePath`／`processLogPath` 同族（票 `context-budget/10` · ADR-0031 决策 1），
+// 由下面 `import { … workDir … } from './engine/paths.js'` 取来再从这里再导出——
+// **调用点一行未改**，而新形状（产物清单／登记／细目／报告）与它同源，改目录名只有一处要动。
 
 function workFile(projectId, name) {
   const dir = workDir(projectId)
@@ -1061,7 +839,7 @@ export function customPatternsBrief(projectId) {
 }
 
 
-/** 把账上的风格线镜像成 AI 必读的 work/style-line.md（写章/审计/交工前读）。 */
+/** 把账上的风格线镜像成 AI 必读的 工作区/style-line.md（写章/审计/交工前读）。 */
 function updateStyleLineMirror(projectId) {
   const meta = readMeta(projectId)
   const notes = (meta.styleNotes ?? []).filter((n) => n.status === 'active' || n.status === 'adopted')
@@ -1114,6 +892,8 @@ function sealGoldStandard(projectId) {
 }
 
 
+// ⚠️ `sources/`（原件）**不在本票射程**：`sources/` → `材料/原件/` 是票 `14` 的书夹形状收口，
+// 本票一件都不许做（票 `13` 的边界）。所以这里两个目录看起来「一半新一半旧」，那是**预期的**。
 function sourcesDir(projectId) {
   const dir = join(projectDir(projectId), 'sources')
   mkdirSync(dir, { recursive: true })
@@ -1121,10 +901,69 @@ function sourcesDir(projectId) {
 }
 
 
+/** 转换稿目录（`材料/转换稿/`）——票 `13` 从书夹根下平级的一层搬进 `材料/`，段名由 `paths.convertedDir()` 持有。 */
 function sourcesMdDir(projectId) {
-  const dir = join(projectDir(projectId), 'sources-md')
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return convertedDir(projectId)
+}
+
+
+/**
+ * 纯文件名判据：不含任何路径分隔符、不是 `.`／`..`、不是绝对路径（`C:\x.pdf` 也不认）。
+ *
+ * **删除目标一律先过它**（`removeSourceFile`）。它与 `projectDir` 里的 `PROJECT_ID_RE` 是同一族
+ * 东西：一个把「书」钉死在书夹里，一个把「要删的那一份材料」钉死在这本书的 `sources/` 里。
+ * ⚠️ 别拿 `resolve` + `startsWith` 代替——那正是 2026-09-26 事故那一族的写法。
+ */
+function assertPlainFileName(file) {
+  const name = String(file ?? '')
+  if (name === '' || name === '.' || name === '..' || basename(name) !== name) {
+    throw new Error(`不是合法的材料文件名: ${JSON.stringify(file)}`)
+  }
+  return name
+}
+
+
+/**
+ * 删掉一份材料的**原件**（票 `mineru-formats/03` · `CONTEXT.md`「材料缺口」的「删掉这份」那一半）。
+ *
+ * 为什么原件也要删：用户说「删掉这份」之后，书夹里还躺着那份 PDF 而材料清单里没有它，
+ * 就是另一种「屏上说的与盘上做的不是一件事」。**代价是不可逆**，所以 UI 那一侧是两步确认
+ * （先「删掉这份」、再「确认删掉？」），这里只保证「删的确实是用户点名的那一格」。
+ *
+ * ## 三档结局，不是「删掉了没有」一个布尔（code-review ⑤）
+ *
+ * 原来这里 `unlinkSync` 外面套着一个空 `catch`（注释写着「已尽力」），之后回 `!existsSync(path)`，
+ * 于是 unlink 失败（文件被别的进程占用、权限不足）会与「原件本来就不在」**塌成同一个 false**：
+ * 调用方照说「原件本来就不在书夹里」，而那一格**照样从清单里消失**——
+ * 文件成了没人管的孤儿，用户再也看不到、也再也点不到它。
+ *
+ * 现在三档各自说各的（判据只有这里一份，调用方不许自己再 `existsSync` 一遍）：
+ *   · `'deleted'` —— 真删掉了；
+ *   · `'missing'` —— 原件本来就不在盘上（**不是失败**，用户要的结局已经成立）；
+ *   · `'failed'`  —— **在盘上却删不掉**：如实带出原因，调用方据此把那一格**留在清单上**
+ *     并告诉用户「删不掉、可以重试」，不许静默摘掉。
+ *
+ * @param {string} projectId 书号（`projectDir` 的 `PROJECT_ID_RE` 限定）
+ * @param {string} file 纯文件名（**先过 `assertPlainFileName`**，请求体里的名字另需命中
+ *                       `meta.sources` 那一格——判据在 `actions/convert.js` 的 `assertRemovableSource`）
+ * @returns {{outcome: 'deleted'|'missing'|'failed', error?: string}}
+ */
+export function removeSourceFile(projectId, file) {
+  const name = assertPlainFileName(file)
+  const path = join(sourcesDir(projectId), name)
+  if (!existsSync(path)) return { outcome: 'missing' }
+  // ⚠️ 刻意**只**用 unlinkSync 摘这一个文件：递归 `fs.rmSync` 对含中文的路径在 Windows 上
+  // 原生崩溃（见 removeTree 头部），文件级删除用 unlinkSync 是本模块既有的安全做法。
+  try {
+    unlinkSync(path)
+  } catch (error) {
+    // 删不掉就说删不掉——**不回 `false`**（那个值会被读成「本来就不在」，于是清单那一格
+    // 静默消失、文件变孤儿）。失败原因原样带出去，用户看得到也能据此重试。
+    return { outcome: 'failed', error: String(error instanceof Error ? error.message : error) }
+  }
+  // unlinkSync 说成功但文件还在（罕见：网络盘/占用竞态）同样算「删不掉」，不许报成功。
+  if (existsSync(path)) return { outcome: 'failed', error: '删除之后它仍在盘上（可能被别的程序占用）' }
+  return { outcome: 'deleted' }
 }
 
 
@@ -1168,14 +1007,11 @@ function wakeMainAI(ctx, projectId) {
     '4. 完成后调用 workbench_act（action=stage-submit）交工；机器验货合格才会继续下一步。',
     '铁律：先用大白话告诉用户你要做什么，再动手；需要用户拍板的事绝不自作主张。',
   ].join('\n')
-  const message = {
-    id: `tb-task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-    role: 'user',
-    content: [{ type: 'text', text }],
-    // v4 producer-owned source（不是已退役的 `{ kind: 'plugin', plugin: … }` 包装）——
-    // 那一版会被宿主 0.1.7 的会话准入门整轮判失败，病因与口径见 announceToSession 上方注释。
-    source: { kind: 'plugin:dsh-craft-your-textbook', form: 'notice', summary: `工作台：轮到 AI 动手（${label}）` },
-  }
+  const message = noticeMessage({
+    idPrefix: 'tb-task',
+    text,
+    summary: `工作台：轮到 AI 动手（${label}）`,
+  })
   try {
     agent.followup(message)
     return true
@@ -1223,10 +1059,52 @@ function handoff(ctx, projectId, stage, gate = null, snapshotReason = null) {
 }
 
 
+/**
+ * 交办 + demo 通道自驱动：**确认闸门放行/驳回之后**动作层该调的那一个口（票 depth-review-2026-10/07）。
+ *
+ * 为什么需要它：demo 与真实的唯一 seam＝内容来源（本文件头部自述）。真实书交办完由主 AI 接着推进，
+ * demo 书**没有主 AI 可唤醒**——`wakeMainAI` 对 `meta.demo === true` 直接早退返回 false，于是
+ * `pendingStage` 挂在那儿、状态机没人推。所以**交办之后得有人推**的那一族动作——确认闸门放行/驳回
+ * （`gates` / `gold` / `resume`），以及「把书翻回 running 再交办」的入账动作（`chapters` 的提意见）
+ * ——一律必须走这个口，由演示占位通道自己把下一步做出来。原先这个判据在 `actions/` 里抄了七份
+ *（每份自带一段理由注释），新增确认动作时最容易漏抄或抄歪；判据与理由收在此处一处。
+ *
+ * ⚠️ **「七份」是历史份数，不是今天的处数**：走这个出口的地方会随票增长（票 `demo-flow-fidelity/05`
+ * 把 `chapters.js` 的**过目态提意见**与**机器空闲时提意见**两处原本裸调 `handoff` 的也改了进来
+ * ⇒ 处数 **7 → 9**）。今天的处数由 `test-flow-transitions-chapters.mjs` 的 G5 结构闸数着
+ * （票 `test-chain-latency/04` 之前它在 `test-flow-transitions.mjs` 里）——它同时是
+ * 「有人又裸调 `handoff`」（demo 书停死在 `running`）与「有人把 kick 堆在手边」（真书多吃一趟
+ * 状态机；`kick` 不幂等）这两件事的警报，**本注释不另记一份会腐烂的账**。
+ *
+ * 判据是两个合取项，**第二个承重**：`woke === false` 的原因不止 demo 一个（meta 读不出、sessionId
+ * 非法、`agents` 注册表里没有这本书的会话、两次 followup 都失败，见 wakeMainAI 各早退），只看 woke
+ * 会把那些真书也拖去补 kick——那等于凭空多驱动一趟状态机。所以要求 `meta.demo === true` 才补。
+ * 另一个承重点：**只读当场状态**（`readMeta` 现读），不收调用方那份局部拷贝——原先那七份拷贝的读取时刻
+ * 各不相同，而语义上「交办之后的状态」只有现读才对。
+ *
+ * `drive: false` 是**刻意不补 kick** 的出口。理由写在定点修改那一族自己那里（`actions/deep-modify.js`）：
+ * 它把待办直接写回 `meta.pendingStage` 再单独唤醒，**既不 handoff 也不 kick**——kick 会让状态机从
+ * 账本重推导（可能落错段），handoff 会追加 stage-start 事件、破坏「10 分钟内可一键撤销」的
+ * 「账面无新进展」守卫。
+ *
+ * @returns handoff 的返回值（= wakeMainAI 的 woke），调用方需要时自取。
+ */
+function handoffAndDrive(ctx, projectId, stage, gate = null, snapshotReason = null, options = {}) {
+  const woke = handoff(ctx, projectId, stage, gate, snapshotReason)
+  if (options.drive === false) return woke
+  const meta = readMeta(projectId)
+  if (woke === false && meta !== null && meta.demo === true) void kick(ctx, projectId)
+  return woke
+}
+
+
 /** 某章的两份产物路径。 */
 function chapterArtifacts(projectId, n) {
-  const file = `chapter-${String(n).padStart(2, '0')}.md`
-  const audit = `audit-${String(n).padStart(2, '0')}.md`
+  // ⚠️ `file` 喂给 `workFile`，而 `workFile` 自己拼 `工作区/` ⇒ 这里要的是**基名**
+  // （`chapterName`），不是相对路径。给成 `chapterRel` 会读成 `工作区/工作区/chapter-NN.md`
+  // ——真的把文件读坏。票 `depth-review-2026-10/05`。
+  const file = chapterName(n)
+  const audit = `audit-${String(n).padStart(2, '0')}.md` // audit 族的同款契约，本票不收
   return { file, audit, chapterPath: workFile(projectId, file), auditPath: workFile(projectId, audit) }
 }
 
@@ -1263,25 +1141,47 @@ function chapterHasSubmitEvent(projectId, n, meta = null, events = null) {
 
 
 /**
- * 票 22：**正文一改，审过就失效**——检查记录必须**晚于**当前这份正文才算审过它。
+ * 票 22：**正文一改，审过就失效**——检查记录必须**审的是当前这份正文**才算审过它。
  *
- * 判据是**两个文件的 mtime 谁更晚**，与 `src/workflow.js` 的 `buildArtifactFacts` 里那条
- * 「新鲜度是服务端事实」**同一口径**（那边算给界面看，这边卡住闸门；两边读的是同一对文件）。
+ * 判据本体是 `domain-rules.auditCoversProduct`（指纹优先、mtime 兜底），与 `src/workflow.js` 的
+ * `buildArtifactFacts` 里那条「新鲜度是服务端事实」**同一对文件**（那边算给界面看，这边卡住闸门）。
+ * 读不到 mtime 时**不判旧稿**——「读不出」不许当成「有问题」。
+ */
+/**
+ * 检查记录审的是不是当前这份产物 —— **指纹优先、时序兜底**（票 `context-budget/10` · ADR-0031 决策 4）。
+ *
+ * ⚠️ 判据本体在 `domain-rules.auditCoversProduct`（两侧共用的纯模块）：「只有一处」是硬要求，
+ * 前端与注入面日后都要读它，而抄第二份就是「两个数字打架」的复发。
+ * 这里只负责**取事实**（今天章级没有指纹，落回 mtime），判定一个字都不在这里重写。
+ *
+ * 指纹优先的理由（为什么不是只比 mtime）：mtime 会被 `git checkout`、复制、跨盘搬运整体推后，
+ * 一份**对旧稿**的检查记录因此可能「看起来比正文新」——今年已经因此被拦过一次（票 `walkthrough-fixes/22`）。
+ * 指纹（内容摘要）没有这个毛病；老账本没有指纹，那一批只能按时序。
+ *
  * 读不到 mtime（stat 抛了）时**不判旧稿**——「读不出」不许当成「有问题」，那会让一本正常书
  * 凭空被拦住；那种情况下上面的「两份产物在」已经扛住了最要紧的那一半。
  */
 function chapterAuditOlderThanChapter(chapterPath, auditPath) {
+  return !auditCoversProduct({
+    productModifiedAt: safeMtimeMs(chapterPath),
+    auditedModifiedAt: safeMtimeMs(auditPath),
+  })
+}
+
+
+/** mtime（毫秒）；读不出返回 `null`（`auditCoversProduct` 把「读不出」判成「不判旧」）。 */
+function safeMtimeMs(path) {
   try {
-    return statSync(auditPath).mtimeMs < statSync(chapterPath).mtimeMs
+    return statSync(path).mtimeMs
   } catch {
-    return false
+    return null
   }
 }
 
 
 /**
  * 过目闸门「全部章节都写好了」的单章判据（票 14，**界面数字与闸门共用这一份**，不许写第二份）：
- *  ① 两份产物存在（`work/chapter-NN.md` ＋ `work/audit-NN.md`，今天已有）；
+ *  ① 两份产物存在（`工作区/chapter-NN.md` ＋ `工作区/audit-NN.md`，今天已有）；
  *  ② **检查记录不比正文旧**（票 22：正文在审计之后又改过 ⇒ 那份审计审的是旧稿，「审过」当场失效）；
  *  ③ 该章有机器记下的「交工通过」（见 chapterHasSubmitEvent）；
  *  ④ 该章**没有未处置（`status === 'pending'`）的抽查意见**——这条是票 10「翻案 → 这本书重新被拦住」
@@ -1301,19 +1201,34 @@ function chapterDone(projectId, n, meta = null, events = null) {
 
 /**
  * 同一份判据的「差在哪一项」形态（**不重复判据，只给结论起个名**）：
- * 满足返回 `null`，不满足返回 `{ reason: 'artifact' | 'stale' | 'review' | 'submit' }`——
+ * 满足返回 `null`，不满足返回 `{ reason: 'artifact' | 'stale' | 'review' | 'submit', state: … }`——
  * `chapters-review-confirm` 闸门要据此说清「是产物缺、还是审的是旧稿、还是该章有未处置意见、还是压根没交工」。
  * 四项与 chapterDone 一一对应，顺序也一致。
+ *
+ * ⚠️ **`state` 是四档环节状态**（`missing`／`stale`／`unconfirmed`／`ready` · ADR-0031 决策 4），
+ * 由 `domain-rules.stageStateOf` **算**出来 —— `reason` 是给闸门报错用的旧词，四档状态是给
+ * 界面与注入面用的（票 `02` 的注入触发词表取的就是那一档）。**这里不新造判据**：
+ * 本函数只负责取三样事实（产物在不在／审计对不对得上／人工确认到位没有），四档由那一个函数给。
  */
 function chapterGateMiss(projectId, n, meta = null, events = null) {
   const { chapterPath, auditPath } = chapterArtifacts(projectId, n)
-  if (!existsSync(chapterPath) || !existsSync(auditPath)) return { reason: 'artifact' }
-  if (chapterAuditOlderThanChapter(chapterPath, auditPath)) return { reason: 'stale' }
   const current = meta ?? readMeta(projectId)
-  const pending = (current?.pendingReviews ?? []).some((r) => r?.chapter === n && r?.status === 'pending')
-  if (pending) return { reason: 'review' }
-  if (!chapterHasSubmitEvent(projectId, n, current, events)) return { reason: 'submit' }
-  return null
+  const state = stageStateOf({
+    artifactPresent: existsSync(chapterPath) && existsSync(auditPath),
+    auditFresh: !chapterAuditOlderThanChapter(chapterPath, auditPath),
+    reviewPending: (current?.pendingReviews ?? []).some((r) => r?.chapter === n && r?.status === 'pending'),
+    submitRecorded: chapterHasSubmitEvent(projectId, n, current, events),
+  })
+  return state.reason === null ? null : { reason: state.reason, state: state.state }
+}
+
+
+/**
+ * 某一章的**环节状态**（四档，纯派生）——服务端／前端／注入面都读它（只此一份）。
+ * @returns {{state: string, reason: string|null}}
+ */
+export function chapterStageState(projectId, n, meta = null, events = null) {
+  return chapterGateMiss(projectId, n, meta, events) ?? { state: 'ready', reason: null }
 }
 
 
@@ -1419,7 +1334,7 @@ function projectRuntime(ctx, projectId, meta) {
 }
 
 
-/** 提案正文的一级标题（人读：《提案/关卡N-vX.md》的第一行）。
+/** 提案正文的一级标题（人读：《工作区/方案/关卡N-vX.md》的第一行）。
  *  文件名与路径是**机器身份词**（不改，锚定它的正则见 domain-rules 的提案白名单）；
  *  但这一行标题是写给人读的（判定线②），所以走界面词模板。导出以便用词不变量断言直调
  *  真实产出函数（票 01），不在测试里复制模板字符串。 */
@@ -1428,11 +1343,10 @@ export function proposalHeading(gate, version, title) {
 }
 
 
-/** 关卡方案落盘为可读文档（提案/关卡N-vX.md）。 */
+/** 关卡方案落盘为可读文档（工作区/方案/关卡N-vX.md）。 */
 function writeProposalDoc(projectId, gate, version, title, summary, detail) {
   try {
-    const dir = join(projectDir(projectId), '提案')
-    mkdirSync(dir, { recursive: true })
+    const dir = proposalDir(projectId)
     writeFileSync(
       join(dir, `关卡${gate}-v${version}.md`),
       `${proposalHeading(gate, version, title)}\n\n## 摘要\n\n${summary}\n\n## 完整方案\n\n${detail}\n`,
@@ -1484,11 +1398,45 @@ function waitForGateDecision(projectId, gate, version) {
 }
 
 
+/**
+ * 兑现这一次拍板：`gateWaiters` 里那笔的 `(gate, version)` **逐字对上**时兑现并清掉；否则什么都不做。
+ *
+ * ⚠️ 票 `deep-module-scan/10`：`gateWaiters` 的 `{gate, version, resolve}` 三字段协议**原先横跨两个文件**——
+ * engine 写、`actions/gates.js` 读（那里直接 `.get()` 出来、比对两个字段、再 `.resolve()`）。
+ * 那意味着**协议的两半都没有声明它**，而 `gates.js` 必须知道 `resolve` 这个字段名才能兑现它。
+ * ⇒ 收回成这一个函数后，**协议只活在 engine 内**，调用方只说「兑现 project 上这一次的拍板」。
+ * 只有一个 implementation，所以**不造 seam**——只是把跨文件的形状收回来。
+ */
+function resolveGateDecision(projectId, gate, version) {
+  const waiter = gateWaiters.get(projectId)
+  if (waiter === undefined || waiter.gate !== gate || waiter.version !== version) return
+  gateWaiters.delete(projectId)
+  waiter.resolve()
+}
+
+
+/**
+ * 这一本书此刻有没有状态机在跑。
+ *
+ * ⚠️ 票 `deep-module-scan/10`：原先两个调用点各自直接 `runners.has(project)` 当「别起第二个状态机」
+ * 的判据（`actions/convert.js` 与 `workflow.js`），**那条判据的含义只活在它们的注释里**。
+ * 收回成具名的一格后，判断的来由写在名字上，而不是靠两处注释各自解释一遍。
+ *
+ * ⚠️ **但 `runners` 这个 Map 仍然导出**，不是忘了收：`books.js` 删书时要 `runners.delete(project)`
+ * （那是清理，与「有没有在跑」不是一回事），`test-material-gap-stance.mjs` 的 `settleRunner`
+ * 要**拿到那个 promise 去 await**——它要的不是布尔，是那一条。
+ */
+function isRunning(projectId) {
+  return runners.has(projectId)
+}
+
+
 async function runPhase1(_ctx, projectId, meta) {
-  // Phase 1：等待材料 → 逐本转换（MinerU）→ 全部完成推进 Phase 2
+  // Phase 1：等待材料 → 逐份转换（MinerU）→ 全部完成推进 Phase 2
   const sources = meta.sources ?? []
   if (sources.length === 0) {
-    appendEvent(projectId, 'textbook/hint', { text: '请先上传教材 PDF（工作台向导）' })
+    // 票 09：退役「教材 PDF」。⚠️ `docs/协作模型.md` 的 B53 锚点逐字记着这句，改这里必须同改那张表。
+    appendEvent(projectId, 'textbook/hint', { text: '请先上传材料（工作台向导）' })
     return 'waiting'
   }
   // 上次转换可能中途中断（宿主重启）留下卡死的 converting 标记：清掉，从头继续。
@@ -1501,10 +1449,29 @@ async function runPhase1(_ctx, projectId, meta) {
   for (;;) {
     const current = readMeta(projectId)
     const currentSources = current?.sources ?? []
-    const pending = currentSources.filter((source) => source.converted !== true)
+    // 三值枚举的读法一律经 domain-rules.convertedState（单一真相源；老书布尔只读归一，不回写）。
+    const pending = currentSources.filter((source) => convertedState(source) === 'pending')
+    const failedSources = currentSources.filter((source) => convertedState(source) === 'failed')
     if (pending.length === 0) {
-      advance(projectId, 1, 2)
-      return 'advanced'
+      // 推进条件（票 `mineru-formats/02` · ADR-0028 决策 1/3）：**没有 pending 也没有 failed** 才推进。
+      // 只判 pending 是不够的——失败源会被留在一本「已进 Phase 2」的书里，
+      // 于是 brief 指向一份**根本不存在**的 `材料/转换稿/…/full.md`（静默读不到，两边都不报错）。
+      if (failedSources.length === 0) {
+        advance(projectId, 1, 2)
+        return 'advanced'
+      }
+      // 停在材料准备，**这一轮不重传任何东西**（票面的反证：failed 源下一轮不会被挑中）。
+      // 置 error 是为了不留「状态永远 running 却什么都不说」的空档——屏上照旧是那张既有的
+      // 错误卡（它读 `lastErrorHuman`，就是上一轮那句批次口径的人话）。
+      //
+      // 票 `mineru-formats/03`（ADR-0028 决策 3）把「表过态」那一层补在这一格之下：
+      // 每一份 `failed` 都要用户**逐个**表态，两个出口各走各的真路径——
+      //   · 补传：同名重传（`handleUpload` 把那一格置回 `'pending'`）→ 下一轮真的重转；
+      //   · 删掉：契约动作 `source-remove`（`actions/convert.js`）把那一格从 `meta.sources` 摘掉。
+      // 两条都改 `meta.sources`，所以「逐个表态完才准推进」这件事**由这一行自己兑现**：
+      // 只要还剩任何一格 `failed`，本函数就既不重传也不推进。
+      updateMeta(projectId, (state) => { state.status = 'error' })
+      return 'error'
     }
     const source = pending[0]
     const sourcePath = join(sourcesDir(projectId), source.file)
@@ -1514,13 +1481,20 @@ async function runPhase1(_ctx, projectId, meta) {
       return 'error'
     }
     updateMeta(projectId, (state) => { state.converting = true })
-    // 批量转换全部待转 PDF（一次提交并行解析；每本结果按 file_name 落到独立子目录）。
+    // 批量转换全部待转原件（一次提交并行解析；每份结果按 file_name 落到独立子目录）。
     const startedAt = Date.now()
+    // ⚠️ 票 09 裁决：**账本 label 一个字不改**——`批量转换 N 本 PDF` 是机器身份词，
+    // 同面先例见 CONTEXT.md「界面用词表」章级完成行（账本 label 照旧、界面走 `stageLabelHuman`）。
+    // 这里也正是 `docs/协作模型.md` 的 B55 锚点逐字钉着的那一串。
     appendEvent(projectId, 'textbook/agent-start', { label: `批量转换 ${pending.length} 本 PDF` })
     try {
       const items = pending.map((item) => {
         const index = currentSources.indexOf(item)
-        const sub = `${String(index + 1).padStart(2, '0')}-${sanitizeFolderName(item.file.replace(/\.pdf$/i, '')).slice(0, 24)}`
+        // 票 07：剥**已知**扩展名（`MINERU_KNOWN_EXTENSIONS` 那一份），不再手抄 `/\.pdf$/i`——
+        // 受理闸门放开后原件可以是 docx/pptx/图片，那份手抄的后缀会原样留在转换稿目录名里
+        // （`01-讲义.docx`），而 PDF 那一半继续被剥掉，同一批里两套命名口径。
+        // 剥已知 ≠ 只认 PDF：`讲义.txt`（名单外，本仓压根进不来）原样留着。
+        const sub = `${String(index + 1).padStart(2, '0')}-${sanitizeFolderName(stripKnownExtension(item.file)).slice(0, 24)}`
         return {
           file: join(sourcesDir(projectId), item.file),
           name: item.file,
@@ -1529,22 +1503,32 @@ async function runPhase1(_ctx, projectId, meta) {
         }
       })
       const results = await convertPdfBatch(items, { formula: meta.science === true }, (stage) => {
-        appendEvent(projectId, 'textbook/mineru-progress', { file: `${pending.length} 本`, stage })
+        // ⚠️ 票 09 记一笔事实：`data.file` 是**死字段**——`src/ui/view-rules.js` 的转换活动行
+        // 只读 `data.stage`，从不读 `data.file`。这里改「本→份」纯属账本内一致性，用户零感知。
+        appendEvent(projectId, 'textbook/mineru-progress', { file: `${pending.length} 份`, stage })
       })
       const failed = results.filter((result) => result.ok !== true)
       // F26（2026-08-20）：记录人话错误文案（mineru-lib 已把页数超限/Token 失效归一成人话），前端 error 卡直接展示。
+      // 票 09：判定线①（error 卡原样渲染 message），数材料说「份」。
       const humanMessage = failed.length === 0
         ? null
-        : `${failed.length} 本转换失败：${failed.map((f) => `${f.name}（${f.error ?? '未知错误'}）`).join('；')}`
+        : `${failed.length} 份转换失败：${failed.map((f) => `${f.name}（${f.error ?? '未知错误'}）`).join('；')}`
       // 转换结果写回**当场新读**的那份（按文件名找条目，不按开工时那份数组的下标）。
+      // 三个结局都落到**同一个** `converted` 字段（票 `mineru-formats/02`）：
+      // 成功写 'ok'（并记下转换稿相对路径），失败写 'failed'——失败源就是**第三态**，
+      // 于是它既不会被下一轮重新挑去重传，也不会被推进条件当成「已经转完了」。
       updateMeta(projectId, (state) => {
         state.converting = false
         for (const result of results) {
-          if (result.ok !== true) continue
           const target = (state.sources ?? []).find((s) => s.file === result.name)
+          if (target === undefined) continue
+          if (result.ok !== true) {
+            target.converted = 'failed'
+            continue
+          }
           const item = items.find((it) => it.name === result.name)
-          if (target === undefined || item === undefined) continue
-          target.converted = true
+          if (item === undefined) continue
+          target.converted = 'ok'
           target.md = join(item.sub, 'full.md')
         }
         if (humanMessage !== null) {
@@ -1553,6 +1537,7 @@ async function runPhase1(_ctx, projectId, meta) {
         }
       })
       if (humanMessage === null) {
+        // 票 09 裁决：与 :1524 的 agent-start 同一面——账本 label 一个字不改（B55 锚点逐字钉着）。
         appendEvent(projectId, 'textbook/agent-end', { label: `批量转换 ${pending.length} 本 PDF`, outcome: 'ok' }, Date.now() - startedAt)
       } else {
         appendEvent(projectId, 'textbook/error', {
@@ -1613,6 +1598,198 @@ async function demoStep(ctx, projectId, meta, label, exec, after) {
 }
 
 
+/**
+ * **「此刻还有几个小助手在跑」**——只数个数，不碰它们。
+ *
+ * ⚠️ 它**不**进任何「就绪」判据（见 {@link exploreArtifactProblems} 的窄处）：`activity === 'running'`
+ * 只表示那条子会话的记录还在会话库里活着（**驻留但空闲**也算），不表示「在写」；拿它当就绪判据会造出
+ * 「小助手跑挂了就永远不齐」的死锁。它进两处：**卡上的活性文案**、**重做/归档前的那道闸**
+ * （票 `premature-announce/01`；此前唯一消费者是 `pause`）。
+ *
+ * 形状取自随代码入库的契约快照 `docs/reference/dsh-subagent-contracts.md`：子代理条目的字段是
+ * **`id`**（宿主**没有** `childId` 这个字段），活性位是 `activity`——`'running'` 表示这条子会话的
+ * 记录还在会话库里活着，`'inactive'` 表示只剩磁盘上的记录。⚠️ 这个数**含编排脚本成员**。
+ *
+ * 数不出来时返回 `null`（「不知道」，不是 0）。**「数不出来」有两条路，都归到下面那个 `catch`**：
+ * ① 宿主服务缺席（`ctx.subagents` 没挂、或它没有 `listDescendants`）——可选链短路成 `undefined`，
+ *   这里的 `?? null` **刻意不写成 `?? []`**（折成 `[]` 就与「确实为 0」不可区分，票 10），
+ *   紧接着的缺席守卫抛错；② `listDescendants` 调用真的抛错。
+ * 这一层 try/catch **是会执行的**守卫——调用方不许因为一条附注而失败。
+ * ⚠️ 消费它的两处都按「`null` ＝ 不知道 ⇒ **不拦人**」处置：`null` 不是「有人在跑」。
+ *
+ * ⚠️ 它**不**收回任何小助手：`ctx.subagents.interrupt` 在本仓是登记过的**禁读**成员
+ * （`dev/host-contract-gate/catalog/web-chat.js` 的 `forbiddenMemberReads`；边界写在
+ * `actions/collab-signals.js` 那一族注释里）——收回小助手是主笔 AI 自己的事。
+ *
+ * @returns {Promise<number|null>} 在跑的小助手个数；数不出来时 null
+ */
+export async function countRunningSubagents(ctx, sessionId) {
+  try {
+    // 「数不出来」不许折成 `[]`（票 host-contract-gate/10）：折成 `[]` 会让「服务缺席」与
+    // 「确实一个都没在跑」变成同一个 0，主笔 AI 分不开。折成 `null` 后由下面那次守卫抛错，
+    // 与「调用真的抛错」走同一条出口——`catch` 是缺席的唯一出口（改前它对这一支是死代码）。
+    const children = await ctx?.subagents?.listDescendants?.(sessionId) ?? null
+    if (children === null) throw new Error('宿主小助手服务缺席：ctx.subagents.listDescendants 不可用')
+    return children.filter((child) => child?.activity === 'running').length
+  } catch (e) {
+    ctx?.logger?.warn?.(`textbook: 没数出小助手个数（记 null 不记 0）: ${String(e instanceof Error ? e.message : e)}`)
+    return null
+  }
+}
+
+
+/**
+ * **源探查的就绪判据（全仓唯一一份）**：盘上那几件产物齐了吗？
+ *
+ * ## 它治的病：早宣告
+ *
+ * 状态机把「工序中途出现的那**一件**产物」当成「这一步做完了」，于是对用户宣告了一件还没发生的事。
+ * 2026-10-10 实跑（`抑郁患者自救`）：那张卡在 `13:58:23.543` 跳出，而 5 件产物**一件都不存在**、
+ * 两个精读小助手都还在跑——卡比真就绪早 **4 分 29 秒**，而且那一刻点「满意」会 200 并把书推过这一段，
+ * 于是只在交工成功支里诞生的 `工作区/knowledge-map.json` **永久缺位**（回去的路又被 pendingStage 闸焊死）。
+ *
+ * 三处消费**同一份**：**置态**（{@link runPhase2} 真实支）、**放行**（`explore-confirm` 那座闸）、
+ * **交工验货**（`stage-submit explore`）——⛔ 不许任何一处另抄一份枚举（票 `dev-gate-scan/17` 那条纪律）。
+ *
+ * ## 报错措辞与交工验货逐字同一份
+ *
+ * 交工那一跳直接拿 `problems[0]` 当 400 文案 ⇒ 这里改一个字，那条 400 也跟着改
+ * （`test-explore-handoff-content.mjs` 锚着「探查报告缺必做项：… 」那一句）。所以别在这里另写人话。
+ *
+ * ## 窄处（判据声称的强度＝实现强度）
+ *
+ * 它只断「**在不在、能不能拼、形状对不对**」——分片内容真假、知识点抽得准不准仍归真机层与抽查那一面；
+ * 也**不看**「还有几个小助手在跑」（`activity === 'running'` 只表示会话还在，不表示在写；
+ * 拿它当就绪判据会造出「小助手跑挂了就永远不齐」的死锁）。小助手数只进两处：卡上的活性文案、
+ * 重做/归档前的那道闸。
+ *
+ * @param {string} projectId
+ * @param {object|null} [meta] 调用方手里那份状态；不递就自己读（⛔ 别递长跑期间拿的旧状态去写回）
+ * @param {{atSubmit?: boolean}} [options] **交工那一跳**传 `true`：那时合并件还没诞生（这一跳自己写它），
+ *   而且演示书**不分叉**——`stage-submit(explore)` 验的就是真实工序该有的那几件
+ * @returns {{problems: string[], shards: Array<{n: number, map: unknown}>}}
+ */
+export function exploreArtifactProblems(projectId, meta = null, options = {}) {
+  const problems = []
+  const shards = []
+  const state = meta ?? readMeta(projectId)
+  if (state === null) return { problems: ['这本书的状态读不出来（账上的 meta 不在）'], shards }
+  const exploreText = existsSync(workFile(projectId, 'explore.md'))
+    ? readFileSync(workFile(projectId, 'explore.md'), 'utf8')
+    : ''
+  if (exploreText.trim() === '') {
+    problems.push('工作区/explore.md 不存在或为空，请先写好探查报告再交工')
+  } else {
+    const exploreTier = exploreDepthTier(state.sources)
+    const missingItems = exploreTier.required.filter((item) => !exploreText.includes(item))
+    if (missingItems.length > 0) {
+      problems.push(`探查报告缺必做项：${missingItems.join('、')} —— 工作区/explore.md 要有这几节（本次 ${exploreTier.count} 份转换完成的源 → ${exploreTier.tier}档，必做：${exploreTier.required.join('、')}），小节名照交办说明逐字写，机器按名字找。`)
+    }
+  }
+  const atSubmit = options.atSubmit === true
+  // ⚠️ **这条判据唯一的分叉**（登记在 `src/demo-exemptions.js` 的 `explore-artifact-shards`）：
+  // 演示通道**没有「精读小助手」这回事**——分片与细目在那条路上**没有来源**（结构性到不了，不是没做完），
+  // 「就绪」那一档因此跳过它们。⚠️ **交工那一跳不分叉**：`stage-submit(explore)` 验的就是真实工序
+  // 该有的那几件，演示书漏交一片照样 400（`test-explore-handoff-content.mjs` 第 5 节② 钉着这条机器证据）。
+  const demoBook = !atSubmit && state.demo === true
+  const okNumbers = demoBook ? [] : okMaterialNumbers(state.sources)
+  const shardMissing = okNumbers
+    .filter((n) => !existsSync(workFile(projectId, knowledgeShardName(n))))
+    .map((n) => knowledgeShardRel(n))
+  if (shardMissing.length > 0) {
+    problems.push(`知识地图分片缺失：${shardMissing.join('、')} —— 每份转换完成的材料都要有一片（逐份派精读小助手时由它落盘，机器按这些片拼成 工作区/knowledge-map.json），缺 ${shardMissing.length} 片。`)
+  }
+  const detailMissing = okNumbers
+    .filter((n) => !existsSync(join(detailDir(projectId), readingName(n))))
+    .map((n) => readingRel(n))
+  if (detailMissing.length > 0) {
+    problems.push(`精读细目缺失：${detailMissing.join('、')} —— 每份转换完成的材料都要有一份细目（逐份派精读小助手时由它自己落盘，主笔不用转写），缺 ${detailMissing.length} 份。`)
+  }
+  const brokenShards = []
+  for (const n of okNumbers) {
+    let map = null
+    try { map = JSON.parse(readFileSync(workFile(projectId, knowledgeShardName(n)), 'utf8')) } catch { map = null }
+    if (map === null || typeof map !== 'object' || Array.isArray(map)) brokenShards.push(knowledgeShardRel(n))
+    else shards.push({ n, map })
+  }
+  if (brokenShards.length > 0) {
+    problems.push(`知识地图分片读不出（不是严格 JSON 对象）：${brokenShards.join('、')} —— 那一片要按精读契约重写；机器按各片拼合并件，读不出就拼不出这一份。`)
+  }
+  const shardShapes = shardShapeProblems(shards)
+  if (shardShapes.length > 0) problems.push(`知识地图分片形状不对：${shardShapes.join('；')}`)
+  // 合并件：机器是它**唯一**的写入者，它在交工成功那一刻才诞生 ⇒ 盘上没有它，就等于这一段还没交工。
+  // ⚠️ 交工那一跳自己就是写它的那一跳，所以那一处传 `atSubmit: true`。
+  if (!atSubmit && !existsSync(workFile(projectId, 'knowledge-map.json'))) {
+    problems.push('知识地图还没生成（工作区/knowledge-map.json 不在）—— 它由机器在主 AI 交工那一刻按分片拼装；盘上没有它，说明这一段还没交工')
+  }
+  return { problems, shards }
+}
+
+
+/**
+ * **章节骨架那一段的就绪判据**（放行那一跳用；票 `premature-announce/01`）。
+ *
+ * ⚠️ 它比探查那一份**窄**，窄处写在明面上：交工验货在 `stage-submit(outline)` 里验的是**内容**
+ * （大纲字段归一化、知识点覆盖、章数契约），而那些判据读的是**交工请求体**——放行那一刻拿不到。
+ * 这一份只断两件**盘上事实**：
+ *   · `工作区/outline.md` 非空（这一段唯一的产物，机器在交工成功那一刻写它）
+ *   · `工作区/knowledge-map.json` 在盘（骨架的知识点覆盖判据读的就是它；它不在，后面必然撞 400）
+ *
+ * @param {string} projectId
+ * @param {object|null} [meta] 调用方手里那份状态；不递就自己读
+ * @returns {string[]} 缺什么（空数组＝就绪）
+ */
+export function outlineArtifactProblems(projectId, meta = null) {
+  const problems = []
+  const state = meta ?? readMeta(projectId)
+  const outlineText = existsSync(workFile(projectId, 'outline.md'))
+    ? readFileSync(workFile(projectId, 'outline.md'), 'utf8')
+    : ''
+  if (outlineText.trim() === '') {
+    problems.push('工作区/outline.md 不存在或为空——这一段还没交工（章节骨架由机器在交工那一刻写它）')
+  }
+  // ⚠️ 合并件**只在「这本书真有材料」时才要求**——与交工验货那条判据**同一个条件**：
+  // `stage-submit(outline)` 的知识点覆盖闸门只在 `okMaterialNumbers(sources).length > 0` 时才读它
+  //（零源旧书两处都不读）。凭空要一份不存在的件，就是「判据比现实严」那一类错。
+  const hasSources = state !== null && okMaterialNumbers(state.sources).length > 0
+  if (hasSources && !existsSync(workFile(projectId, 'knowledge-map.json'))) {
+    problems.push('工作区/knowledge-map.json 不在——章节骨架的知识点覆盖读的就是它（源探查那一段的合并件）')
+  }
+  return problems
+}
+
+
+/**
+ * **范例章那一段的就绪判据**（放行那一跳用；票 `premature-announce/01`）。
+ *
+ * ⚠️ **它不翻 `ADR-0034` 裁决甲**：裁决甲管的是 {@link runPhase4} 那道**置态**闸门
+ * （「稿在盘就提前展示」——有意，一个字不动）；本函数管的是**放行**那一跳（用户点「定稿」时，
+ * 这三件必须真在盘上）。两者不是一件事，本票只做后者。
+ *
+ * 判据与交工验货**同一份来源**（`stage-submit gold` 里那三行 `missing` 逐字）：章正文、
+ * `style-spec.md`、检查记录 `audit-NN.md`，「在盘且非空」。⛔ 内容判据（style-spec 五个节标题、
+ * 审计矩阵、正文与分片的一致性）**不在这里**：它们读的是内容与交工请求体，而顺序是「先交工、再放行」
+ * ——交工那一跳已逐项验过；这一跳只防「产物被搬走／删掉之后书还往前走」。
+ *
+ * ⚠️ 它堵的是**静默跳过交工**那条路：跳过 `stage-submit gold`，`styleSpecHash` 永不定格，
+ * 终检那一条对账会**静默不成立**（票 `05` 记的那半处不可逆）。
+ *
+ * @param {string} projectId
+ * @param {object|null} [meta] 调用方手里那份状态；不递就自己读
+ * @returns {string[]} 缺什么（空数组＝就绪）
+ */
+export function goldArtifactProblems(projectId, meta = null) {
+  const state = meta ?? readMeta(projectId)
+  if (state === null) return ['这本书的状态读不出来（账上的 meta 不在）']
+  const gN = goldN(state)
+  const missing = [chapterName(gN), 'style-spec.md', `audit-${String(gN).padStart(2, '0')}.md`].filter((name) => {
+    const target = workFile(projectId, name)
+    return !existsSync(target) || readFileSync(target, 'utf8').trim() === ''
+  })
+  return missing.length > 0 ? [`范例章文件缺失或为空：${missing.join('、')}`] : []
+}
+
+
 async function runPhase2(ctx, projectId, meta) {
   if (meta.demo) {
     // 演示模式：与真实共用确认闸门——产物已存在 → 停 awaiting-explore 等人拍板；内容来自内置回放。
@@ -1632,12 +1809,15 @@ async function runPhase2(ctx, projectId, meta) {
       return 'waiting'
     })
   }
-  // 真实模式：源探查交办给主 AI；产物已存在则等人确认（explore-confirm）后推进。
-  if (existsSync(workFile(projectId, 'explore.md'))) {
-    if (meta.exploreConfirmed === true) {
-      advance(projectId, 2, 3)
-      return 'advanced'
-    }
+  // 真实模式：源探查交办给主 AI。⚠️ 「这一步做完没有」**只看那一份就绪判据**（票 `premature-announce/01`）：
+  // 原先这里只看 `工作区/explore.md` 在不在——主笔一写索引底稿，机器就宣告「材料读完了」，而精读小助手
+  // 还在跑（2026-10-10 实跑：卡早 4 分 29 秒；那一刻点「满意」会把书推过这一段，合并件永久缺位）。
+  // 已经拍过板（`exploreConfirmed`）的书照旧往前推——放行那一跳自己会过同一份闸。
+  if (meta.exploreConfirmed === true) {
+    advance(projectId, 2, 3)
+    return 'advanced'
+  }
+  if (exploreArtifactProblems(projectId, meta).problems.length === 0) {
     ensureStatus(projectId, 'awaiting-explore', EXPLORE_DONE_HINT)
     return 'waiting'
   }
@@ -1750,7 +1930,7 @@ async function runPhase3(ctx, projectId, meta) {
         // 改在改法里写（不拿手里那份旧状态整份写回）：生成要 await，期间账本可能已经动过。
         updateMeta(projectId, (state) => { state.outline = outline })
         // ⚠️ 演示模式写的是**同一份 JSON**（与 `actions/chapters.js` 的真实模式一个文件、一个形状）：
-        // 所以产物判据对两条路是同一条——`work/outline.md` 判 `'inline'`、不开右栏预览
+        // 所以产物判据对两条路是同一条——`工作区/outline.md` 判 `'inline'`、不开右栏预览
         // （票 pipeline-wiring-gaps/09），人读形态是章节安排确认卡与阶段页第 3 阶段的就地折叠清单。
         writeWork(projectId, 'outline.md', JSON.stringify(outline, null, 2))
       })
@@ -1780,7 +1960,7 @@ async function runPhase3(ctx, projectId, meta) {
 /** 真实模式：最佳范例章交办给主 AI（金标准，全书基准）；演示模式：回放生成（共用 awaiting-gold 闸门）。 */
 async function runPhase4(ctx, projectId, meta) {
   const gn = goldN(meta)
-  if (existsSync(workFile(projectId, `chapter-${String(gn).padStart(2, '0')}.md`))) {
+  if (existsSync(workFile(projectId, chapterName(gn)))) {
     // 已写好：必须用户确认后才进全章写作（awaiting-gold）。真实与演示共用同一块（原逐字节相同）。
     ensureStatus(projectId, 'awaiting-gold', '📖 最佳范例章写好了，请在工作台查看：满意点「✅ 满意，继续写全书」，不满意点「❌ 重写」。')
     return 'waiting'
@@ -1794,7 +1974,7 @@ async function runPhase4(ctx, projectId, meta) {
         redoNote: meta.goldRedoNote ?? '',
       })
       writeWork(projectId, 'style-spec.md', result.styleSpec)
-      writeWork(projectId, `chapter-${String(gn).padStart(2, '0')}.md`, result.chapter)
+      writeWork(projectId, chapterName(gn), result.chapter)
       writeWork(projectId, `audit-${String(gn).padStart(2, '0')}.md`, JSON.stringify(result.audit, null, 2))
       if (result.audit?.passed === false) {
         appendEvent(projectId, 'textbook/hint', { text: '最佳范例章检查发现待完善项，已随章记录，可在交付前查看。' })
@@ -1824,7 +2004,7 @@ async function demoWriteChapters(ctx, projectId, meta) {
   const audits = []
   for (let index = 0; index < chapters.length; index += 1) {
     const n = index + 1
-    const file = `chapter-${String(n).padStart(2, '0')}.md`
+    const file = chapterName(n)
     const chapterPath = workFile(projectId, file)
     if (existsSync(chapterPath)) {
       const auditPath = workFile(projectId, `audit-${String(n).padStart(2, '0')}.md`)
@@ -1890,7 +2070,7 @@ async function demoMergeBook(ctx, projectId, meta) {
   try {
     const merged = await generateContent(runtime, 'merge', {
       chapters: (meta.outline?.chapters ?? [{ title: '第1章' }]).map((chapter, index) => {
-        const file = `chapter-${String(index + 1).padStart(2, '0')}.md`
+        const file = chapterName(index + 1)
         return {
           n: index + 1,
           title: chapter.title ?? `第${index + 1}章`,
@@ -1945,7 +2125,14 @@ async function runPhase5(ctx, projectId, meta) {
   // 账本只有 1 条章级完成事件」也一路进了过目 → 合并 → 交付。老书某章没交工就重新走既有逐章交工。
   const allDone = chapters.length > 0 && chapters.every((_chapter, index) => chapterDone(projectId, index + 1))
   if (allDone) {
-    if (!existsSync(workFile(projectId, 'book.md'))) {
+    // ⚠️ 「机器已合并」**只认当前账本里的交工事实**（票 walkthrough-2026-10/10 裁决 A）。
+    // 回退（快照）会把 `timeline.jsonl` 换回快照那一刻（ADR-0016 决策 3 的明文例外），而
+    // **回退不删产物文件**——`book.md` 照旧在盘上。原先这里只看 `existsSync(book.md)`，于是
+    // 回退到「交办合并之前」之后：机器看见旧书还在 ⇒ 直接 `advance(5,6)` 跳过合并，
+    // 「合并成书」这一步再也点不动，成品变成 AI 手拼——「机器 100% 保真拼装」这条契约在回退
+    // 路径上被绕过（真机账本 seq 107–113 的实录）。现在盘上有 `book.md` **且**当前账本里有
+    // 一条合并交工，才算「机器已合并」；否则照常走全章过目闸门 → 交办合并（重拼由机器做）。
+    if (!existsSync(workFile(projectId, 'book.md')) || !mergeSubmitRecorded(projectId)) {
       // 全章过目闸门（真实模式）：所有章写完先请人过目，不自动合并（F18）。
       if (meta.status !== 'awaiting-chapters-review' && meta.chaptersReviewed !== true && meta.demo !== true) {
         updateMeta(projectId, (state) => { state.status = 'awaiting-chapters-review' })
@@ -2080,7 +2267,7 @@ const CHAPTER_HEADING_RE = /^第\s*[0-9一二三四五六七八九十百零两]+
  * 「🚧 常见误区」按 6 个字符算，混过了「≥6 字才参与判重」那道闸，于是每章都有的
  * 板块名被判成「重复标题」拦交付（三本真书实测 27 / 12 / 1 处，见 ADR-0008 修订 2026-09-30）。
  */
-export function headingKey(text) {
+function headingKey(text) {
   return String(text).replace(/[^\p{L}\p{N}]/gu, '')
 }
 
@@ -2121,7 +2308,7 @@ async function runPhase6(ctx, projectId, meta) {
     const checks = runQualityChecks(projectId)
     updateMeta(projectId, (state) => { state.finalChecks = checks })
     appendEvent(projectId, 'textbook/quality', { checks })
-    appendEvent(projectId, 'textbook/agent-end', { label: '最后检查（质量门）', outcome: 'ok', path: 'work/book.md' }, Date.now() - startedAt)
+    appendEvent(projectId, 'textbook/agent-end', { label: '最后检查（质量门）', outcome: 'ok', ...artifactDataForStage('final') }, Date.now() - startedAt)
     ensureStatus(projectId, 'awaiting-final-approval', FINAL_CHECK_DONE_HINT)
     return 'waiting'
   }
@@ -2139,7 +2326,7 @@ function specFingerprint(projectId) {
  * 票 12 · ①：**机器替 AI 记「它改了机器契约」这一笔**（落账侧检测）。
  *
  * 病（2026-09-29 真机走查）：范例章 22:57:09 定稿、指纹 `1e117f928b674fc7` 定格，
- * **`work/style-spec.md` 在 88 分钟后的 00:25:22 被改写**——而这 88 分钟里第 1–12 章全部照**旧版**落盘。
+ * **`工作区/style-spec.md` 在 88 分钟后的 00:25:22 被改写**——而这 88 分钟里第 1–12 章全部照**旧版**落盘。
  * 机器**有**判据（终检那一次对账），但它：① 拦在最后一刻、② 拦错了对象（说的是「你的报告要补一句声明」，
  * 不是「你那 12 章是照一份已经作废的契约写的」）、③ **账本里一个字都没有**。
  *
@@ -2164,7 +2351,7 @@ function noteStyleSpecChange(projectId) {
   try { now = specFingerprint(projectId) } catch { /* 文件不在/读不到：to 记 null，那也是一次变更 */ }
   if (now === frozen) return false
   if ((meta.styleSpecSeen ?? frozen) === now) return false
-  const chapters = (meta.outline?.chapters ?? []).filter((_c, i) => existsSync(workFile(projectId, `chapter-${String(i + 1).padStart(2, '0')}.md`))).length
+  const chapters = (meta.outline?.chapters ?? []).filter((_c, i) => existsSync(workFile(projectId, chapterName(i + 1)))).length
   appendEvent(projectId, 'textbook/style-spec-change', { from: frozen, to: now, chapters })
   updateMeta(projectId, (state) => { state.styleSpecSeen = now })
   return true
@@ -2225,16 +2412,16 @@ function runQualityChecks(projectId) {
     }
     return approved.has('1') && approved.has('2') && approved.has('3')
   })()
-  // 票 15②（票 06 的 Answer 第 2 条）：成品文件齐全**真数既有产物清单**——`work/book.md` ＋ 每章
-  // `work/chapter-NN.md`（清单从 meta.outline 读，不硬编码章数）。缺项即 ok:false（other 豁免仍可放行）。
+  // 票 15②（票 06 的 Answer 第 2 条）：成品文件齐全**真数既有产物清单**——`工作区/book.md` ＋ 每章
+  // `工作区/chapter-NN.md`（清单从 meta.outline 读，不硬编码章数）。缺项即 ok:false（other 豁免仍可放行）。
   // 按**硬闸门**的强度做：runQualityChecks 的结论在终检交工处是「全过才交付」，恒真项等于这道闸门少一格。
   // 清单**绝不许含** `preface.md` / `progress.md`：演示通道不写它们，含了就是给 demo 判假（判据按
   // demo 的确定性产物清单校准，不给 demo 开豁免）。
   const requiredArtifacts = [
-    { rel: 'work/book.md', path: bookPath },
+    { rel: '工作区/book.md', path: bookPath },
     ...(meta?.outline?.chapters ?? []).map((_chapter, index) => {
       const { chapterPath } = chapterArtifacts(projectId, index + 1)
-      return { rel: `work/chapter-${String(index + 1).padStart(2, '0')}.md`, path: chapterPath }
+      return { rel: chapterRel(index + 1), path: chapterPath }
     }),
   ]
   const missingArtifacts = requiredArtifacts.filter((item) => !existsSync(item.path) || readFileSync(item.path, 'utf8').trim() === '')
@@ -2522,34 +2709,97 @@ function kick(ctx, projectId) {
 }
 
 
-function sendJson(res, status, value) {
-  // 元数据批量落盘边界：任何 HTTP 响应前把待写 project.json 同步写盘，
-  // 外部读者（工作台/测试直读）始终看到最新状态（与旧同步写语义一致）。
-  flushMeta()
-  const body = JSON.stringify(value)
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-  })
-  res.end(body)
-}
-
-
 /**
- * 方法论文本过长时截断（交办说明里嵌，避免刷爆 AI 上下文）。
+ * 注入面（票 02 两层合并）：**注入什么由 `disclose` 决定 ＋ 一页纸常驻 ＋ 状态迁移→节注入表 ＋ 指针兜底**。
  *
- * 票 subagent-guidance/09：`audit-and-testing.md` 有四节（§八/§十/§十一/§十二）**整节落在
- * cap 之外**——成因是「往文档末尾加节」这个做法本身在持续挤掉前面的节，不是一次性事故。
- * 这里**不抬 cap**（省上下文这条约束已被 9000 证明有效），改为**按阶段定向注入**（见
- * `METHODOLOGY_TAIL_BY_STAGE` 与 `withTailSections`）。
+ * ① `disclose`（产物清单那一列，**唯一判据** · ADR-0031「给下游票的接口清单 → 票 02」）：
+ *    注入件集合＝`manifestRowsFor(shape)` 里 `disclose !== 'never'` 的切片，
+ *    **每份一行登记（一句话 ＋ 路径）**。`pointer` 给一行 ＋ 精确路径；`inline` 的正文常驻
+ *    （今天**只有工具纪律 §九 那一页纸**）；`never` 一个字都不给（今天＝模式卡那一族）。
+ *    ⚠️ 「什么时候给」**不在 `disclose` 里**（`CONTEXT.md`「disclose」词条明写）——那是下面那张表。
+ * ② `METHODOLOGY_ONEPAGE` —— 每份共用文档一行「管什么＋何时需要」（那一行**就是**登记行本身）。
+ * ③ `STAGE_STATE_INJECTIONS` —— **触发取状态迁移、不取阶段**：键取 `stageStateOf()` 的 `reason`
+ *    （`artifact`／`stale`／`review`／`submit`／`null`＝全齐），取值域**就是那四档**，
+ *    `reason → 四档` 的映射由 `domain-rules.STAGE_STATE_BY_REASON` 单点持有（**本层不重述四档**）。
+ *    另有三条**仓库事件**行（用户驳回／暂停且还有小助手在跑／进入审计动作）——它们不是状态迁移，
+ *    但同样是仓库可读的事实，与本文件既有的 `deepRedo`／`userFeedback`／`occupancyLine` 同构。
+ * ④ 指针兜底 —— 精确路径＋节号（沿用旧 `clipMethodology` 第三参那种形态），
+ *    事件没接住时 AI 自救；节号从源文自己的 `##` 标题派生，台账不会与正文漂移。
  *
- * 截断提示语**必须带可点路径**：原来只写「需要全文可再读插件 resources/ 目录」，
- * AI 得先 glob 才知道文件在哪——那正是「靠指针自救」这个绕路成立的原因之一。
+ * Q3 退役记账：这里原先是 `clipMethodology`（cap 9000）＋ `METHODOLOGY_TAIL_BY_STAGE` ＋
+ * `withTailSections` 一整套。**当初为什么定**（票 subagent-guidance/09）：`audit-and-testing.md`
+ * 有四节整节落在 cap 之外，而「省上下文」这条约束已被 9000 证明有效；指针曾掩盖交付缺失，
+ * 所以不敢只留指针。**现在为什么改**（grilling Q7'(c)）：指针的病在**触发**不在**存在**——
+ * 「需要时」的判定粒度停在「哪个阶段」，同一份 9000 字头重复进 gold/chapters/final 三份 brief。
+ * 事件表把触发变成接线，AI 不必自觉判断；省上下文这条约束本身不变，机制细化。
+ *
+ * ⚠️ 本层只负责「交出去的在不在」；主笔**读没读**注入节、时机赶没赶上动作，归真机层（票 07）。
  */
-function clipMethodology(text, cap = 9000, rel = null) {
-  const clean = String(text ?? '').trim()
-  if (clean.length <= cap) return clean
-  return `${clean.slice(0, cap)}\n…（方法论过长已截断${rel === null ? '，需要全文可再读插件 resources/ 目录' : `；全文 ${rel}`}）`
+const AUDIT_DOC = 'references/audit-and-testing.md'
+/**
+ * 章级审计的**派发模板**（rel，不含 `resources/` 前缀）——写完整本那一跳要交给审计小助手填的那一份。
+ * 票 `chapter-audit-orchestration/03`：这一跳改由编排脚本驱动之后，派发正文仍按这份模板填，
+ * 所以脚本那一跳的指路与交办说明里的指路**同出一源**（同一枚常量，不手抄第二个字面量）。
+ */
+const AUDIT_TEMPLATE_REL = 'references/subagent-prompts/audit-agent-prompt.md'
+/**
+ * 编排脚本骨架（rel）——铺章那一跳的审计改由宿主 `workflow` 工具驱动，主笔照这一份填脚本。
+ * 它是**给主笔读的形状出处**，不是给成员读的派发模板（成员由脚本派、拿不到方法论挂载面）。
+ */
+const CHAPTER_AUDIT_SCRIPT_REL = 'references/workflow-scripts/chapter-audit.md'
+/** 形状契约那份（四份设计产物的字段契约与铁律）——「产物不在 → 给形状」与「全齐 → 给下一阶段的形状」都指它。 */
+const SHAPE_DOC = 'references/file-contracts.md'
+
+/** 一页纸常驻：一行 = 一份共用方法论文档（`管什么` ＋ `何时需要`）。键 = 挂载面那份 rel。 */
+export const METHODOLOGY_ONEPAGE = {
+  'SKILL.md': {
+    what: '全流程导航 ＋ 两条 Iron Law（设计先行／先写金标准再并行铺章）',
+    when: '不确定这一步该干什么、或要卡 Iron Law 判据时',
+  },
+  'references/source-material.md': {
+    what: '源材料通读法 ＋ 源角色标签（哪一份当权威源）',
+    when: '判断某份材料能不能当真相源、要抽结构或定知识点时',
+  },
+  'references/patterns/README.md': {
+    what: '21 张教学板块模式卡（卡本身判 never、不进上下文，经这一行按教学问题翻）',
+    when: '关卡②选教学模式、给每章设计板块结构时',
+  },
+  'references/file-contracts.md': {
+    what: '四份设计产物的字段契约与铁律',
+    when: '写 工作区/style-spec.md 等四件设计产物、或交工前自查格式时',
+  },
+  [AUDIT_DOC]: {
+    what: '审校与教学测试细则（§九 工具纪律全文常驻）',
+    when: '派小助手、派审计小助手、暂停、收到驳回意见时',
+  },
+  'references/delivery-checklist.md': {
+    what: '交付前 6 项质量门',
+    when: '最后检查与交付前逐条过',
+  },
+  'references/subagent-prompts/writing-agent-prompt.md': {
+    what: '写作小助手派发模板',
+    when: '派写作小助手时按模板填',
+  },
+  [AUDIT_TEMPLATE_REL]: {
+    what: '章级审计小助手派发模板',
+    when: '派章级审计小助手时按模板填',
+  },
+  'references/subagent-prompts/cross-audit-prompt.md': {
+    what: '跨章审计小助手派发模板（四项判定词只住那一份）',
+    when: '合并前派跨章审计小助手时按模板填',
+  },
+  [CHAPTER_AUDIT_SCRIPT_REL]: {
+    what: '编排脚本骨架：一次运行只审一章',
+    when: '审计那一跳要调 workflow 时',
+  },
+  'references/subagent-prompts/gold-audit-prompt.md': {
+    what: '金标准章审计模板（必读矩阵＋一致性核对）',
+    when: '派范例章审计小助手时按模板填',
+  },
+  'references/invariants.md': {
+    what: '不变量底线 I/H 编号（按路线选节，见上面那段）',
+    when: '拿不准某条底线适用哪条路线时',
+  },
 }
 
 /**
@@ -2577,41 +2827,534 @@ export function pickSections(text, headings) {
   return picked.join('\n\n')
 }
 
+// ── 这一步的产物行（阶段 → 它该产出的那几件）───────────────────────────────────
+//
+// 它有两个消费者，**只有这一份**：
+//   ① `stepStageState()` —— 环节状态的四项事实从这些产物行在盘上的实况取（ADR-0031 决策 4
+//      「粒度挂在产物行上，环节状态是它上面的聚合」）；
+//   ② `dispatchRegistryFor()` —— 派发面「该产出的登记行」按这张表与清单的 `producer` 列对出来。
+// `chapters` 是 `per-chapter`：它一次写 N 章，没有单文件（形状先例＝`artifactDataForStage` 的注释）。
+const PER_CHAPTER = 'per-chapter'
 /**
- * 票 subagent-guidance/09：把按阶段选中的小节**追加**在截断件之后。
- *
- * **口径（追加 vs 替换）：选追加。** 理由有两条，缺一不可：
- * ① 主文仍以「已截断」收尾、追加块自己交代来由——AI 的读法是「主文被截了，下面这几节是
- *    按阶段补进来的」，两句同时成立；选替换会让截断提示语与追加块互相矛盾。
- * ② 主文长度与「§九 工具纪律完整存活在截线以内」那条契约**一个字不用改**。
+ * 章正文的**清单行路径**（`工作区/chapter-{n}.md`）——从 `domain-rules` 的族声明**派生**，
+ * 不在这里手抄一遍（手抄的路径改名时会静默失配）。
  */
-function withTailSections(clipped, rel, headings) {
-  const sections = pickSections(resourceText(rel), headings)
-  if (sections === '') return clipped
-  return [
-    clipped,
-    '',
-    `↓ 以下 ${headings.length} 节按本阶段定向补进来（它们在 resources/${rel} 里排在 9000 字截断线之后，`,
-    `   主文被截断时整节都读不到，所以单独附在后面）：`,
-    '',
-    sections,
-  ].join('\n')
+const CHAPTER_ROW_PATH = BOOK_PRODUCT_FAMILIES.find((family) => family.family === '章节正文').path
+/**
+ * 章正文**分片**的清单行路径（`工作区/分片/*`）——票 `walkthrough-2026-10/02` 之后**小助手产出的
+ * 就是这一族**（章正文那一族改成 `machine` 产出：机器按分片拼）。同款：从族声明派生，不手抄。
+ */
+const CHAPTER_SHARD_ROW_PATH = BOOK_PRODUCT_FAMILIES.find((family) => family.family === '章节正文分片').path
+const STEP_OUTPUT_ROWS = {
+  explore: ['工作区/explore.md', '工作区/knowledge-map.json'],
+  // 关卡的「产物」是用户拍板的裁决，不是 AI 写出来的文件——所以这一步没有产物行，
+  // 状态恒为「产物不在」，注入的正是形状契约那一节（缺件时最该给的就是形状）。
+  gate: [],
+  outline: ['工作区/outline.md'],
+  gold: [CHAPTER_ROW_PATH],
+  chapters: PER_CHAPTER,
+  // 合并的产物是机器拼装的成品书 + AI 前言；跨章审计报告是**检查记录**（`machine` 件，不进清单）。
+  merge: ['工作区/book.md', '工作区/preface.md'],
+  final: ['工作区/book.md'],
 }
 
 /**
- * 票 subagent-guidance/09：**按阶段**定向注入 audit-and-testing.md 的四节尾节。
- *
- * 映射依据是每节各自治理的事，不是「哪个阶段就全给」：
- * - `## 八、`  审计后回填约束文件（防复发）→ 审计**产出结论**的阶段才有意义
- * - `## 十、`  三阶段递进审计：§十 自己写死了三轮的归属——第一轮章级审计＝gold·chapters、
- *            第二轮全书结构与索引审计＝merge、第三轮修订复审＝**final**
- * - `## 十一、` 小助手中途引导 → 派小助手干活的阶段
- * - `## 十二、` 暂停时收回小助手 → 触发只有「暂停」一个，跟着会派小助手的阶段走
- *
- * ⚠️ `final` 今天**根本不读 audit-and-testing.md**（它只挂 delivery-checklist.md），
- * 所以 §十 第三轮「终检 AI 自查 + 机器硬检查质量门」这条判据此前从未进过终检 brief——
- * 定向注入顺带补上这一格。
+ * 这一步**派出的小助手**要产出的登记行（派发面「该产出的」那一半）。
+ * ⚠️ 它与 `STEP_OUTPUT_ROWS` **不是同一张表的两个意思**：那一张是「这一步整体该有的产物」
+ * （环节状态的事实来源），这一张是「派出去的那几路该落哪几件」。
+ * `merge` 那格是空的——跨章审计报告与章审计报告都是**检查记录**（`productOpenMode` 判 `'machine'`，
+ * 按 ADR-0031 决策 3 不进产物清单），所以「该产出的」在清单里真的没有它们；这不是漏，是判出来的事实。
  */
+const STEP_SUB_OUTPUT_ROWS = {
+  // ⚠️ 票 `premature-announce/02` 修了两处**声明面的错**（此前它们被 `dispatchRegistryFor` 的 `pick`
+  // **静默过滤**掉，一声不响）：
+  //   ① `工作区/reading-{n}.md` —— 早已随票 11 并进 `工作区/细目/*`（退役注记在
+  //      `domain-rules.js` 的「细目」族那一行），留在这里就是一条**死条目**；
+  //   ② `工作区/knowledge-map-{n}.md` —— 扩展名写错了，分片是 `.json`（族声明
+  //      `domain-rules.js` 的「知识地图分片」那一行是同一份契约）。
+  // ⇒ 现在这一行与产物清单**逐字对得上**，「该产出的」里终于有那一片分片。
+  // 读数与判据见 `declaredStageRowsMissingFromManifest()`（静默过滤变成可断言的读数）。
+  explore: ['工作区/细目/*', '工作区/knowledge-map-{n}.json'],
+  gate: [],
+  outline: [],
+  // ⚠️ 票 `walkthrough-2026-10/02`：执笔小助手产出的是**分片**（章正文由机器拼，那一族改成
+  // `machine` 产出）——这两格因此指向分片族。判据（`test-tool-discipline.mjs`）按清单的
+  // `producer` 列与这张表对账，指错了当场红。
+  gold: [CHAPTER_SHARD_ROW_PATH],
+  chapters: [CHAPTER_SHARD_ROW_PATH],
+  merge: [],
+  final: ['工作区/报告/*'],
+}
+
+/**
+ * 这一步的**输入**产物行（派发面「该读的登记行」里那些书内产物）。
+ * 共用文档那一半（`scope === 'reference'` 的规范行）由挂载面直接给，不在这张表里。
+ */
+const STEP_INPUT_ROWS = {
+  explore: [],
+  gate: [],
+  outline: ['工作区/knowledge-map.json', '工作区/explore.md'],
+  gold: ['工作区/outline.md'],
+  chapters: ['工作区/style-spec.md', '工作区/outline.md'],
+  merge: [chapterRel],
+  final: ['工作区/book.md'],
+}
+
+/**
+ * 「产物不在 → 给形状」时，`file-contracts.md` 的**哪一节**对应这一步（票面 8 行表第 1 行）。
+ * 逐档带理由：`file-contracts.md` 的四节正好对应四类设计产物，「这一步的形状」与
+ * 「下一阶段的形状」走同一张表（判据 `test-tool-discipline.mjs` 断它是**闭的**：每个阶段都有一格）。
+ */
+const SHAPE_HEADING_BY_STAGE = {
+  explore: '## 源材料索引与源定位（有源场景）',   // 这一步产出的两件都是源材料索引
+  gate: '## 章节骨架（大纲与架构）',            // 关卡③要定的正是骨架与体量
+  outline: '## 章节骨架（大纲与架构）',
+  gold: '## 写作规范 · 契约与铁律',
+  chapters: '## 风格与语法',                    // 铺章逐章落实的是风格线那一份
+  merge: '## 写作规范 · 契约与铁律',             // 成书与前言仍受铁律约束
+  final: '## 写作规范 · 契约与铁律',
+}
+
+/** 阶段的推进次序（供「全齐 → 下一阶段的形状」用；末一个没有下一站，原地不动）。 */
+const NEXT_STAGE = { explore: 'outline', gate: 'outline', outline: 'gold', gold: 'chapters', chapters: 'merge', merge: 'final', final: 'final' }
+
+/**
+ * 票 02 第 1 层：**注入什么由 `disclose` 决定**（ADR-0031 给票 02 的接口清单）。
+ *
+ * 一份共用文档在交办说明里能以什么形态出现，**只由产物清单那一列决定**，本函数是那一份的读法：
+ * · `never`   → 返回 `null`，**不许挂**（一个字都不给，连指针都没有）。
+ * · `pointer` → 那一行 ＋ 精确路径（正文自己回读）。
+ * · `inline`  → 那一页正文常驻（今天只有工具纪律 §九）。
+ * 清单里查不到的行**同样判 never**：挂载面宁可少给，也不许自己另定一套规矩——
+ * 「代码里另有一份名单」正是票 02 第 1 层要消灭的那个病（`CONTEXT.md`「disclose」词条的 Avoid 行）。
+ *
+ * @param {string} rel 挂载面用的 rel（`references/…` 或 `SKILL.md`）
+ * @returns {string|null} `disclose` 三档之一；不可注入时为 `null`
+ */
+export function discloseOf(rel) {
+  const row = SPEC_ROW_BY_PATH[rel] ?? SPEC_ROW_BY_PATH[`resources/${rel}`] ?? null
+  const disclose = row?.disclose ?? null
+  return DISCLOSE_MODES.includes(disclose) ? disclose : null
+}
+
+/**
+ * 这一步该给 AI 的几行登记——**注入件集合＝清单里 `disclose` 命中的切片**（用户故事 13／19）。
+ * 每一行 = 一句话（那一页纸行）＋ 路径（`resources/…`）＋ 它自己在清单里的那一档 `disclose`。
+ *
+ * @param {string[]} rels 这一步挂载面交出去的每份共用文档的 rel
+ * @returns {{path: string, rel: string, role: string, disclose: string}[]}
+ */
+function registryRowsFor(rels) {
+  const rows = []
+  for (const rel of rels) {
+    const disclose = discloseOf(rel)
+    if (disclose === null) continue
+    const row = SPEC_ROW_BY_PATH[rel] ?? SPEC_ROW_BY_PATH[`resources/${rel}`]
+    rows.push({ path: `resources/${rel}`, rel, role: row.role, disclose })
+  }
+  return rows
+}
+
+/**
+ * 派发面也走**同一张表**（票 02 实现决策 11 · ADR-0031 接口清单第四行）：
+ * 给「你该读的登记行 ＋ 你该产出的登记行」，**不再靠派发措辞**。
+ *
+ * 病根（实测）：explore 交办原文写「要求详细摘录」，于是三份精读报告 22,106／39,321／52,770
+ * 字符全文回灌，而另一本书**同一机制**三个精读全落盘——同一个机制、两本书两种表现，全凭自觉。
+ * 派发面拿到的两组清单**全部来自产物清单**（共用文档那一半＝本页挂载面；书内产物那一半＝上面两张表），
+ * 所以「该读什么／该产出什么」不再由主笔的措辞决定。
+ *
+ * @param {string} stage
+ * @param {object} meta
+ * @param {string[]} mountedRels 这一步挂载面交出去的共用文档（它们就是「该读的」共用那一半）
+ */
+function dispatchRegistryFor(stage, meta, mountedRels) {
+  const live = new Map(manifestRowsFor({ hasSources: okMaterialShards(meta.sources).length > 0 })
+    .filter((row) => row.disclose !== 'never')
+    .map((row) => [row.path, row]))
+  const pick = (paths, producer) => [...new Set(paths)]
+    .map((p) => live.get(p))
+    .filter((row) => row !== undefined && (producer === null || row.producer === producer))
+    .map((row) => ({ path: row.path, role: row.role, disclose: row.disclose }))
+  return {
+    read: [...pick(STEP_INPUT_ROWS[stage] ?? [], null), ...registryRowsFor(mountedRels)],
+    produce: pick([...(STEP_OUTPUT_ROWS[stage] === PER_CHAPTER ? [CHAPTER_ROW_PATH] : STEP_OUTPUT_ROWS[stage] ?? []), ...(STEP_SUB_OUTPUT_ROWS[stage] ?? [])], 'subagent'),
+  }
+}
+
+/**
+ * **声明面自检**（票 `premature-announce/02`）：上面两张派发表里**落不到产物清单**的条目 ＋ 扫到的条数。
+ *
+ * 病：`dispatchRegistryFor` 的 `pick` 对认不出的路径**静默过滤**（`.filter((row) => row !== undefined)`），
+ * 于是声明面里躺着退役的、或名字写错的条目也一声不响——实测两处（见 `STEP_SUB_OUTPUT_ROWS` 的注记：
+ * `工作区/reading-{n}.md` 已随票 11 退役、`工作区/knowledge-map-{n}.md` 扩展名写错）。
+ * ⇒ 本函数把「静默」变成**读数**：判据断 `missing` 为空、`checked` 有下限（防空跑）。
+ *
+ * ⚠️ **我的枚举面比现实窄在哪里**：它只对账**声明面 ↔ 产物清单**（两张表 ↔ 由
+ * `BOOK_PRODUCT_FAMILIES` 派生的清单行，`hasSources` 两种形状都试，任一对得上就算活）；
+ * **不判**「清单本身是不是交工验货要的那几件」——那一层是另一件事（A/B 与交工验货 C 的粒度差，
+ * 例如检查记录成对挂在那份正文上，不由这里列）。
+ *
+ * @returns {{missing: string[], checked: number}}
+ */
+export function declaredStageRowsMissingFromManifest() {
+  const liveByVariant = [false, true].map((hasSources) => new Set(manifestRowsFor({ hasSources }).map((row) => row.path)))
+  const missing = []
+  let checked = 0
+  for (const [stage, rows] of Object.entries(STEP_OUTPUT_ROWS)) {
+    const list = rows === PER_CHAPTER ? [CHAPTER_ROW_PATH] : rows ?? []
+    for (const path of [...new Set([...list, ...(STEP_SUB_OUTPUT_ROWS[stage] ?? [])])]) {
+      checked += 1
+      if (!liveByVariant.some((live) => live.has(path))) missing.push(`${stage}: ${path}`)
+    }
+  }
+  return { missing, checked }
+}
+
+/**
+ * 票 02 第 1 层 + 第 2 层：**状态迁移 → 节注入表**（票面那张 8 行表，逐行落成数据）。
+ *
+ * ⚠️ **键取 `stageStateOf()` 的 `reason`，不取阶段名，也不另立一份事件清单**：
+ * `reason` 的取值域就是既有四档判据那四个词（`artifact`／`stale`／`review`／`submit`），
+ * `null` 是「全齐」（= `ready`）。`reason → 四档` 的映射由 `domain-rules.STAGE_STATE_BY_REASON`
+ * 单点持有——**本表不重述四档**（重述就是「两个数字打架」的原材料）。
+ * 三条 `event` 行（用户驳回／暂停且还有小助手在跑／进入审计动作）不是状态迁移，
+ * 是同样可读的仓库事件，判定口径与本文件既有的 `deepRedo`／`userFeedback`／`occupancyLine` 同一形状：
+ * 读得到事实才成立，读不到就不成立（宁可少给，不编）。
+ *
+ * 逐行理由（哪一行为什么是这一节）：
+ * · `产物不在`   → 该产物的**形状契约**（`file-contracts.md` 对应节）：缺件时最该给的是形状。
+ * · `旧审计过期` → §十（那里面写死了「第三轮：修订复审」＝改稿之后必须重审）＋「须重新审计」口径。
+ * · `抽查意见未清零` → §十一；「交工前三查」的落点是 §11.5「pending 不得交工」＋人设第 15 条，
+ *   **不另写一份**。
+ * · `机器交工未过` → `delivery-checklist.md` 的分工那一节（交工那一档的质量门住在交付清单里）。
+ * · `用户驳回` → §十一（重做优先唤醒原来那个小助手，不另派）＋风格线处置那段。
+ * · `暂停且还有小助手在跑` → §十二（§十二 自己的触发就只有「暂停」这一个，判据是那个数）。
+ * · `进入审计动作` → §十 ＋ 审计派发模板（今天已有，保留；按仓库事实选一份，不两份都塞）。
+ * · `全齐` → 下一阶段的**形状**（只给形状，不给方法论）。
+ */
+export const STAGE_STATE_INJECTIONS = [
+  {
+    id: '产物不在',
+    why: '这一步该有的产物还不在盘上（artifact）——缺件时最该给的是它的形状契约',
+    reason: 'artifact',
+    inject: (meta) => [{ rel: SHAPE_DOC, headings: [SHAPE_HEADING_BY_STAGE[meta.pendingStage] ?? SHAPE_HEADING_BY_STAGE.outline] }],
+  },
+  {
+    id: '旧审计过期',
+    why: '产物被改过 ⇒ 旧审计过期（stale）：审的是旧稿的那份不算数，须重新审计',
+    reason: 'stale',
+    inject: () => [{ rel: AUDIT_DOC, headings: ['## 十、'] }],
+  },
+  {
+    id: '抽查意见未清零',
+    why: '产物与审计对得上但人工确认没到位（review）——§11.5「pending 不得交工」就是三查那一半',
+    reason: 'review',
+    inject: () => [{ rel: AUDIT_DOC, headings: ['## 十一、'] }],
+  },
+  {
+    id: '机器交工未过',
+    why: '没有机器记下的交工（submit）——交工那一档的质量门住在交付清单里',
+    reason: 'submit',
+    inject: () => [{ rel: 'references/delivery-checklist.md', headings: ['## Phase 6 的三步分工'] }],
+  },
+  {
+    id: '用户驳回',
+    why: '关卡方案被用户驳回或终检 approved=false——重做优先唤醒原来那个小助手，不另派',
+    event: '用户驳回',
+    inject: () => [{ rel: AUDIT_DOC, headings: ['## 十一、'] }],
+  },
+  {
+    id: '暂停且还有小助手在跑',
+    why: '用户点过暂停且 pause.subagentsRunning > 0——§十二 自己的触发就只有这一个',
+    event: '暂停且还有小助手在跑',
+    inject: () => [{ rel: AUDIT_DOC, headings: ['## 十二、'] }],
+  },
+  {
+    id: '进入审计动作',
+    why: '本阶段进入审计动作（派审计小助手／产出审计结论）——§十 自己写死了三轮归属',
+    event: '进入审计动作',
+    inject: () => [
+      { rel: AUDIT_DOC, headings: ['## 十、'] },
+      // 审计派发模板跟着「进入审计」这一条走，且**按仓库事实选一份**（票 02 落地记录的原话：
+      // 「按仓库事实选一份，不两份都塞」）。⚠️ 那一刀在票 05 落进这张表之后**没有回头改**，
+      // 于是 merge / final 也拿到了**章级**那份——它教的是落 `工作区/audit-<NN>.md` 严格 JSON、
+      // ≤2K token，而 merge 真要派的 `cross-audit-prompt.md` 落 `工作区/audit-cross.md`、final 真要派的
+      // 是 §10.b 的五份分查形状（**各自落 `工作区/报告/`**）：**同一份 brief 里并存两套互相打架的派发口径**。
+      // 口径（与 `test-tool-discipline.mjs` 的 `AUDIT_DISPATCH_BY_STAGE` 同一份形状，逐档对账）：
+      //   gold     → 金标准章审计那份（审「范例章兑现了设计没有」）
+      //   chapters → 章级审计那份（审「这一章写对没有」）
+      //   merge    → 跨章审计那份（审「这本书拼起来对不对」，落盘点是 audit-cross）
+      //   final    → **不带任何章级模板**：它派的是 §10.b 那五份分查，那一节的形状由 §十 自己承载。
+      { rel: 'references/subagent-prompts/cross-audit-prompt.md', full: true, when: (meta) => meta.pendingStage === 'merge' },
+      { rel: AUDIT_TEMPLATE_REL, full: true, when: (meta) => meta.pendingStage === 'chapters' },
+      { rel: 'references/subagent-prompts/gold-audit-prompt.md', full: true, when: (meta) => meta.pendingStage === 'gold' },
+    ],
+  },
+  {
+    id: '全齐可推进',
+    why: '产物／审计／人工确认都到位（reason 为 null，即全齐）——只给下一阶段的形状，不给方法论',
+    reason: null,
+    inject: (meta) => {
+      const next = NEXT_STAGE[meta.pendingStage] ?? meta.pendingStage
+      return [{ rel: SHAPE_DOC, headings: [SHAPE_HEADING_BY_STAGE[next] ?? SHAPE_HEADING_BY_STAGE.outline] }]
+    },
+  },
+]
+
+/** 本轮有没有用户意见/风格线变化在案（抽查意见／用户留言／金标准意见——都读 meta，不读措辞）。 */
+function userFeedbackInFlight(meta) {
+  const count = (list, keep) => (Array.isArray(list) ? list.filter(keep).length : 0)
+  return count(meta.pendingReviews, (r) => r.status !== 'revoked')
+    + count(meta.pendingInterventions, (i) => i.status === 'pending')
+    + count(meta.goldOpinions, (o) => o.status === 'pending' || o.status === 'sent')
+}
+
+/** 本轮是不是「用户驳回触发的重做」（关卡方案被驳回，或终检给了改进意见）。 */
+function gateRejectedInFlight(meta, facts) {
+  if (facts?.gateRejected === true) return true
+  return typeof meta.finalRedoNote === 'string' && meta.finalRedoNote.trim() !== ''
+}
+
+/** 「进入审计动作」：本阶段会派审计小助手或产出审计结论（**选哪一份模板是另一件事**，在 inject 里分档）。 */
+const AUDIT_ACTION_STAGES = new Set(['gold', 'chapters', 'merge', 'final'])
+/** 会派小助手的阶段——派发面那一半（两组登记行）只对这几个阶段有意义。 */
+const SUBAGENT_DISPATCH_STAGES = new Set(['explore', 'gold', 'chapters', 'merge', 'final'])
+
+/**
+ * 本轮触发了哪几行（`{state, reason}` ＋ meta ＋ 已知事实 → 触发行 id 集合）。
+ * 状态行按 `reason` 精确匹配（**不按阶段名匹配**），事件行读仓库可读的事实。
+ */
+function firedInjectionIds(state, meta, facts) {
+  const events = {
+    用户驳回: gateRejectedInFlight(meta, facts),
+    暂停且还有小助手在跑: meta.pause != null && (meta.pause.subagentsRunning ?? 0) > 0,
+    进入审计动作: AUDIT_ACTION_STAGES.has(meta.pendingStage),
+  }
+  const fired = new Set()
+  for (const row of STAGE_STATE_INJECTIONS) {
+    if (row.event !== undefined) {
+      if (events[row.event] === true) fired.add(row.id)
+      continue
+    }
+    if (state.reason === row.reason) fired.add(row.id)
+  }
+  return fired
+}
+
+/**
+ * 单个产物行的四项事实 → 四档状态（走的是 `stageStateOf` 那**一个**函数，本层不判档）。
+ *
+ * ⚠️ **「交工」那一项由调用方喂进来，本层不许自己算第二份**：`stepStageState` 那一层已经在算
+ * `stepSubmitRecorded`，在这里重算就是本程要消灭的「两个数字打架」。它曾被**写死**成 `false`，
+ * 而 `stageStateOf` 在 `submitRecorded !== true` 时**必返 reason** ⇒ 调用方的循环**必在首轮 return**
+ * ⇒ 末尾那行聚合**不可达** ⇒ 非 `PER_CHAPTER` 工序（explore／outline／gold／merge／final）的
+ * **`ready` 档结构性不可达**（ADR-0031 决策 4 补记 · 票 `15`）。
+ *
+ * ⚠️ **配对检查件经 `domain-rules.pairedAuditRels` 取，不在这里按文件名猜**：那一份是
+ * 「这一行**结构上**有没有配对检查件」的单一出处，**空数组＝没有**（`stale` 档对那几族不适用）。
+ * 它曾在这里就地做「产物文件名 → 检查件名」的字符串变换（`chapter-NN.md` → `audit-NN.md`），
+ * 对不带章号前缀的行那次变换**原样返回** ⇒ 拿**自己**当自己的检查件 ⇒ 自比较恒真 ⇒ `stale` 恒不可达。
+ *
+ * @param {string} stage 分段机器键（配对检查件那张表按它分档）
+ * @param {string} productRel 产物行的书夹相对形状（规范形状）
+ * @param {boolean} reviewPending 本轮有没有未处置的意见
+ * @param {boolean} submitRecorded 账本里有没有这一步的机器交工证据（**调用方算好的那一枚**）
+ */
+function stepRowState(projectId, stage, productRel, reviewPending, submitRecorded) {
+  const productPath = workFile(projectId, basename(productRel))
+  const auditRels = pairedAuditRels(stage, productRel)
+  return stageStateOf({
+    artifactPresent: existsSync(productPath),
+    // ⚠️ **三档判法，缺的那一档不许蒙过去**：
+    //   · 配对清单为空 ⇒ 结构上就没有配对检查件 ⇒ 这一项**不适用**，不判旧；
+    //   · 配对清单非空而**缺一份** ⇒ 判不成立（把「还没审」与「审的是旧稿」并成一档 `stale`，
+    //     因为注入面那一行给的口径就是「须重新审计」——那正是缺一份时该说的话）；
+    //   · 齐了且没有一份比产物旧 ⇒ 审的就是当前这份。
+    //   「读不出」当成「有问题」会让正常的一步凭空被拦，但**更坏**的是反过来：
+    //   拿自己当自己的检查件，于是 `stale` 那一档永远绿灯。
+    auditFresh: auditRels.length === 0 || auditRels.every((rel) => {
+      const auditPath = bookRelOnDisk(projectId, rel)
+      return existsSync(auditPath) && !chapterAuditOlderThanChapter(productPath, auditPath)
+    }),
+    reviewPending,
+    submitRecorded,
+  })
+}
+
+/** 账本里有没有「这一步交工通过」的机器证据（只认已存在的写入点，不按文件存在兜底——同 `chapterHasSubmitEvent` 的纪律）。 */
+function stepSubmitRecorded(projectId, meta) {  const stage = meta.pendingStage ?? null
+  if (stage === null) return false
+  if (readEvents(projectId).some((event) => event.type === 'textbook/agent-end'
+    && event.data?.outcome === 'ok' && event.data?.stage === stage)) return true
+  if (stage === 'chapters') {
+    const chapters = meta.outline?.chapters ?? []
+    return chapters.length > 0 && chapters.every((_chapter, index) => chapterHasSubmitEvent(projectId, index + 1, meta))
+  }
+  return false
+}
+
+/**
+ * 账本里有没有「**合并**这一步交工通过」的机器证据（票 `walkthrough-2026-10/10` 裁决 A）。
+ *
+ * **以当前账本为准**：回退（快照）会把 `timeline.jsonl` 换回快照那一刻（ADR-0016 决策 3），
+ * 而**回退不删产物文件** ⇒「盘上有 `book.md`」不等于「机器合并过」。跳步闸门（`runPhase5`）
+ * 读的就是这一枚：没有它就不许跳过合并。
+ *
+ * ⚠️ **判据取 label 前缀，不取 `data.stage`**：`agent-end` **不带 `stage`**（只有 `stage-start`
+ * 带，见 `handoff()`），按 `data.stage` 认是**结构性不命中**。前缀取自 `stageLabel('merge')`
+ * 这一份现成的机器身份词，**不另写一个 label 字面量**——写入点（`actions/chapters.js` 的
+ * `stage-submit merge`）那条 label 正是以「合并成书」开头。同款先例：`chapterHasSubmitEvent`
+ * 按 label 里的章号认章级交工、`goldVersions` 按 label 认范例章。
+ */
+function mergeSubmitRecorded(projectId) {
+  const prefix = stageLabel('merge')
+  return readEvents(projectId).some((event) => event.type === 'textbook/agent-end'
+    && event.data?.outcome === 'ok'
+    && String(event.data?.label ?? '').startsWith(prefix))
+}
+
+/**
+ * 这一步的**环节状态**——`stageStateOf` 的**调用方**，不是第二份判据（ADR-0031 决策 4 第一条纪律）。
+ *
+ * 四项事实从 `STEP_OUTPUT_ROWS` 指的产物行在盘上的实况取；章一级逐章那一档**直接复用既有的
+ * `chapterStageState`**（它自己已经调 `stageStateOf`），本函数不重写任何一条判据。
+ *
+ * **聚合口径**：一步有多个产物行时，取**顺序里第一个没齐的**那一行的状态；全齐才报 `ready`
+ * （「第一个没齐的」是阅读顺序，不是另立一份严重度排序——那样就成了第二份判据）。
+ *
+ * @param {string} projectId
+ * @param {object} [meta]
+ * @returns {{state: string, reason: string|null}}
+ */
+export function stepStageState(projectId, meta = null) {
+  const current = meta ?? readMeta(projectId) ?? {}
+  const reviewPending = userFeedbackInFlight(current) > 0
+  const outputs = STEP_OUTPUT_ROWS[current.pendingStage] ?? []
+  const submitRecorded = stepSubmitRecorded(projectId, current)
+  if (outputs === PER_CHAPTER) {
+    const chapters = current.outline?.chapters ?? []
+    for (let index = 0; index < chapters.length; index += 1) {
+      const state = chapterStageState(projectId, index + 1, current)
+      if (state.reason !== null) return state
+    }
+    return stageStateOf({ artifactPresent: chapters.length > 0, auditFresh: true, reviewPending, submitRecorded })
+  }
+  for (const rel of outputs) {
+    const state = stepRowState(projectId, current.pendingStage, rel === CHAPTER_ROW_PATH ? chapterRel(goldN(current)) : rel, reviewPending, submitRecorded)
+    if (state.reason !== null) return state
+  }
+  return stageStateOf({ artifactPresent: outputs.length > 0, auditFresh: true, reviewPending, submitRecorded })
+}
+
+
+/** 三层挂载的块首（与判据里那几个哨兵同形——判据按**内容**定位，不按行号）。 */
+const ONEPAGER_HEAD = '↓ 方法论一页纸（本 brief 挂的每份共用文档：管什么 ＋ 何时需要）'
+const RESIDENT_HEAD = '↓ 常驻全文块（普适短规则，不按事件增减）'
+const EVENT_HEAD = '↓ 状态迁移注入节（本轮命中的状态迁移 → 对应小节）'
+const POINTER_HEAD = '↓ 指针兜底（上面没给的，按精确路径＋节号自己回读）'
+/**
+ * 方法论**根目录**那一行——本机绝对路径，运行时从 `content-lib.RESOURCES_DIR` 算，**不写死**
+ * （写死＝`.scratch/dsh-contract-drift/issues/03` 那个病：代码里出现某台机器的路径）。
+ *
+ * 为什么必须有（票 `.scratch/methodology-root-pointer/01`）：下面每一条指针都是 `resources/…`
+ * 形态的**包内相对路径**，而宿主把相对路径按**会话 cwd** 解析（`dsh-tool-fs` 的 `sessionResolveOptions`）。
+ * 开发机上会话工作区恰好就是仓根、仓根又躺着几本书，所以 `resources/…` 凑巧命中、看不出病；
+ * 换台机器（工作区 ≠ 插件包）就一条都读不到，只剩搜盘一条路。
+ *
+ * ⚠️ 它是**指针面**的一部分，不是新增的正文面——ADR-0030 决策 3（一页纸 ＋ 状态迁移→节 ＋ 指针兜底）
+ * 那条取舍一个字没动：本票只补「发给 AI 的路径缺一个解析基准」。
+ */
+const RESOURCE_ROOT_LINE = `   - 方法论根目录（本机绝对路径，下面每条 resources/… 都相对它）：${RESOURCES_DIR}`
+
+/** 一页纸的一行：路径＋管什么＋何时需要。没登记的文档明说「未登记」（由判据盯住不许出现）。 */
+function onepagerLine(rel) {
+  const entry = METHODOLOGY_ONEPAGE[rel]
+  if (entry === undefined) return `- resources/${rel}：共用方法论文档（本仓未登记它管什么——补登记，或别挂它）`
+  return `- resources/${rel}：${entry.what}｜何时需要：${entry.when}`
+}
+
+/**
+ * 指针兜底里的节号台账：**从源文自己的 `##` 标题派生**，标题改名时台账跟着走（不会漂）。
+ *
+ * ⚠️ 票 02 第 1 层起它对**每一份**挂载文档派生（原先只有 `audit-and-testing.md` 有）——
+ * 因为「状态迁移→节」那张表现在也指向 `file-contracts.md` 与 `delivery-checklist.md`，
+ * 它们的节号如果不在指针上，那几节就成了死路。**读不出标题就只给路径**（不给空气节号）。
+ */
+function pointerMarks(rel) {
+  const text = resourceSafeText(rel)
+  if (text === null) return []
+  return [...text.matchAll(/^## (.+)$/gm)]
+    .map((match) => `§${match[1].split(/[、（]/)[0]}`)
+}
+
+/** `resourceText` 的安全形：文件读不出来就返回 `null`（挂载面不许因为一份文档坏掉就炸掉整份 brief）。 */
+function resourceSafeText(rel) {
+  try { return resourceText(rel) } catch { return null }
+}
+
+/**
+ * 把三层挂到 brief 上（票 02）。返回拼好的正文；顺带把状态迁移注入的文档**登记进挂载闭包**，
+ * 让 `brief.methodologyDocs` 仍然是「这一份实际挂了哪几份」的完整事实。
+ *
+ * ⚠️ **`never` 的行挂不进来**（`register` 与事件注入两处都直接跳过）：注入件集合由清单那一列说了算，
+ * 挂载面不拥有「这一份例外」的权力——那正是本票第 1 层要消灭的「代码另定一套规矩」。
+ */
+function mountMethodology(base, meta, facts, state, onepagerLines, docs) {
+  const register = (rel) => {
+    if (discloseOf(rel) === null) return
+    if (!docs.includes(rel)) {
+      docs.push(rel)
+      if (!onepagerLines.some((line) => line.startsWith(`- resources/${rel}：`))) onepagerLines.push(onepagerLine(rel))
+    }
+  }
+  // ① 一页纸（阶段分支里 mtl() 攒的行）——**在状态迁移循环之后才拼**：注入的文档也要补一行。
+  const resident = [RESIDENT_HEAD, pickSections(resourceText(AUDIT_DOC), ['## 九、'])].join('\n')
+  // ② 状态迁移→节：触发取 `stageStateOf` 的 `reason` ＋ 仓库事件；没命中的节不进 brief
+  const fired = firedInjectionIds(state, meta, facts)
+  const notes = []
+  const bodies = []
+  for (const row of STAGE_STATE_INJECTIONS) {
+    if (!fired.has(row.id)) continue
+    const marks = []
+    for (const wiring of row.inject(meta, facts)) {
+      if (typeof wiring.when === 'function' && wiring.when(meta, facts) !== true) continue
+      if (discloseOf(wiring.rel) === null) continue
+      register(wiring.rel)
+      if (wiring.full === true) {
+        marks.push(`${wiring.rel} 全文`)
+        bodies.push(resourceText(wiring.rel).trim())
+        continue
+      }
+      const section = pickSections(resourceText(wiring.rel), wiring.headings)
+      if (section === '') continue
+      marks.push(`${wiring.rel} ${wiring.headings.map((h) => `§${h.replace(/^## /, '')}`).join('、')}`)
+      bodies.push(section)
+    }
+    if (marks.length > 0) notes.push(`   · 状态迁移「${row.id}」（${row.why}）→ ${marks.join('；')}`)
+  }
+  const events = notes.length === 0 ? '' : [
+    EVENT_HEAD,
+    ...notes,
+    '   （触发是仓库状态判定的，不是你自觉判断；没被触发的节一律走下面的指针兜底。）',
+    '',
+    bodies.join('\n\n'),
+  ].join('\n')
+  // ③ 指针兜底：精确路径＋节号，事件没接住时 AI 自救（rot 护栏：读一次 → 落产物 → 留摘要）
+  const pointer = [
+    POINTER_HEAD,
+    RESOURCE_ROOT_LINE,
+    ...[...new Set(docs)].map((rel) => {
+      const marks = pointerMarks(rel)
+      return `   - resources/${rel}${marks.length > 0 ? `：${marks.join('／')}` : ''}`
+    }),
+    '   （只回读当前这一步真要用到的小节，读完把结论落进产物——别把整份读进来。）',
+  ].join('\n')
+  // ① 一页纸（阶段分支里 mtl() 攒的行）＋常驻全文块（工具纪律 §九：短小普适，不按事件增减）
+  const head = [ONEPAGER_HEAD, ...onepagerLines].join('\n')
+  return [base, head, resident, events, pointer].filter((part) => typeof part === 'string' && part.trim() !== '').join('\n\n')
+}
+
 /**
  * 票 22（2026-09-29 用户裁决）：`references/invariants.md` **挂进 brief，但按 route 选节**。
  *
@@ -2619,10 +3362,9 @@ function withTailSections(clipped, rel, headings) {
  * ① 挂在哪几个阶段 = 下面 `INVARIANTS_STAGES` / `INVARIANTS_GATES` 两张表
  *    （`gold`/`merge`/`final` 已有 `delivery-checklist.md` 覆盖 I8，**不重复挂**）。
  * ② 按 `meta.route` 选节 = 下面这张**按 route 的节清单表**。
- *    ⚠️ **它不是 `METHODOLOGY_TAIL_BY_STAGE`**：那张是「同一份文件被 9000 截断线切掉之后按阶段补尾节」，
- *    由 `test-tool-discipline.mjs` 逐字反解比对，**一个字都不许动**。本表是「另一份文件按路线选节」，两回事。
- * ③ **不许用 `mtlWithTail`**：`invariants.md` 只有约 3000 字符、**从不截断**，对它调 `mtlWithTail`
- *    = 整份原文 ＋ 重复的小节 ＋ 一句**事实错误的**横幅（「以下 N 节排在 9000 字截断线之后」）。
+ *    ⚠️ **它不是事件→节注入表**：那张选的是 audit-and-testing.md 的小节（按事件触发），
+ *    本表选的是 invariants.md 的小节（按路线），两回事，别互相推导。
+ * ③ invariants.md **只按 route 选节**，不参与事件注入：它只有约 3000 字符、不需要按事件增减。
  *
  * 节号口径来自 `invariants.md` 自己的四段结构：I1-I4 跨路线 / I5-I6 仅 blueprint /
  * H1-H3 仅 human / I7-I9 过程（两条路线同等适用）。`writing-agent-prompt.md:17` 的占位符映射与此同源。
@@ -2636,13 +3378,6 @@ const INVARIANTS_STAGES = new Set(['explore', 'chapters'])
 /** 关卡阶段挂哪几关：②（教学模式选型）与 ③（整书教学架构）——最需要底线的两个设计路口。 */
 const INVARIANTS_GATES = new Set(['2', '3'])
 
-const METHODOLOGY_TAIL_BY_STAGE = {
-  gold: ['## 八、', '## 十、', '## 十一、', '## 十二、'],
-  chapters: ['## 八、', '## 十、', '## 十一、', '## 十二、'],
-  merge: ['## 八、', '## 十、', '## 十一、', '## 十二、'],
-  final: ['## 十、', '## 十二、'],
-}
-
 
 /** 给主 AI 的阶段任务说明（stage-brief 返回；全部中文、人话）。 */
 function buildStageBrief(projectId) {
@@ -2650,58 +3385,123 @@ function buildStageBrief(projectId) {
   const stage = meta?.pendingStage ?? null
   const gate = meta?.pendingGate ?? null
   if (stage === null) return null
-  const sources = (meta.sources ?? [])
-    .filter((source) => source.converted === true)
-    .map((source) => ({ file: source.file, role: source.role ?? '', md: `sources-md/${source.md}` }))
+  // 票 03 · 「几路精读」这个数**只数一次**：连同它对应的材料条目一起从
+  // `okMaterialShards`（`src/domain-rules.js`）取，`brief.materials` 与 `brief.parallelReads`
+  // 都由**这一份**驱动。⚠️ 之前 `sources` 在这里私滤一遍 `convertedState(source) === 'ok'`，
+  // `parallelReads[].n` 却来自 `okMaterialNumbers`（另一处过滤），而 `file/role/md` 靠
+  // `sources[i]` **位置**对齐——两处口径哪天一分叉（一边认 `'ok'`、一边只认老书布尔 `true`），
+  // 就是「派出去的文件名和材料对不上号」而没人看得懂。**位置对齐这个洞随本票一起消失。**
+  const okShards = okMaterialShards(meta.sources)
+  // 票 21 · pipeline-wiring-gaps：落到 brief 的 role 只认 `domain-rules.ROLES` 这一套 canonical
+  // 五分类——空串（老代码 `?? ''` 兜底写法的产物）、字段缺失、老书遗留的越界值**一律不发**：
+  // 发出去就等于告诉 AI「这份材料有一个五分类之外的角色」，AI 只能自己编一个（同一份 brief 注入的
+  // source-material.md 里那张七类表正等着被抄——本票的病根）。键整体缺席（undefined 经 sendJson 的
+  // JSON.stringify 消失），不是发个空串。⚠️ 归一与 `okMaterialShards` 的转换状态过滤是**两道独立的闸**
+  // （判据见 test-brief-role-taxonomy.mjs：越界值源转完了照样不发，转没完的源归那道闸管）。
+  // `sources` 在下面只算这一次、explore/gate/outline/gold 四个阶段的 `brief.materials` 都由它派生，
+  // 归一在单点生效。判据强度对齐：`brief.materials[].role ⊆ ROLES` 是无条件不变量，所以这里按
+  // `ROLES.includes` 收口，而不是只挡空串。
+  const briefRole = (role) => (ROLES.includes(role) ? role : undefined)
+  const sources = okShards.map(({ source }) => ({ file: source.file, role: briefRole(source.role), md: `材料/转换稿/${source.md}` }))
   /** 本 brief 实际挂了哪几份共用方法论文档——**记下来随 brief 一起交出去**（`brief.methodologyDocs`）。
    *  「哪个阶段挂了哪几份」从此是**生产路径上的一个事实**，不是靠人反解 `engine.js` 源码猜的
    *  （`test-brief-doc-closure.mjs` 的传递闭包断言读的就是这一份）。 */
   const methodologyDocs = []
+  /** 一页纸的行：挂载闭包照旧登记，正文交出去的是那一行摘要（票 02：不再全文内联）。
+   *  ⚠️ **`never` 的行直接不给**——注入件集合由产物清单那一列说了算（`discloseOf`），
+   *  挂载面不拥有例外权；`docs` 也不会记它，所以它连指针兜底都进不去。 */
+  const onepagerLines = []
   const mtl = (rel) => {
+    if (discloseOf(rel) === null) return ''
     methodologyDocs.push(rel)
-    return clipMethodology(resourceText(rel), 9000, rel)
+    onepagerLines.push(onepagerLine(rel))
+    return onepagerLine(rel)
   }
   // 票 22：按 route 选节的不变量底线（**只对挂了的那几个阶段追加**）。
   const attachInvariants = (stageKey) => {
     if (!invariantsAttached(stageKey, gate)) return
+    // ⚠️ 同一条 `never` 纪律：这张表按 route 选节是票 22 的口径，但**挂不挂**仍然由
+    // 产物清单那一列说了算（今天它是 `pointer`；哪天判 never，这里就整块不给）。
+    if (discloseOf('references/invariants.md') === null) return
     const headings = INVARIANTS_SECTIONS_BY_ROUTE[meta.route ?? 'blueprint'] ?? INVARIANTS_SECTIONS_BY_ROUTE['blueprint']
     const sections = pickSections(resourceText('references/invariants.md'), headings)
     if (sections === '') return
     // 路线名照 meta.route 逐字取（'blueprint' / 'human-readable'），不另造一套译法——
     // 这里写错会让 AI 看到「适用本路线（blueprint）」却拿到 human 的小节。
     const routeLabel = INVARIANTS_SECTIONS_BY_ROUTE[meta.route] === undefined ? 'blueprint' : meta.route
-    brief.methodology = `${brief.methodology ?? ''}\n\n↓ 以下是不变量底线里**适用本路线（${routeLabel}）**的 ${headings.length} 节（resources/references/invariants.md 的其余小节属于另一条路线，不适用本书；本文件从不截断，所以没有「排在截断线之后」那回事）：\n\n${sections}`
+    brief.methodology = `${brief.methodology ?? ''}\n\n↓ 以下是不变量底线里**适用本路线（${routeLabel}）**的 ${headings.length} 节（resources/references/invariants.md 的其余小节属于另一条路线，不适用本书）：\n\n${sections}`
     methodologyDocs.push('references/invariants.md')
+    onepagerLines.push(onepagerLine('references/invariants.md'))
   }
   /** 某份 brief 该不该挂不变量底线（阶段 + 关卡两维；`gold`/`merge`/`final` 一律不挂）。 */
   function invariantsAttached(stageKey, gateKey) {
     if (stageKey === 'gate') return INVARIANTS_GATES.has(String(gateKey))
     return INVARIANTS_STAGES.has(stageKey)
   }
-  /** 票 09：某个阶段该补哪几节尾节（没登记的阶段就是没有，不补）。 */
-  const mtlWithTail = (rel, stage) => {
-    const headings = METHODOLOGY_TAIL_BY_STAGE[stage] ?? []
-    return withTailSections(mtl(rel), rel, headings)
-  }
+  /** 关卡当前盘上真实裁决（驳回重做事件的判据之一；只在这一步读一次，别在两处各读一遍）。 */
+  const gateDecision = stage === 'gate' ? foldGate(projectId) : null
   const brief = {
     stage, gate, label: stageLabel(stage, gate), dir: projectDir(projectId),
+    // 方法论根目录也走**结构化字段**（不只是指针块里那一行）：派发行要原样转给小助手，
+    // 从字段取比从散文里抠路径可靠。票 `.scratch/methodology-root-pointer/01`。
+    resourceRoot: RESOURCES_DIR,
     project: { name: meta.name ?? '', goal: meta.goal ?? '', route: meta.route ?? 'blueprint', science: meta.science === true },
   }
   switch (stage) {
     case 'explore': {
-      brief.task = '统筹通读全部转换后的教材（sources 里每本给出准确的 sources-md/ 子路径与 full.md）：可自己读，也可把每本分头派给小助手通读（干净上下文、要求详细摘录结构/角色/权威层级/教学线索），你逐份核对后亲自汇总整理出「源材料索引」与「结构化知识地图」。'
+      // 票 03 · ADR-0030 决策 2（改派）／4（模板层）：这一段的病是**回灌**——交办原文
+      // 「要求详细摘录」把 3 份精读报告（22,106／39,321／52,770 字符）全灌回了主笔上下文。
+      // 真机已经证明另一条路可行（有个精读小助手自发「细目落盘 38,030 字符＋摘要回灌」），
+      // 但**全凭自觉**——这一支把它变成结构：精读派读是主路径，主笔的活是派发／合并／抽查。
+      // 票 `context-budget/17`：合并件改**机器拼装**，主笔只交书级两件——口径改了，交办不给新说法
+      // AI 就仍会去抄一遍（那 24,025 字符的 write 正是本票要永久省掉的那一笔）。
+      brief.task = '统筹读完全部转换后的材料（每份的 材料/转换稿/ 子路径与 full.md 见 materials）：**按 parallelReads 逐份派精读小助手**（每份一个干净上下文，各路可并发），每路按 resources/references/subagent-prompts/close-reading-prompt.md 派，自己落下该材料的细目与知识地图分片。你只做三件：派发与抽查一两路、产出书级的 teachingFocus 与 chapterSuggestion、以及亲自汇总写 工作区/explore.md（那份索引的必做小节见 outputs，机器交工时逐项验）——**合并件由机器按分片拼装**（交工那一刻它按键拼成 工作区/knowledge-map.json），**不要自己再合并一遍**，那正是要砍掉的那份重复搬运。'
+      // 票 07 · pipeline-wiring-gaps：explore.md 的必做小节与机器验货是**同一份词表**
+      //（`domain-rules.exploreDepthTier`——任务说明与机器判据各写一份词表就会漂，漂了就是永远 400）。
+      // 档位按当次转换完成的源数量分（同一次数出来的口径：分片/细目义务、parallelReads、这里的档位）。
+      const exploreTier = exploreDepthTier(meta.sources)
+      const exploreTierLine = exploreTier.count === 0
+        ? '本次没有转换完成的源（无源书）：必做小节为空，索引写本次实际做的事。'
+        : `本次转换完成的源共 ${exploreTier.count} 份 → 探查深度档「${exploreTier.tier}」，explore.md 必做小节：${exploreTier.required.join('、')}（小节名**逐字**含这些词，机器交工时按名字逐项验，缺哪项当场 400 点名哪项）。`
       brief.outputs = [
-        // 票 brief-word-limits/01：主次分工写明——**细颗粒度进 knowledge-map.json，explore.md 只做给人读的索引**。
+        // 票 brief-word-limits/01：主次分工写明——**细颗粒度落细目目录与知识地图 JSON，explore.md 只做给人读的索引**。
         // 原式两句并列，AI 看不出主次，于是「用户要更多细节」与「≤1200 字」互相顶。
-        'work/explore.md —— **给人读的索引**（纯 Markdown，篇幅从简）：材料清单（文件名+角色）、结构观察（摸源结构、角色标签、权威层级）、教学线索（知识点密度、重点难点、可用素材）；约 1200 汉字（软目标，机器不验，超一点没关系）。**细颗粒度的东西（逐条摘录、知识点细目）一律进 work/knowledge-map.json，不要塞进这个索引**——它只做索引。',
-        'work/knowledge-map.json —— 结构化知识地图（严格 JSON，**细颗粒度内容的主落点**）：materials:[{num,sections:[{title,summary,keywords}]}]、knowledgePoints:[{id,title,source,summary,difficulty}]、teachingFocus:[string]（重点/难点各一句人话，纯字符串，如「重点：分数运算」「难点：应用题建模」）、chapterSuggestion:[{title,source,points}]（4-10 章）。',
+        // ⚠️ 票 11 改掉了后半句：它原先逐字写着「细颗粒度的东西（逐条摘录、知识点细目）**一律进
+        // 工作区/knowledge-map.json**」——那是**与落盘正面冲突**的一句话（spec 决策 14 点名要改的那句）：
+        // 逐条摘录与知识点细目落的是**每个精读小助手自己的细目文件**，知识地图装的是结构化键与聚合，
+        // 两件不是同一件，把细目导向 JSON 等于让主笔把五份全文手抄进一个文件里（实测最贵的那次搬运）。
+        // 票 07 · pipeline-wiring-gaps：内容清单从「散文三类」换成与机器验货同一套词的必做小节
+        //（源材料方法论 source-material.md §二第一层的产物：源文件简码表、真相校准、全书通用锚点；
+        // 完整版再加每源结构探查与高频陷阱预判——三档分法见那份文档，档位与必做项由
+        // exploreDepthTier 按源数给）。
+        // ⚠️ 票 17 · ADR-0023：那份方法论简码表里的「地位」列**不在**这份索引里要求——
+        // 逐源声明是结构化字段 materials[].standing（见下一条 outputs），散文里不再有第二份
+        // 地位/权威式的要求（两处说法必然漂，结构化的那份是唯一出口；这个退役了的词
+        // 在本文件里一个字都不许再出现——test-material-standing.mjs 的契约面判据盯着）。
+        `工作区/explore.md —— **给人读的索引**（纯 Markdown，篇幅从简）。${exploreTierLine}每节下写真东西：源文件简码表要有 简码/路径/定位 三列，真相校准写实际翻源发现的「看起来完整其实是碎片」的坑，全书通用锚点写跨章共享的源定位（公式汇总表/原则全文位置/术语表位置）。约 1200 汉字（软目标，机器不验字数、验上述必做小节，超一点没关系）。**逐条摘录与知识点细目落 ${DETAIL_DIR_REL}/（每份材料一份，由那个精读小助手自己落盘，见 parallelReads[].reading），结构化的知识点键落 工作区/knowledge-map.json**——两份都不要塞进这个索引，它只做索引。`,
+        `工作区/knowledge-map.json —— 结构化知识地图（严格 JSON，**结构化键与书级聚合的主落点**，格式与以前那份一模一样）：materials:[{num,standing,sections:[{title,summary,keywords}]}]（standing＝**材料分量声明**，逐源一句人话写清这份材料在什么问题上说了算、在什么问题上不算数；本次转换完成的源只有一份时可省——单本教材的声明无信息量；角色为「真题」的源必须写，且要显式写明有无配套答案与评分标准）、knowledgePoints:[{id,title,source,summary,difficulty}]（difficulty 只填 基础/重点/难点/进阶 四档之一——取值域登记在案，出域值机器交工时会归一化写回并告知用户；id 可选，机器不依赖它）、teachingFocus:[string]（重点/难点各一句人话，纯字符串，如「重点：分数运算」「难点：应用题建模」）、chapterSuggestion:[{title,source,points}]（${CHAPTER_SUGGESTION_MIN}-${CHAPTER_SUGGESTION_MAX} 章，契约区间，机器交工时验）。**materials 与 knowledgePoints 由各精读小助手各写各的分片（工作区/knowledge-map-NN.json），合并件由机器按分片序号按键拼装、交工那一刻落盘——你不用交它；你只交 teachingFocus 与 chapterSuggestion 这两件书级聚合（交工参数同名），它们是这一份里唯一只有你能产出的部分。逐条摘录与细目正文不在这里——它们在各路自己的细目文件里。**`,
       ]
       brief.materials = sources
+      // 票 03 · Q6 已锁的落点：**逐份列并发单元**（形状先例＝ chapters 的 `remaining` 逐章表）。
+      // 每格把那一份材料的两件落盘路径写死，派发时照抄即可——「并行」从散文里的「材料多时可以」
+      // 变成表里的一行行事实。序号与材料条目**成对取自 `okMaterialShards`**（与
+      // `stage-submit(explore)` 的验货同一份口径，且**不再按 `sources[i]` 位置对齐**）。
+      brief.parallelReads = okShards.map(({ n, source }, i) => ({
+        n,
+        file: sources[i].file,
+        role: sources[i].role,
+        md: sources[i].md,
+        reading: readingRel(n),
+        shard: knowledgeShardRel(n),
+      }))
       brief.methodology = `${mtl('SKILL.md')}\n\n${mtl('references/source-material.md')}`
       brief.hints = [
-        '这是全书设计的基准，宁可多读、多整理，不要只读开头。材料多时可直接把每本分头派给小助手通读（每本一个干净上下文，要求详细摘录结构/角色/权威层级/教学线索），你逐份核对后亲自汇总整理。',
+        '这是全书设计的基准，宁可多读、多整理，不要只读开头。',
+        `精读派发模板：resources/references/subagent-prompts/close-reading-prompt.md —— 派每一路之前照它填（细目落盘 ${readingRel('NN')}、分片落盘 ${knowledgeShardRel('NN')}、最终回复 ≤2K token：结论／结构一句话／质量信号／落盘路径）。按 parallelReads 逐份派、可并发；材料多时不要退回「自己从头读到尾再汇总」，那会把同一份内容搬两遍。`,
+        `精读小助手的回灌要短：细目写在它自己的 ${readingRel('NN')} 里，带回来的是浓缩结论＋条目级点名＋落盘路径。**别让它把整份摘录灌回你的上下文**——那是你这一段最大的开销来源。`,
+        `合并步：合并由机器做——交工那一刻它按 NN 把各份 ${knowledgeShardRel('NN')} 的 materials/knowledgePoints 拼成 工作区/knowledge-map.json；你只交书级的 teachingFocus 与 chapterSuggestion（stage-submit 的同名参数）。抽查请读分片或细目的**片段**，不要整份搬进上下文。`,
         '无论自己读还是派小助手，文件操作用文件工具（read/write/edit/glob/grep），别用 shell（工具纪律见 audit-and-testing.md §九，跨平台一致）。',
-        '写完用 stage-submit（stage=explore）交工；机器会验 work/explore.md 与 work/knowledge-map.json 的格式，验过后等用户确认。',
+        `写完用 stage-submit（stage=explore）交工，带 teachingFocus 与 chapterSuggestion；机器会验 工作区/explore.md（必做小节逐项在场，见 outputs）、每份转换完成的材料各有一片 ${knowledgeShardRel('NN')} 与一份 ${readingRel('NN')}、材料分量声明（≥2 份源时逐源要有 standing，真题源还要显式表态有无配套答案与评分标准——单源可省）、以及 chapterSuggestion 的章数（${CHAPTER_SUGGESTION_MIN}-${CHAPTER_SUGGESTION_MAX} 章），缺一件当场 400 并逐件点名；合并件由机器拼，不用你交。`,
       ]
       // 重做时：把用户的不满意见带给 AI（这是重做唯一的改进方向）。
       const redoNote = meta.exploreRedoNote
@@ -2712,19 +3512,27 @@ function buildStageBrief(projectId) {
       break
     }
     case 'gate': {
-      const current = foldGate(projectId)
+      const current = gateDecision
       brief.task = `手工起草${gateHuman(gate)}的设计方案，用人话向用户解释，等用户拍板。`
       brief.gateLabel = GATE_LABELS[gate] ?? ''
       brief.gateTask = {
         '1': '分析源材料并推导学习目标：这本书让学习者最终能做到什么？最大的坑是什么？',
         '2': '教学模式选型与板块语法：读了模式库，考虑过哪些、拒绝哪些、为什么；选中的模式解决本书哪个教学问题；设计每章的板块结构。',
-        '3': '整书教学架构：知识链主线、卷/部划分、逐章骨架表（每章五行：章号/标题/类型/知识链位置/锚定知识点——**第 5 列统一是知识点**，无源书没有知识点清单、那一列改写锚定的源任务或概念）、特殊章、跨章引用机制、附录策略、贯穿案例约定；以及体量设计：整书总字数与预计学时、每章字数区间、依据（材料知识量/学习目标/读者背景），体量须在大白话摘要中呈现。**另有两件在**这一步**就要答、不能拖到写范式章才答**：①本书第一读者是谁（AI 老师 / 人类读者）；②防螺旋铁律的**设计期禁令**——从这一关拍板到写作规范产出之间，不许自行加章/加附录/加机制级板块，真要加等用户走定点修改重新拍板（style-spec 里的「防螺旋铁律」那一项记的是**定稿之后**的回炉规则，两半不是一回事）。',
+        '3': '整书教学架构：知识链主线、卷/部划分、逐章骨架表（每章五行：章号/标题/类型/知识链位置/锚定知识点——**锚定知识点来自知识地图**（探查段合并件 工作区/knowledge-map.json），第 5 列统一是知识点，无源书没有知识点清单、那一列改写锚定的源任务或概念）、特殊章、跨章引用机制、附录策略、贯穿案例约定；以及体量设计：整书总字数与预计学时、每章字数区间、依据（材料知识量/学习目标/读者背景），体量须在大白话摘要中呈现。**另有两件在**这一步**就要答、不能拖到写范式章才答**：①本书第一读者是谁（AI 老师 / 人类读者）；②防螺旋铁律的**设计期禁令**——从这一关拍板到写作规范产出之间，不许自行加章/加附录/加机制级板块，真要加等用户走定点修改重新拍板（style-spec 里的「防螺旋铁律」那一项记的是**定稿之后**的回炉规则，两半不是一回事）。',
       }[String(gate)] ?? ''
+      // 票 `pipeline-wiring-gaps/05`：关卡③ 的骨架表第 5 列要「锚定知识点」，但这一关原先
+      // 既没挂参考件、任务词也不提知识地图（核验报告 verification.md 第 1 条：CONFIRMED）——
+      // 孤儿指令的形状。与 outline 段同形地**两处一起接**：参考件挂 `brief.references`、
+      // 任务词在 gateTask['3'] 里明写「锚定知识点来自知识地图」（判据见 test-gate3-knowledge-map.mjs，
+      // 两处缺一即红）。只在 gate 3 挂：①② 用不到知识地图，不动前两关。
+      if (String(gate) === '3') {
+        brief.references = ['工作区/knowledge-map.json（知识地图）']
+      }
       brief.previousDecision = current === null || current.gate !== gate ? null : {
         version: current.version, status: current.status,
         reasons: current.decision?.reasons ?? [], note: current.decision?.note ?? '',
       }
-      brief.outputs = '方案三段通过 stage-submit（stage=gate）提交：title（一句话标题）/ summary（给用户看的人话摘要，约 300 汉字以内；软目标，机器不验）/ detail（完整方案 Markdown 正文，必须内联全文--禁止写「见文件/proposal-*.md」，用户只在页面上看方案，不会去文件夹翻）。'
+      brief.outputs = '方案三段通过 stage-submit（stage=gate）提交：title（一句话标题）/ summary（给用户看的人话摘要，约 300 汉字以内；软目标，机器不验）/ detail（完整方案 Markdown 正文，必须内联全文--禁止写「见文件/proposal-*.md」，用户只在页面上看方案，不会去文件夹翻）。**正式拍板卡的入参来自真实方案，不许出现测试/占位字样**——三段都填了不等于内容是真的（真出过的一次三段全非空、内容全是占位件）；机器逐字段筛测试/占位词表（「测试标题」「测试摘要」「稍后重发」「占位」「TODO」…），命中当场 400 并点名是哪个词、在哪个字段，纪律见 resources/references/anti-patterns.md 的流程级反模式。'
       brief.materials = sources
       brief.methodology = mtl({
         '1': 'references/source-material.md', '2': 'references/patterns/README.md', '3': 'references/file-contracts.md',
@@ -2742,9 +3550,11 @@ function buildStageBrief(projectId) {
       break
     }
     case 'outline': {
-      brief.task = '基于知识地图与材料结构，设计整书章节骨架：每章明确用哪本材料的哪一部分、覆盖哪些知识点（points，来自知识地图）、建议字数（遵循第 3 次拍板已定的体量设计，不许静默缺省）、体量依据；并标注建议的最佳范例章（goldChapter+理由：哪章最能代表全书风格/结构最完整/材料最充分）。'
+      // 票 `pipeline-wiring-gaps/12`：任务词写明知识点覆盖闸门（票 07 的同一口径：交办与机器验货
+      // 同一套词，AI 与机器都知道交工时验什么）。口径按票 01：title 单键、先规范化、id 不进比对环。
+      brief.task = '基于知识地图与材料结构，设计整书章节骨架：每章明确用哪份材料的哪一部分、覆盖哪些知识点（points，来自知识地图——交工时机器会按 title 逐条比对知识地图（比对前先规范化：去尾部括注/trim/全半角）：知识地图里每条知识点都要被某一章的 points 认领，points 里也不许出现知识地图没有的条目，漏了/多了当场 400 并逐条点名）、建议字数（遵循第 3 次拍板已定的体量设计，不许静默缺省）、体量依据；并标注建议的最佳范例章（goldChapter+理由：哪章最能代表全书风格/结构最完整/材料最充分）。'
       brief.outputs = 'chapters 数组通过 stage-submit（stage=outline）提交：[{title,outline(一句话),source:"资料N：小节或主题",targetWords,points:[知识点…],volumeReason(一句依据)}]（4-10 章），外加 goldChapter（1 基章号）与 goldChapterReason（一句理由）。'
-      brief.references = ['work/knowledge-map.json（知识地图）', 'work/explore.md（探查报告）']
+      brief.references = ['工作区/knowledge-map.json（知识地图）', '工作区/explore.md（探查报告）']
       brief.materials = sources
       brief.methodology = mtl('references/file-contracts.md')
       const outlineRedo = meta.outlineRedoNote
@@ -2757,42 +3567,62 @@ function buildStageBrief(projectId) {
     case 'gold': {
       const gn = goldN(meta)
       const chapterSource = meta.outline?.chapters?.[gn - 1]?.source ?? ''
+      const auditName = `工作区/audit-${String(gn).padStart(2, '0')}.md`
       brief.chapter = gn
       brief.title = meta.outline?.chapters?.[gn - 1]?.title ?? ''
-      brief.task = `亲笔写全书的最佳范例章（第 ${gn} 章，全书基准）：写出写作规范 + 第 ${gn} 章全文 + 四层审计 + 试教（条件触发）。这是全书其余章节要模仿的基准，务必高质量、与教材内容一致。`
+      // 票 `context-budget/04` · ADR-0030 决策 2：**风格源头从主笔挪到执笔小助手**。
+      // 这一段的正文（写作规范 ＋ 范例章）原先由主笔亲笔写 ⇒ 主笔同时是「写的人」和「审的人」，
+      // 而且材料正文要过主笔的手（与 ADR-0030 决策 1「材料不搬运」正面矛盾）。
+      // 现在主笔是**纯协调者**：派发 ＋ 转达用户意见 ＋ 逐条回权威源核实后汇总裁决（裁决权那一半保留）。
+      // ⚠️ 这是**质量模型的变化**、不只是省 token（ADR-0030 后果第一条）：机器层只断接线与形状，
+      //    范例章质量与用户意见闭环的手感是真机层（ADR-0005，票 07）。
+      brief.task = `协调全书的最佳范例章（第 ${gn} 章，全书基准）。这一段的正文不由你写——风格源头单点在执笔小助手那边，你走四步：①派执笔小助手起草（写作规范 ＋ 第 ${gn} 章**分片**，按 \`resources/references/subagent-prompts/gold-writing-agent-prompt.md\` 那份派发模板填必带内容；本章材料小节由它在自己的干净上下文里读）；②**它交稿后先让机器把分片拼成章正文**（workbench_act(action=chapter-assemble, chapter=${gn})）——审计小助手要读的 ${chapterRel(gn)} 就是机器拼出来的那一份；③再派全新上下文的审计小助手（模板与产出形状照旧，结论照旧过 audit-submit）；④读审计报告，**逐条回权威源核实后汇总裁决**（审计员也会误判，不照单全收）；⑤点名条目与用户意见一并回灌给执笔小助手修订（改完分片要**再让机器拼一次**），最后 stage-submit 交工。这是全书其余章节要模仿的基准，务必高质量、与教材内容一致。`
       brief.targetWords = meta.outline?.chapters?.[gn - 1]?.targetWords ?? meta.targetWords ?? 6000
       brief.chapterSource = chapterSource
       brief.outputs = [
         // 票 19：这份契约文本是「审计要查的东西、producer 不许写」那条悬空契约的**生产端**。
-        // 十八项与 `resources/references/subagent-prompts/audit-agent-prompt.md §审计要求`、
-        // `audit-and-testing.md §7.0` 两份审计清单**逐项对齐**；差集断言（`test-contract-gap.mjs`）
-        // 从两侧**解析**出集合来比，本文件里不硬编码第二份清单。
-        // 「N. **名字**」的编号+加粗是**给解析器看的**：改成不带编号的散文，那条断言会立刻空转
-        // （它会报「生产集合解析出 0 项」）。
-        // 版权铁律／字数／frontmatter schema 三项**要求写的是「有意不做 + 理由」**，不是写内容——
-        // 2026-08-18 走查 :73 的原裁是「补产物**或**写明『有意不做』的理由」，仓里有先例。
-        'work/style-spec.md -- 写作规范（十九项契约，**每项都要有一个同名小节**，逐项打钩）：1. **模式选型**（考虑过哪些/拒绝了哪些/为什么；每个模式对应本书哪个教学问题）、2. **章内板块语法**（必含/循环/可选板块的完整语法）、3. **情境钩子写法**、4. **Voice 规则**（正文语言风格：正式程度/术语处理/本书特有禁用词）、5. **量化参考密度**（参考非铁律，本稿回填实测）、6. **深度四维承诺**（四维各用什么板块兑现到什么程度）、7. **最佳范例章写作惯例区**（本稿回填）、8. **防幻觉铁律**（最危险的断言类型/回源到哪/追不到怎么降级）、9. **写作纪律**（一个 agent 写几章/并行度/篇幅约束/排除项）、10. **脚手架标题列表**（交付前拆除用）、11. **本书定位**（一句话说清这本书是什么、给谁用）、12. **读者意识声明**（本书第一读者是谁；**写每一块之前先问自己什么问题**——这半句落在这里，「第一读者是谁」那一半在第 3 次拍板（整书教学架构）的提案里）、13. **章末教学区规范**（板块结构/长度/格式）、14. **frontmatter schema**（需要章级 yaml 就定义字段+校验规则；不需要就逐字声明「本书无章级 frontmatter」）、15. **AI 老师使用方式**（顺序讲/地基章先吃透/按需检索）、16. **防螺旋铁律**（定稿后不许自行加章/附录/机制级板块；确需加由用户走定点修改重新拍板）、17. **多源同级声明**（本书若有两本并行的权威源且说法不同，逐字写出「以哪本为准 ＋ 为什么是它」；冲突先按问题类型四路分派定权威源——定义/原则、操作步骤、考试覆盖范围、敏捷——四路分不出来才用「根真相源 > 教学讲义 > 碎片笔记」那条线性刻度，**考纲是覆盖校验基准、不进那条刻度**）、18. **版权铁律**、19. **字数**。⚠️ **18 与 19 是「有意不做」项**：照 2026-08-18 实书走查的裁决，本仓不设版权声明模板、也**不设任何字数/篇幅闸门**（与「机器永不查字数」的口径一致，超一点没关系）——这两项**必须写下来的是那句「有意不做 + 理由」，不是内容**；14 同理，只能二选一（有 schema / 无 schema），不许留空。',
-        `work/chapter-${String(gn).padStart(2, '0')}.md —— 第 ${gn} 章全文（按 style-spec，含全部板块与答案；约 ${brief.targetWords} 汉字，是写作体量参考、**不是闸门**——机器不验字数，宁可多写不可敷衍）`,
-        `work/audit-${String(gn).padStart(2, '0')}.md —— 审计记录（四层审计 + 试教[条件触发]，严格 JSON：{"passed":true,"issues":[{"level":"错误|警告|提示","text":"具体问题"}]}）`,
+        // 票 `context-budget/04` 起它**随 producer 搬到执笔派发模板**（生产端跟着生产端的人走），
+        // engine 这一侧只留落盘形状 ＋ 指路；十八项与 `resources/references/subagent-prompts/audit-agent-prompt.md
+        // §审计要求`、`audit-and-testing.md §7.0` 两份审计清单**逐项对齐**；差集断言（`test-contract-gap.mjs`）
+        // 从两侧**解析**出集合来比，三处都不硬编码第二份清单。解析锚点与截段规则单点在
+        // `dev/style-spec-contract-source.mjs`（三条判据共用，别各写一份）。
+        `工作区/style-spec.md -- 写作规范（十九项契约，**每项都要有一个同名小节**，逐项打钩）。**十九项的全文与每一项的答法不在这里，在派发模板 \`resources/references/subagent-prompts/gold-writing-agent-prompt.md\` 的「写作规范十九项契约」一节**——照那一节写，别凭印象；「N. **项名**」的编号是给机器解析用的，改成散文这一段的差集判据就空转了。`,
+        // 票 `walkthrough-2026-10/02`：执笔小助手**只落分片**（章正文由机器拼）。这一行是它的产物要求，
+        // 而下面那一行是被拼出来的那一份——两份都在清单里，AI 才知道「谁写哪一份」。
+        `${chapterShardRel(gn, 1)} —— 第 ${gn} 章正文的**分片**（执笔小助手写这一份；NN＝章号、MM＝第几路，都补两位、从 01 起。一章只派一路就是「-01」；派两路就是「-01」＋「-02」，机器按 MM 升序拼）`,
+        `${chapterRel(gn)} —— 第 ${gn} 章全文（按 style-spec，含全部板块与答案；约 ${brief.targetWords} 汉字，是写作体量参考、**不是闸门**——机器不验字数，宁可多写不可敷衍）。**这一份由机器从分片拼**（chapter-assemble），你与小助手都不写它`,
+        `${auditName} —— 审计记录（四层审计 + 试教[条件触发]；**由那份额外派出的审计小助手产出**，严格 JSON：{"passed":true,"issues":[{"level":"错误|警告|提示","text":"具体问题"}]}）`,
       ]
       brief.materials = sources
-      brief.methodology = `${mtl('references/file-contracts.md')}\n\n${mtlWithTail('references/audit-and-testing.md', 'gold')}`
+      brief.methodology = `${mtl('references/file-contracts.md')}\n\n${mtl('references/audit-and-testing.md')}`
       // 票 workbench-transitions/19③（2026-09-24 裁决补充）：范例章也是写作任务，风格线同样必读。
       // 这一段原先**没有** `references` 字段（`gold` 是新建，不是「加一行」）。
-      brief.references = ['work/style-line.md（写每一章前必读、逐条落实）']
+      brief.references = ['工作区/style-line.md（写每一章前必读、逐条落实）']
       // 金标准写作规范：本书自定义模式库一并交给 AI（「模式选型」节须覆盖它们）。
       {
         const customPatterns = customPatternsBrief(projectId)
         if (customPatterns !== '') brief.methodology = `${brief.methodology}\n\n${customPatterns}`
       }
       brief.hints = [
-        `先按 outline 里第 ${gn} 章的 source 找到对应材料小节通读，再动笔；章节长就分段写入 chapter-${String(gn).padStart(2, '0')}.md。`,
-        '写完用 stage-submit（stage=gold）交工；机器验三份文件都在且非空。',
-        '派审计小助手时提醒：文件操作用文件工具（read/write/edit/glob/grep），别用 shell（工具纪律见 audit-and-testing.md §九，跨平台一致）。',
-        '写完 style-spec 与范例章后**不要自己充审计**：按 `resources/references/subagent-prompts/gold-audit-prompt.md` 派全新上下文的审计小助手（必读文档矩阵+一致性核对，产出含 matrix 的 audit 文件），读报告、判决修订后才交工。',
-        `审计结论落盘后，先交给机器过一遍形状：workbench_act（action=audit-submit）当场验 work/audit-${String(gn).padStart(2, '0')}.md 的 matrix（5 个必读文件各一行 {file, quote}、quote 逐字；不带内容就读书里那份，也可带 auditJson 正文由机器落盘）。不合格会当场把机器看到的行键、样例与缺口说清——别等 stage-submit 那一刻才知道。`,
+        // 票 04：原来这条要求主笔自己「找到对应材料小节通读，再动笔」——那正是 ADR-0030 决策 1
+        // 「材料不搬运」的活体反例。现在 `brief.materials` 只当**路径清单**用：主笔据它 ＋ outline 的
+        // source 合成一条定位交给执笔小助手，**材料正文留在执笔小助手的干净上下文里**。
+        `材料怎么交给执笔小助手：brief.materials 给的是**路径清单**（文件名／角色／转换后 md 相对路径，纯元数据不是正文搬运），你据它 ＋ outline 里第 ${gn} 章的 source（${chapterSource === '' ? '这一章没填 source，先按 outline 与知识地图对出来' : `「${chapterSource}」`}）合成一句定位——哪份材料的哪个小节——写进派发 prompt；**材料正文由执笔小助手在它自己的干净上下文里读，你不读**（ADR-0030 决策 1「材料不搬运」，rot 护栏：读一次 → 落产物 → 留摘要）。`,
+        '派执笔小助手时按 `resources/references/subagent-prompts/gold-writing-agent-prompt.md` 那份模板填必带内容（章骨架＋知识点清单／材料定位／风格线／本书自定义模式库／不变量编号）；它写 工作区/style-spec.md ＋ **本章分片**（`工作区/分片/chapter-NN-MM.md`，本章就是上面 outputs 里那一片），**章正文与审计文件都不归它**（也不许它先把审计文件写出来占位）。',
+        // 票 `walkthrough-2026-10/02`：分片落齐后**先让机器拼**，再派审计——审计读的是拼出来的正文，
+        // 而票 22 的新鲜度闸门比的就是它与检查记录的 mtime（晚拼一步，检查记录当场变成「审的是旧稿」）。
+        `分片落齐后**先让机器拼章正文**：workbench_act(action=chapter-assemble, chapter=${gn})。审计小助手读的就是拼出来的 ${chapterRel(gn)}；改过分片（含用户意见那一轮修订）要**再拼一次**，否则审计审的是旧稿。交工时机器会再拼一次并验「盘上那份就是这几片分片的拼装件」——**盘上那份若不是机器拼的，交工会被拒收**（机器不覆盖它）。`,
+        // 票 context-budget/06（ADR-0030 决策 4）＋ 合并对齐：回灌预算**不留占位符**——
+        // 逐类定档已经落定（audit-and-testing.md §九 那张表的「范例章执笔回执」＝≤1K token），
+        // 这里只点那一档与出处，不重述形状（与 chapters / final 两支同口径）。
+        '回灌有预算：执笔小助手的完工回执 ≤1K token（形状与逐类一档表的单一事实源是 audit-and-testing.md §九「回灌三件套」，派发时按 gold-writing-agent-prompt.md 那份填）——超了就只留指针、细目去 工作区/style-spec.md 与章稿里看，不许把正文或逐条证据抄回回报。',
+        '稿子回来后**不要自己充审计**：按 `resources/references/subagent-prompts/gold-audit-prompt.md` 派全新上下文的审计小助手（必读文档矩阵+一致性核对，产出含 matrix 的 audit 文件），读报告、判决后才交工。',
+        `审计结论落盘后，先交给机器过一遍形状：workbench_act（action=audit-submit）当场验 ${auditName} 的 matrix（5 个必读文件各一行 {file, quote}、quote 逐字；不带内容就读书里那份，也可带 auditJson 正文由机器落盘）。不合格会当场把机器看到的行键、样例与缺口说清——别等 stage-submit 那一刻才知道。`,
+        '派小助手/审计小助手时提醒：文件操作用文件工具（read/write/edit/glob/grep），别用 shell（工具纪律见 audit-and-testing.md §九，跨平台一致）。',
+        '要小助手继续跑：优先 send_message 唤醒原来那个执笔小助手（忘了是谁就用 list_agents 按「章号 ＋ 角色」的 label 召回），召不回才新派——与逐章写作段既有先例同形。',
+        `写完用 stage-submit（stage=gold）交工；机器验三份文件都在且非空。`,
       ]
-      // 修订时：把用户的金标准意见（意见单 + 合并后的交办）透出给 AI 逐条照改。
+      // 修订时：把用户的金标准意见（意见单 + 合并后的交办）透出给 AI，由它转达给执笔小助手。
       const goldActive = (meta.goldOpinions ?? []).filter((o) => o.status === 'pending' || o.status === 'sent')
       const goldRedo = meta.goldRedoNote
       if (goldActive.length > 0 || typeof goldRedo === 'string') {
@@ -2802,8 +3632,10 @@ function buildStageBrief(projectId) {
         brief.hints = [
           ...(brief.hints ?? []),
           ...(meta.goldRedoNote != null && meta.goldRedoNote.includes('整版重写')
-            ? [`这是整版重写：${meta.goldRedoNote} 不参考旧稿（已归档）。`]
-            : [`这是修订：用户的意见是「${note}」。逐条照改；改完自查一遍再交工。`]),
+            ? // 整版重写本就「不参考旧稿」：唤醒原来那个等于让它背着旧稿重来，这一轮**直接新派**
+              // 一个执笔小助手按派发模板从头起草，再走一遍审计（唤醒策略与普通修订轮不同形，理由在此）。
+              [`这是整版重写：${meta.goldRedoNote} 不参考旧稿（已归档）——**直接新派一个执笔小助手**按派发模板从头起草（这一轮不唤醒原来那个，唤醒了它就是背着旧稿重写），审完再交工。`]
+            : [`这是修订：用户的意见是「${note}」。**逐条转达给执笔小助手去改**（仍优先 send_message 唤醒原来那个，召不回才新派），正文不由你亲手改；改完自查一遍再交工。`]),
           '交工后用户会在工作台「边读边标记」确认；每条意见都会在定稿时沉淀进风格线，全书写都要遵守。',
         ]
       }
@@ -2814,7 +3646,7 @@ function buildStageBrief(projectId) {
       const remaining = chapters
         .map((chapter, index) => ({ n: index + 1, ...chapter }))
         .filter((chapter) => !chapterDone(projectId, chapter.n))
-      brief.task = '写完整本：对每一章走三步——派小助手写（给大纲/材料小节/写作规范/范例章路径）→ 派小助手审计（干净上下文，产出 audit-NN.md；机器会读它验货）→ 机器按章验货（audit.passed===true 才放行）。**remaining 里还没写的各章可并行派多个写作小助手**（每章一个、干净上下文、各写各的独立文件），各自完成后逐个交工验货。你不逐章复核；只有该章有用户抽查意见时，才需要你亲自核对修订结果。'
+      brief.task = `写完整本：对每一章走四步——派小助手写（给大纲/材料小节/写作规范/范例章路径；**它只落分片** \`工作区/分片/chapter-NN-MM.md\`，一路一个号，章正文不归它）→ **让机器把分片拼成章正文**（workbench_act(action=chapter-assemble, chapter=N)——审计要读的 \`工作区/chapter-NN.md\` 就是拼出来的那一份，改过分片要再拼一次）→ **调一次编排脚本审这一章**（宿主 \`workflow\` 工具，**一次运行只审一章**：脚本自己派一个干净上下文的审计小助手，**审计员自己落盘 \`工作区/audit-NN.md\`** 的严格 JSON，机器按章验货读的就是它；**你不再从它的回报转写**——脚本把 \`{chapter, passed, auditPath}\` 结构化带回）→ 机器按章验货（audit.passed===true 才放行）。**remaining 里还没写的各章可并行派多个写作小助手**（每章一个、干净上下文、各写各的分片），各自完成后逐个交工验货。你不逐章复核；只有该章有用户抽查意见时，才需要你亲自核对修订结果。`
       brief.total = chapters.length
       brief.remaining = remaining.map((chapter) => ({
         n: chapter.n, title: chapter.title ?? '', outline: chapter.outline ?? '',
@@ -2822,24 +3654,40 @@ function buildStageBrief(projectId) {
         points: chapter.points ?? [],
       }))
       brief.references = [
-        'work/style-spec.md（写作规范）',
-        // 票 workbench-transitions/19③：风格线原先只有 persona 一条 + `work/style-line.md` 镜像，
+        '工作区/style-spec.md（写作规范）',
+        // 票 workbench-transitions/19③：风格线原先只有 persona 一条 + `工作区/style-line.md` 镜像，
         // 逐章交办里没有它——界面那句「AI 写每一章都会照着办」于是不兑现。这里把它补进必读清单。
-        'work/style-line.md（写每一章前必读、逐条落实）',
+        '工作区/style-line.md（写每一章前必读、逐条落实）',
         '范例章（见 brief）',
-        'work/outline.md（章节骨架）',
+        '工作区/outline.md（章节骨架）',
+        // 票 `chapter-audit-orchestration/03`：审计那一跳改由编排脚本驱动 ⇒ 两件进必读清单。
+        // 两处路径都从上面的常量派生（不在这里手抄第二个字面量）。
+        `resources/${AUDIT_TEMPLATE_REL}（章级审计派发模板：脚本里那份派发正文照它逐项填）`,
+        `resources/${CHAPTER_AUDIT_SCRIPT_REL}（编排脚本骨架与调用形状：一次运行只审一章）`,
       ]
       // F39（2026-08-20 走查）：段落级抽查意见也透出给 AI（整章意见带 comment，段落意见合成人话；已撤回的跳过）。
       // 票 09：**必须带 id**——没有 id，主笔 AI 交工时无从点名（handledReviews 按 id 销号）。
       brief.pendingReviews = (meta.pendingReviews ?? []).filter((r) => r.status !== 'revoked').map((r) => ({ id: r.id, chapter: r.chapter, comment: paragraphReviewText(r) }))
-      brief.methodology = `${mtlWithTail('references/audit-and-testing.md', 'chapters')}\n${mtl('references/file-contracts.md')}\n${mtl('references/subagent-prompts/writing-agent-prompt.md')}\n${mtl('references/subagent-prompts/audit-agent-prompt.md')}`
+      brief.methodology = `${mtl('references/audit-and-testing.md')}\n${mtl('references/file-contracts.md')}\n${mtl('references/subagent-prompts/writing-agent-prompt.md')}\n${mtl(AUDIT_TEMPLATE_REL)}\n${mtl(CHAPTER_AUDIT_SCRIPT_REL)}`
       brief.hints = [
         CHAPTER_PROGRESS_REQUIREMENT,
         // 票 03 · P34：上面那条只说了 stage 有哪些取值，没说**什么时候**必须报——实测 9.4 小时里
         // 「还剩 39 步」一字未变、▶ 指着 10 小时前就写完的第 1 章，因为 AI 一次都没带过
         // chapter/stage（契约有、转发有、按章落账有、界面也接上了，只有上报这一格是空的）。
         '逐章阶段上报：每章走「写 → 审 → 复核」时，**每次状态变化**都用 workbench_act(action=progress) 把 chapter=N 与 stage 一起报上（stage 的取值见上一条）——派出去写时报 writing、检查时报 auditing、检查完报 audited、你要复核报 finalizing、这一章交工完报 done。只有文字、没有 chapter 与 stage 的 progress 落在步清单上什么也看不出来。',
-        '并行纪律：remaining 各章可并行派多个写作小助手，并发 2-4 章为宜（低内存/老机器从 2 起）；每章一个写作小助手、各章独立文件（chapter-NN.md / audit-NN.md），绝不共享工作区写同一文件；各章各自完成后逐个交工验货（ordered-commit：慢章压住快章属预期，不必等齐）。宿主不支持并行 spawn 时小助手自动排队，退化为逐章串行，行为与现状等价。',
+        // 票 `walkthrough-2026-10/02`（走查 A10 的裁决）：**换协议**，不是「加一把锁」。
+        // 病：「拆两半派」时两个执笔小助手写**同一个** `工作区/chapter-08.md`——零互斥、零合并，
+        // 谁后落盘谁说了算（后半段那位报「已落盘、前半段未改动一字」的时间早于前半段报「已落盘 455 行」）。
+        // 换协议之后**每一路落自己的分片**，章正文由机器按分片号拼——两个写者结构上碰不到同一个文件。
+        // ⛔ 旧句「各章独立文件（chapter-NN.md / audit-NN.md），绝不共享工作区写同一文件」随本票退役：
+        // 那句话当年就是**唯一的载体**（`src/**` 里没有任何机器判据断它），而它管不住子助手手里的写工具。
+        '并行纪律：remaining 各章可并行派多个写作小助手，并发 2-4 章为宜（低内存/老机器从 2 起）；每章一个写作小助手、**各写各的分片文件**（`工作区/分片/chapter-NN-MM.md`：NN＝章号、MM＝第几路，都补两位、从 01 起，一路一个号——**同一章拆两半派就是 01 ＋ 02，谁也不碰别人的分片**；章正文 `工作区/chapter-NN.md` 由机器按 MM 升序拼，谁都不直接写它）；分片落齐后**先让机器拼章正文**（chapter-assemble）再派审计，改过分片要再拼一次；各章各自完成后逐个交工验货（ordered-commit：慢章压住快章属预期，不必等齐）。宿主不支持并行 spawn 时小助手自动排队，退化为逐章串行，行为与现状等价。',
+        // 票 `chapter-audit-orchestration/03`：审计那一跳改由宿主的 `workflow`（编排脚本）驱动。
+        // 三条杠杆与骨架同源——脚本形状住 resources/…（references 清单里也点了一次），这里只点
+        // 「什么时候用、边界在哪」，不重述脚本正文（重述就是会漂的第二份）。
+        `审计那一跳用编排脚本（宿主 \`workflow\` 工具，骨架与调用形状见 resources/${CHAPTER_AUDIT_SCRIPT_REL}）：**一次运行只审一章**——要审哪一章就把它放进 args 单开一次运行，别把 remaining 里剩下的章塞进同一次运行。`,
+        '审不过就停：编排脚本**不自行派修复、也不重试**——它把 `{chapter, passed, auditPath}`（章号、结论、报告落点）原样带回；要修就由你按点名条目**另派一个干净上下文的成员**去改该章，改完重新走一遍审计与机器验货。',
+        '脚本里不许再嵌 `workflow`：脚本成员继承模式里的**全部**工具集，引擎也不传深度限制——递归扇出是真实风险。⚠️ 这一条**只有纪律、机器不强制**（宿主没有按工具名的白/黑名单，可用的机制只有「挂不挂」）。',
         '派小助手/审计小助手时提醒：文件操作用文件工具（read/write/edit/glob/grep），别用 shell（工具纪律见 audit-and-testing.md §九，跨平台一致）。',
         '小助手与审计小助手用你的 subagent 工具派；提醒小助手材料小节与产出文件的准确路径（都在 dir 下）。',
         '每交一章前先 workbench_status 查有没有新抽查意见，有就先处理（修订 → 重新审计 → 机器验货）再继续；该章意见未处置机器会拒收。',
@@ -2849,7 +3697,10 @@ function buildStageBrief(projectId) {
         // 已经结束的事；而要用户拍板的那类决定记进 progress，机器侧就无从知道有**一个问题悬着**。
         '进度保鲜与拍板通道：每个小助手回来、每交工一章时，**必须补一条 progress**，写那段时间里真的在做的事（派了几路、在写哪几章、哪几章检查完了、下一路是谁）；上一次落账到这一次之间一个章的时长都没补，工作台上挂的就是旧闻。要用户拍板、选一条路、授权一次改动，走 intervene，不要记进 progress（它是留给用户回话的悬案通道，工作台据此把闸门按钮亮出来）。留痕不许因为加了保鲜就被稀释——该落的引导那一行一次都不能少，细则见 audit-and-testing.md §十一。',
         '处置过的抽查意见要在交工时报出：stage-submit（stage=chapters）带 handledReviews:[{id, how}]——id 取 pendingReviews 里那一条，how 是一句人话（这条我怎么改的）。机器**只给点名的**置为已处置，没点名的继续拦；一条都不点名就交工会被 400 打回。',
-        '机器按章验货：每章都要有 work/chapter-NN.md 和 audit-NN.md，且 audit.passed 必须是 true（读审计 JSON，不是只看文件存在）。',
+        // 票 walkthrough-2026-10/06 现象二（2026-10-05 走查 BUG-4①）：主卡把 progress 的 detail **原样**
+        // 上屏，而走查那一屏的自述写着「你已点继续」——屏上根本没有那个按钮。规则正文在 §11.5（进度保鲜那一半）。
+        '进度行只叙述已发生的事实的界线：progress 那一行会**原样**出现在主卡上给用户读，所以它只说已经发生过的事（盘上写了、账上记了、小助手回来了）；不许承诺还没发生的事，也不许引用一个界面上没有的动作（走查那一屏写着「你已点继续」、而屏上只有「⏸ 暂停」）。别替用户记动作。细则见 audit-and-testing.md §11.5。',
+        '机器按章验货：每章都要有 工作区/chapter-NN.md 和 audit-NN.md，且 audit.passed 必须是 true（读审计 JSON，不是只看文件存在）。',
         // 票 brief-word-limits/01：把「字」的口径与「这些数字不是闸门」**一次说清**（主笔 AI 自报进度
         // 那行自由文本只能靠交办说明/persona 传口径，服务端改不了它的措辞）。
         '体量口径：remaining[].targetWords 的「字」一律按**汉字**计（数字/字母/标点/空白都不计），它是写作体量参考、**不是交工闸门**——机器不验字数，超一点没关系。自报 progress 时也按这个口径说。',
@@ -2859,6 +3710,10 @@ function buildStageBrief(projectId) {
         '要用户拍板时先把影响预告给出来：凡是你要在几个选项里请用户选、而选哪条会牵动已经写好或已经拍板的内容（例如全书体量、章节结构、范例章写法），**每个选项的说明都要各带一句影响预告**，照「影响预告：这一步改了，这些要一起重做：…」那个形状说人话——按现在已写 N 章、累计多少汉字说清：选它要重写哪几章、最终落在多少汉字。三条路各有各的代价（实测里最忠于用户当初拍板的那条恰好最贵），不许等用户点完再在正文里补一句「我倾向」。',
         '派写作小助手时必须带（按 writing-agent-prompt.md 模板填）：本章知识点清单（remaining[].points）、本章在知识链中的位置与跨章引用指向（前面哪章讲过什么、后面哪章会用到这里）、范例章路径与写作规范。',
         '跨章引用纪律：前向引用只到大纲承诺粒度（「第 N 章会展开」），禁止编造未写章节的具体数字/结论/例题；审计小助手按 audit-agent-prompt.md 派，要求其扫跨章引用存在性（含前向承诺失配）。',
+        // 票 context-budget/06（ADR-0030 决策 4）：回灌预算从交办说明这一层点一次名——形状与逐类
+        // 一档表的唯一出处是 audit-and-testing.md §九「回灌三件套」，这里只点两档与出处，不重述形状。
+        // N 是 AI 侧软目标（机器永不查字数/篇幅，CONTEXT.md「机器检查契约原则」），真合没合规归真机层。
+        '回灌有预算：写作小助手的完工回执 ≤1K token、章审计报告 ≤2K token（形状与逐类一档表的单一事实源是 audit-and-testing.md §九「回灌三件套」，派发时按 writing-agent-prompt.md / audit-agent-prompt.md 填）——超了就只留指针、细目去落盘件里看，不许把正文或逐条证据抄回回报。',
       ]
       // 票 28 / 走查 P46：每次领任务都把**主 AI 上下文占用**一并告诉主笔 AI，
       // 好让它知道自己该收尾了。读不到（宿主投影缺席 / 未绑定读数口）就**整句不追加**——
@@ -2871,24 +3726,75 @@ function buildStageBrief(projectId) {
       break
     }
     case 'merge': {
-      brief.task = '合并前先做跨章审计：通读全部章节 + outline + knowledge-map，逐项核对（①跨章事实一致性—数字/人名/结论不打架 ②术语统一—同一概念全书一个说法 ③交叉引用不悬空—「见第X章」的章真实存在 ④知识递进链—后章依赖的前置概念前章真的讲过），发现问题先修，再把审计结论落盘 work/audit-cross.md（机器验存在才放行合并）。然后写这本书的前言/使用说明（约 300 汉字，通俗；软目标，机器不验字数），随 stage-submit（stage=merge, preface=...）交工；机器会 100% 保真拼装各章成书（不删节）。'
-      brief.references = ['交工后工作台会生成 work/book.md（机器拼装成品）']
-      brief.methodology = mtlWithTail('references/audit-and-testing.md', 'merge')
-      brief.outputs = ['维护 work/progress.md（每章一行：写完/审计/验货）', 'work/audit-cross.md —— 合并前跨章审计结论（机器验存在才放行合并）']
-      brief.hints = ['前言写给"拿到这本书的人"：这本书讲什么、怎么用（给 AI 老师上课还是人直接读）。', 'audit-cross.md 是硬门槛：没落盘机器会 400 拒收，别只交前言。']
+      // 票 `.scratch/context-budget/issues/05` · ADR-0030 决策 2（改派第一刀 · merge 段）。
+      //
+      // **病根是分工，不是措辞**：改之前这一支要求主笔「通读全部章节 + outline +
+      // knowledge-map」，而实测（session-98d830e6）merge 窗口 **+0 token**——一个章都没读，
+      // 凭协调记忆写出了 2,780 字符的 audit-cross.md，机器只验「文件存在且非空」就放行。
+      // 交办文本与「材料不搬运」的诊断正面矛盾，实测的解法就是静默不做。
+      // 所以这一支改成**协调者形态**：派审计小助手 → 收报告 → 按点名条目派修复小助手 →
+      // 汇总裁决追加进 audit-cross.md → 写前言 → 交工。**主笔不碰章正文。**
+      //
+      // ⚠️ 四项核对的**判定词与判定口径只住在派发模板**（`references/subagent-prompts/
+      // cross-audit-prompt.md` 的「四项核对判定表」，机器的验货判据也从那儿解析）。
+      // 这里与方法论文档、拒收文案、人设一律只**引**它——各写一份就是四份会漂的平行清单。
+      const mergeTemplatePath = `resources/${CROSS_AUDIT_TEMPLATE_REL}`
+      brief.task = `合并前先**派跨章审计小助手**做跨章审计（派发模板：${mergeTemplatePath}，四项判定词与判定口径只住在那一份里，别处不另抄）：**派发那一刻你手里不许有任何一章正文**，它从零读全部章 + outline + knowledge-map + style-spec 逐项核对，**报告人自落** 工作区/audit-cross.md（机器逐项验那四项都有交代才放行合并）。你只收它的报告：按它**条目级点名**的那几条**逐条派修复小助手**去改（你不碰章正文），再把「哪几条要改、哪几条判为误判」的汇总裁决**追加**进 audit-cross.md（小 edit，别整份重写）。然后写这本书的前言/使用说明（约 300 汉字，通俗；软目标，机器不验字数），随 stage-submit（stage=merge, preface=...）交工；机器会 100% 保真拼装各章成书（不删节）。`
+      // 章路径清单（票面「派发接线」）：**纯路径元数据**，不带正文——形状先例＝chapters 的
+      // `brief.remaining`。路径逐字取自 `chapterRel`（章节正文路径的单一出处，见 `src/domain-rules.js`）。
+      const mergeChapters = meta.outline?.chapters ?? []
+      brief.auditScope = {
+        template: mergeTemplatePath,
+        chapters: mergeChapters.map((_chapter, index) => chapterRel(index + 1)),
+        constraints: [...CROSS_AUDIT_CONSTRAINTS],
+        report: CROSS_AUDIT_REPORT_REL,
+      }
+      brief.references = ['交工后工作台会生成 工作区/book.md（机器拼装成品）']
+      // 挂载关系照旧（票 05 口径）：这一支仍挂 `references/audit-and-testing.md`，
+      // 但**取法**用票 02 合并后的形态——`mtl(...)`（事件注入表已接管分阶段尾节，`mtlWithTail` 退役）。
+      brief.methodology = mtl('references/audit-and-testing.md')
+      brief.outputs = ['维护 工作区/progress.md（每章一行：写完/审计/验货）', `工作区/audit-cross.md —— 合并前跨章审计结论，由审计小助手自落（机器逐项验四项核对都有交代才放行）`]
+      brief.hints = [
+        '前言写给"拿到这本书的人"：这本书讲什么、怎么用（给 AI 老师上课还是人直接读）。',
+        `audit-cross.md 是硬门槛：没落盘、或那四项核对有一项没交代，机器都会 400 拒收并点名缺哪一项，别只交前言。四项判定词与判定口径见 ${mergeTemplatePath}。`,
+        '派审计小助手时把 auditScope 里的路径逐条给它（全部章 + 三份约束件 + 落盘路径），报告人自落——**你不转写那份报告**，那正是「全文回流 + 主笔转写」的搬运。',
+        '改法一律派修复小助手：只改它点名的那几条，不通读全书、不顺手重写别的章；改完把新发现的点名追加进 audit-cross.md。',
+        '重跑优先 `send_message` 唤醒原来那个跨章审计小助手（`list_agents` 按「跨章审计」label 召回），召不回才新派——重读一遍全书很贵。',
+      ]
       break
     }
     case 'final': {
       // 票 walkthrough-fixes/32 · ADR-0027：终检改派 5 个小助手分查。**协调员不读正文**（§6.1 硬约束）——
       // 终检是全书体量最大、上下文余量最小的那个时点，让它亲自通读 book.md 等于把最贵的读放在最没余量的地方。
       // 三层归属在这条字符串里必须自洽：协调员**不读正文** / **仍能改点名的条目** / **styleCheck 逐条交代由分报告做**。
-      brief.task = `最后检查**分头查，不要自己通读**（口径见 audit-and-testing.md §十「派 5 个小助手分查」那一节）：按那一节派 5 个上下文干净的小助手分查 work/book.md，各查各负责的范围（成品完整与每章自查记录 / AI 脚手架残留与练习答案齐全 / 与已拍板设计一致 / 材料可追溯与引用矛盾 / 事实与跨章一致性），**派发那一刻你手里一章正文都不许有**，只收 5 份报告。五份各自出结论（通过／不通过）＋**条目级**点名（「第 3 章有问题」不算点名，要指到具体哪一处）。**五份不合成**：你只做汇总裁决，不逐条回正文复核（核实是写那份报告的助手自己的活）；按点名的那几条**直接改**——只改点名的条目，不通读全书、不顺手重写别的章。改完把五份结论汇成一份自查报告（人话）随 stage-submit（stage=final, report=...）交工。${REPORT_WORDING_RULE}**风格线逐条交代由五份分报告各自做、你不读正文所以不做**：交工时要对**每一条**生效中的风格线（workbench_status 的 styleNotes 里 status 为 active 的那些）都有交代——把五份报告里各自交代的去向合并成一份 styleCheck:[{id, status, note?, chapter?}] 随交工一起交：adopted＝已落实（写清落实在哪章）、conflict＝与哪一章冲突（note 必写一句冲突理由）、superseded＝已不再适用；漏一条机器会拒收（哪一路没交代就唤醒那一路补，别自己凭印象编）。机器硬检查会兜底（乱码/章节数/必含板块/禁用词/章名全书唯一/无重复标题，判据来自已拍板的 style-spec/outline；**章名唯一性读大纲的章名，同一章里重名的小节才算重复——每章都有的同名板块（板位）不拦，只在自查报告里说明**）；全过后你在工作台等用户「认可」才算交付。`
+      brief.task = `最后检查**分头查，不要自己通读**（口径见 audit-and-testing.md §十「派 5 个小助手分查」那一节）：按那一节派 5 个上下文干净的小助手分查 工作区/book.md，各查各负责的范围（finalScopes 逐路写明了每一路的范围与**它自己该落的那一份报告**，派发时照表填），**派发那一刻你手里一章正文都不许有**，只收 5 份报告。五份**报告人自落**：每一路的小助手把「结论（通过／不通过）＋条目级点名＋落盘路径」写进它自己那一份（finalScopes[].report），**你不转写那份报告**——转写就是「全文回流 + 主笔搬运」，那正是这一层分派要治的病。五份各自出结论，**点名要到条目级**（「第 3 章有问题」不算点名，要指到具体哪一处）。**五份结论不合并、也不互相替代**：机器只拼一份**派生的条目并集**（finalSummary 那一件，只有条目、**它不出通过/不通过**——裁决仍在你手上）；每一份自己的结论与证据仍在它那份原文里，你要核就按汇总件各节「来源」那行去读对应那一份。你**只做汇总裁决**，不逐条回正文复核（核实是写那份报告的助手自己的活）；按点名的那几条**直接改**——只改点名的条目，不通读全书、不顺手重写别的章。改完把五份结论汇成一份自查报告（人话）随 stage-submit（stage=final, report=...）交工。${REPORT_WORDING_RULE}**风格线逐条交代由五份分报告各自做、你不读正文所以不做**：交工时要对**每一条**生效中的风格线（workbench_status 的 styleNotes 里 status 为 active 的那些）都有交代——把五份报告里各自交代的去向合并成一份 styleCheck:[{id, status, note?, chapter?}] 随交工一起交：adopted＝已落实（写清落实在哪章）、conflict＝与哪一章冲突（note 必写一句冲突理由）、superseded＝已不再适用；漏一条机器会拒收（哪一路没交代就唤醒那一路补，别自己凭印象编）。机器硬检查会兜底（乱码/章节数/该有的板块/不该用的词/章名全书唯一/无重复标题，判据来自已拍板的 style-spec/outline；**章名唯一性读大纲的章名，同一章里重名的小节才算重复——每章都有的同名板块（板位）不拦，只在自查报告里说明**）；全过后你在工作台等用户「认可」才算交付。机器还会**逐份点名**缺哪一份分报告——缺了就唤醒那一路补，不许自己凭印象写一份顶上（那正是「自发件不是契约件」）。`
       brief.counts = { chapters: (meta.outline?.chapters ?? []).length, sources: (meta.sources ?? []).length }
-      brief.methodology = `${mtl('references/delivery-checklist.md')}\n\n${mtlWithTail('references/audit-and-testing.md', 'final')}`
-      brief.outputs = ['维护 work/progress.md（每章一行：写完/审计/验货）']
+      // 票 11：五份分报告的**落点表**（范围 ＋ 逐份路径）——形状先例＝ merge 那一支的 `brief.auditScope`。
+      // 路径逐字取自 `finalAuditReportRel`（落盘路径的单一出处，见 `src/domain-rules.js`），
+      // 这里与方法论文档、派发模板、拒收文案一律只**引**它——各写一份就是四份会漂的清单。
+      brief.finalScopes = FINAL_AUDIT_SCOPES.map(({ n, scope }) => ({ n, scope, report: finalAuditReportRel(n) }))
+      // 票 `context-budget/12`：五份齐了之后**机器拼一份派生的条目并集**给协调员读（它不合并结论、
+      // 不替代各自结论，也不出裁决）。形状先例＝ merge 的 `brief.auditScope`：一张表，逐字来自
+      // `domain-rules`（路径单一持有）。⚠️ 拼装写盘是 `buildStageBrief` 里**唯一**的写副作用，
+      // 理由写在 `refreshFinalAuditSummary` 上方：交办说明是协调员**读到汇总件的唯一入口**，
+      // 拼在别处它就永远看不见（交工那一刻那次刷新只是保证指针新鲜）。
+      const finalSummary = refreshFinalAuditSummary(projectId)
+      brief.finalSummary = finalSummary === null
+        ? { path: finalAuditSummaryRel(), ready: false, chars: null, unionSize: 0, items: [] }
+        : { path: finalSummary.path, ready: true, chars: finalSummary.chars, unionSize: finalSummary.unionSize, items: finalSummary.items }
+      brief.methodology = `${mtl('references/delivery-checklist.md')}\n\n${mtl('references/audit-and-testing.md')}`
+      brief.outputs = [
+        '维护 工作区/progress.md（每章一行：写完/审计/验货）',
+        ...FINAL_AUDIT_SCOPES.map(({ n, scope }) => `${finalAuditReportRel(n)} —— 最后检查第 ${n} 路分报告（${scope}）：由那一路的小助手自落，协调员不转写`),
+      ]
+      // 这一句随五份齐不齐改写（读不到就不出现那半句——与「上下文占用」那句同一纪律）：
+      // 齐了 ⇒ 汇总件已在盘上，**读它**；没齐 ⇒ 说清为什么没有，别让协调员去找一个不存在的文件。
+      const finalSummaryHint = finalSummary === null
+        ? `五份还没齐 ⇒ 机器拼不出那份条目并集（${finalAuditSummaryRel()} 还不在盘上）；五份齐了再领一次任务就能读到，别自己凭印象写一份顶上。`
+        : `机器已把五份的**条目并集**拼在 ${finalAuditSummaryRel()}（${finalSummary.unionSize} 条，同一条只出现一次、不丢不重）：**读它**、按点到的条目改就够了，不用把五份全文都搬进上下文。它**只列条目、不出结论**——每份自己的结论与证据在它那份原文里。`
       // 票 32 · ADR-0027 决策 4：上下文余量**解绑**进终检——分派把书摘下去了，但五份报告回流、
       // 汇总、改点名条目仍在协调员身上，余量仍然是它该盯的数（读不到读数就整句不出现，同铺章那一族）。
-      brief.hints = ['派完这 5 路之后别断线：五份齐了才进下一步；某一路超载就拆范围（或唤醒原助手补），别硬扛。', '五份报告只信「条目级点名」的那几条——点名不到具体位置的打回重做。']
+      brief.hints = ['派完这 5 路之后别断线：五份齐了才进下一步；某一路超载就拆范围（或唤醒原助手补），别硬扛。', '五份报告只信「条目级点名」的那几条——点名不到具体位置的打回重做。', `五份报告的预算与落点：每份最终回复 ≤2K token，收「结论＋条目级点名＋落盘路径」（口径与逐类一档表见 audit-and-testing.md §九「回灌三件套」）——**五份各自落盘**（finalScopes 里逐份写明了路径，由写它的那一路自己落，**你不转写**）；压不进 2K 就按 §10.g 拆范围，或点名不到条目级时打回重做，不许靠把正文贴上来兜（那等于把分派省下的工作量原样搬回你身上）。`, finalSummaryHint]
       {
         const occupancyLine = contextOccupancyBriefLine(meta.session)
         if (occupancyLine !== null) brief.hints.push(occupancyLine)
@@ -2907,6 +3813,32 @@ function buildStageBrief(projectId) {
   }
   // 票 22：不变量底线只对裁决里那四个阶段/关卡追加（explore / 关卡② / 关卡③ / chapters）。
   attachInvariants(stage)
+  // 票 02：注入件集合＝清单里 `disclose` 命中的切片 ＋ 一页纸常驻 ＋ 状态迁移→节 ＋ 指针兜底
+  //（**在 attachInvariants 之后**：不变量按 route 选节是票 22 的口径，它的位置与本三层无关）。
+  brief.methodology = mountMethodology(
+    brief.methodology ?? '',
+    meta,
+    { gateRejected: gateDecision !== null && gateDecision.status === 'rejected' },
+    stepStageState(projectId, meta),
+    onepagerLines,
+    methodologyDocs,
+  )
+  // 票 02 第 1 层 · 这一步的几行登记（用户故事 13／19）：**注入件集合＝清单里 `disclose` 命中的切片**。
+  // 随 brief 交出去的是结构化事实（路径 ＋ 角色 ＋ 它自己那一档 `disclose`），
+  // `test-tool-discipline.mjs` 拿它与 `manifestRowsFor()` 对账，而不用反解 `engine.js` 源码。
+  brief.registry = registryRowsFor(methodologyDocs)
+  // 票 02 实现决策 11：**派发面也走同一张表**——给「该读的登记行 ＋ 该产出的登记行」，
+  // 不再靠派发措辞（实测：explore 交办原文「要求详细摘录」让三份报告全文回灌，而同一机制
+  // 另一本书三个精读全落盘——同一个机制、两本书两种表现，全凭自觉）。
+  brief.dispatch = dispatchRegistryFor(stage, meta, methodologyDocs)
+  // 派发那一半的**交办原文**：把两组登记行写进 hints，让主笔照它原样带给小助手
+  // （六份派发模板里的「登记表口径」那一节说的是同一件事——派发时随活一起给它）。
+  if (SUBAGENT_DISPATCH_STAGES.has(stage)) {
+    const half = (rows, head) => (rows.length === 0 ? `${head}：这一步没有` : `${head}：${rows.map((r) => `${r.path}（${r.role}）`).join('、')}`)
+    // ⚠️ 那两行路径是**包内相对路径**，而真正按它们去读的是**小助手**——所以根目录要随活一起发下去。
+    // 不发根，小助手拿到 `resources/…` 就等于拿到一个没有基准的相对路径（票 `methodology-root-pointer/01`）。
+    brief.hints = [...(brief.hints ?? []), `派小助手时按派发模板的「登记表口径」随活把那两行清单原样给它——**边界以那两行为准，不靠你的措辞**：${half(brief.dispatch.read, '你该读的登记行')}；${half(brief.dispatch.produce, '你该产出的登记行')}。**一并把方法论根目录（本机绝对路径）也给它**：${RESOURCES_DIR}——上面那些 resources/… 路径都相对它拼，小助手那边才读得到（只发相对路径＝它也得去搜盘）。`]
+  }
   // 深改注入的重做意见：只交给被改段的那个阶段。
   if (meta.deepRedoNote != null) {
     const segOfStage = { explore: 'explore', gate: `gate-${gate ?? ''}`, outline: 'outline', gold: 'gold', chapters: 'chapters', merge: 'merge', final: 'final' }
@@ -2944,15 +3876,15 @@ function buildStageBrief(projectId) {
 // 即第二个 adapter。族边界 = 未来共享 domain module 的候选挂载点（见议题 01 协调注记）。
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** 该关卡**盘上真实存在**的全部版次（`提案/关卡N-vM.md`，按版次升序）。
+/** 该关卡**盘上真实存在**的全部版次（`工作区/方案/关卡N-vM.md`，按版次升序）。
  *  判据＝磁盘实况——与 workbench-transitions/23 同一条（不是"最新"、更不是写死的 v1）。
  *  定点修改的归档名单照这条判据走才不会把修订件留在原地（dead-gates/18：留下就会被下一轮同名版次覆盖）。 */
 function proposalFilesOnDisk(projectId, gate) {
   let names = []
-  try { names = readdirSync(join(projectDir(projectId), '提案')) } catch { return [] }
+  try { names = readdirSync(proposalDir(projectId)) } catch { return [] }
   const re = new RegExp(`^关卡${gate}-v(\\d+)\\.md$`)
   return names
-    .map((name) => { const m = re.exec(name); return m === null ? null : { rel: `提案/${name}`, version: Number(m[1]) } })
+    .map((name) => { const m = re.exec(name); return m === null ? null : { rel: `${PROPOSAL_DIR_REL}/${name}`, version: Number(m[1]) } })
     .filter((entry) => entry !== null)
     .sort((a, b) => a.version - b.version)
     .map((entry) => entry.rel)
@@ -2964,34 +3896,55 @@ function deepAffected(projectId, meta, segKey) {
   const chapters = meta?.outline?.chapters ?? []
   const gn = goldN(meta)
   const pad = (n) => String(n).padStart(2, '0')
-  const chapterFiles = (n) => [`work/chapter-${pad(n)}.md`, `work/audit-${pad(n)}.md`]
+  // ⚠️ 这里的 `files` 是**书夹相对路径**（归档按它逐件 rename）⇒ 正文那一项取 `chapterRel`。
+  // `audit-NN.md` 仍是本地的 `pad`——它属 audit 族（见 gold-audit-prompt.md），不是本章正文的形状。
+  // ⚠️ 下面 `outlineDown` 里的 `chapter-${i + 1}` 是**段 key**、不补零、也不是路径——**不要**动它。
+  //
+  // ⚠️ **票 `walkthrough-2026-10/02`：这一章盘上真有的分片也要登记**（扫盘，不凭请求体）。
+  // 分片是章正文的**输入**（机器按它拼）：定点修改到本章／金标准段时只归档正文、把分片留在原地，
+  // 重做那一路写的若是**另一片**，机器就会把旧内容拼回正文里——旧稿回来了，而账上什么都没说。
+  // 这与票 11 给「细目／报告」两族补登记是同一条教训（`archived` 是撤销回移的唯一依据）。
+  const chapterFiles = (n) => [chapterRel(n), `工作区/audit-${pad(n)}.md`, ...chapterShardRelsOnDisk(projectId, n)]
   const allChapters = chapters.flatMap((_, i) => chapterFiles(i + 1))
-  const goldFiles = ['work/style-spec.md', ...chapterFiles(gn)]
-  const bookFiles = ['work/book.md', 'work/preface.md']
+  const goldFiles = ['工作区/style-spec.md', ...chapterFiles(gn)]
+  const bookFiles = ['工作区/book.md', '工作区/preface.md']
+  // ⚠️ 票 11：细目与报告是**目录族**，份数随材料数／固定五份变，写死清单装不下——
+  // 所以这里登**实际盘上有的那一族每一件**（枚举形状与 `deepAffected` 别处的 `proposalFilesOnDisk`
+  // 同款：扫盘、按声明形状过滤，不凭请求体）。**不登记的后果**：定点修改到 explore／final 段时，
+  // `deep-modify.js` 的 `movable` 只认 `affected.files`，新目录里的件既搬不走、撤销时也回不来——
+  // 而那份 `过程/存档/deep/<id>.json` 里的 `archived` 就是撤销回移的唯一依据（它会静默少登记）。
+  const okReadingNumbers = okMaterialNumbers(meta.sources)
+  const detailFiles = okReadingNumbers
+    .map((n) => readingRel(n))
+    .filter((rel) => existsSync(join(projectDir(projectId), ...rel.split('/'))))
+  const reportFiles = [...FINAL_AUDIT_SCOPES.map(({ n }) => finalAuditReportRel(n)), finalAuditSummaryRel()]
+    .filter((rel) => existsSync(join(projectDir(projectId), ...rel.split('/'))))
   const gates = [1, 2, 3]
   const proposals = (from) => gates.filter((g) => g >= from).flatMap((g) => proposalFilesOnDisk(projectId, g))
   const outlineDown = ['outline', 'gold', ...chapters.map((_, i) => `chapter-${i + 1}`), 'chapters-review', 'merge', 'final']
   switch (segKey) {
     case 'explore':
       return { downstream: ['explore', 'gate-1', 'gate-2', 'gate-3', ...outlineDown],
-        files: ['work/explore.md', 'work/knowledge-map.json', ...proposals(1), 'work/outline.md', ...goldFiles, ...allChapters, ...bookFiles],
+        files: ['工作区/explore.md', '工作区/knowledge-map.json', ...detailFiles, ...proposals(1), '工作区/outline.md', ...goldFiles, ...allChapters, ...bookFiles],
         reset: 'explore' }
     case 'gate-1': case 'gate-2': case 'gate-3': {
       const n = Number(segKey.slice(5))
       return { downstream: [segKey, ...outlineDown],
-        files: [...proposals(n), 'work/outline.md', ...goldFiles, ...allChapters, ...bookFiles],
+        files: [...proposals(n), '工作区/outline.md', ...goldFiles, ...allChapters, ...bookFiles],
         reset: 'gate' }
     }
     case 'outline':
-      return { downstream: outlineDown, files: ['work/outline.md', ...goldFiles, ...allChapters, ...bookFiles], reset: 'outline' }
+      return { downstream: outlineDown, files: ['工作区/outline.md', ...goldFiles, ...allChapters, ...bookFiles], reset: 'outline' }
     case 'gold':
       return { downstream: ['gold', ...chapters.map((_, i) => `chapter-${i + 1}`), 'chapters-review', 'merge', 'final'],
         files: [...goldFiles, ...chapters.flatMap((_, i) => (i + 1 === gn ? [] : chapterFiles(i + 1))), ...bookFiles],
         reset: 'gold' }
     case 'merge':
-      return { downstream: ['merge', 'final'], files: bookFiles, reset: 'merge' }
+      return { downstream: ['merge', 'final'], files: [...bookFiles, ...reportFiles], reset: 'merge' }
     case 'final':
-      return { downstream: ['final'], files: [], reset: 'final' }
+      // ⚠️ 票 11：终检这一段的 `files` 原本是**空的**（那时还没有任何终检产物）。
+      // 五份分报告落盘之后它不再是空的——不然定点修改到终检段时那些报告既不搬走、也回不来。
+      return { downstream: ['final'], files: [...reportFiles], reset: 'final' }
     default: {
       const m = /^chapter-(\d+)$/.exec(segKey)
       if (m === null) return null
@@ -3060,13 +4013,18 @@ export {
   GATE_LABELS,
   STAGE_LABELS,
   stageLabel,
+  // 这三个随 labels 簇一起搬走（票 depth-review-2026-10/10）。前两个是「这条路走完了」的人读
+  // 提示，第三个是「写作规范里哪几项不许写」的硬约束——**都不是界面词的副本**：
+  // `test-wording-invariants.mjs` 与 `test-contract-gap.mjs` 按名从 engine 取它们。
+  EXPLORE_DONE_HINT,
+  FINAL_CHECK_DONE_HINT,
+  REPORT_WORDING_RULE,
   dshHome,
   projectsRoot,
   registryPath,
   readRegistry,
   writeRegistry,
   registerProject,
-  registeredDir,
   sessionWorkspace,
   sanitizeFolderName,
   freeBookDir,
@@ -3077,53 +4035,74 @@ export {
   logEntryText,
   readMeta,
   flushMeta,
-  // ⚠️ writeMeta / metaCache / metaDirty / metaFlushHandle **刻意不导出**（ADR-0016 决策 2）：
-  // engine 之外不该再有直接写状态的通道。四个写入入口＝updateMeta（读→改→写）、createMeta（建档）、
+  // ⚠️ writeMeta / metaCache / metaDirty / metaFlushHandle **刻意不导出**（ADR-0016 决策 2）。
+  // ⚠️ 边界在拆子模块后**不再是「engine 之外」**，而是「**store 子模块之外，且持有 appendEvent
+  // 的那个模块之外**」——appendEvent 是账高与最后动静时刻的唯一写入者，它至今仍住在 engine.js，
+  // 必须够得着底层写入口。测试按**名字搜出**那个模块，不手写清单；appendEvent 日后搬进
+  // engine/ledger.js 时这条判据不用改。
+  //   两半都要占：store.js **导出** writeMeta（engine.js 要 import 它），而 engine 的**导出面**
+  //   **不列**它——`test-ledger-seq-integrity.mjs` 的 `key in engine` 正是钉这一条。
+  // 四个写入入口＝updateMeta（读→改→写）、createMeta（建档）、
   // appendEvent（记一笔：账高与最后动静时刻的唯一写入者）、rollbackLedger（合法回退的账本重写）。
-  // 防回潮断言见 test-ledger-seq-integrity.mjs（engine 之外出现这些标识符即判红）。
+  // 防回潮断言见 test-ledger-seq-integrity.mjs。
   updateMeta,
   createMeta,
   rollbackLedger,
   waived,
   announceText,
   announceToSession,
-  pendingPhaseEnd,
-  announceEventToSession,
+  noticeMessage,
   appendEvent,
   readEvents,
   listProjects,
-  copyTreeSync,
   removeTree,
-  removeTreeManual,
   trashProject,
   snapshotsDir,
-  mergeUserVoice,
   writeSnapshot,
   restoreSnapshot,
   foldGate,
   workDir,
+  // 票 `context-budget/11`：细目目录与报告目录**同样只经 `./engine/paths.js` 解析**，
+  // 再从这里再导出给动作层——动作层要的是「绝对路径 + 越界守卫已在那一层」，
+  // 而 brief／文案要的**书夹相对**形状归 `domain-rules` 的 `readingRel`／`finalAuditReportRel`。
+  // ⚠️ 这两个目录下的件**不在工作区根**，所以 `workFile(project, name)` 对它们无效（那会拼成
+  // `工作区/<name>`）；要绝对路径一律 `join(detailDir(project), <基名>)`。
+  detailDir,
+  reportDir,
+  // 票 `context-budget/13` 改名：四个旧段名逐字落地成 `工作区/`／`工作区/方案/`／`过程/存档/`／
+  // `材料/转换稿/`（旧名的逐字清单见 ADR-0031 的「改名补记」与票 13 落地记录），
+  // 解析函数同样只此一份、从这里再导出。
+  // ⚠️ `deep-modify` 那一族原先**手写**了 `join(projectDir(p), <存档段名>, 'deep')`（两处），
+  // 那正是「定义点之外的第二份」的典型——不改就会把深改存档写到旧目录、撤销时找不到那份存档。
+  proposalDir,
+  processDir,
+  archiveDir,
+  materialDir,
+  convertedDir,
+  // 老书读侧兜底（票 `context-budget/13` 的取舍已被维护者推翻，见 `.scratch` 票面第 3 节的改写）：
+  // ① `bookRelOnDisk` ＝「规范形状 → 盘上真落点」，读通道与交办说明的指针都要它
+  //    （`brief.references` 逐字写的是规范形状，而老书盘上是老名那一份）；
+  // ② `legacyDirConflicts` ＝「两套名同时存在」的逐条点名——**新名优先的那一半不许静默**。
+  bookRelOnDisk,
+  legacyDirConflicts,
   workFile,
   writeWork,
-  readWork,
   customPatternsDir,
   listCustomPatterns,
   updateStyleLineMirror,
   sealGoldStandard,
   sourcesDir,
-  sourcesMdDir,
   runners,
   gateWaiters,
-  parents,
   wakeMainAI,
   handoff,
+  handoffAndDrive,
   chapterArtifacts,
   chapterDone,
   chapterHasSubmitEvent,
   chapterGateMiss,
-  announceCtx,
   bindAnnounce,
   bindContextOccupancy,
-  readContextOccupancy,
   contextOccupancyBriefLine,
   disposeParent,
   getParent,
@@ -3133,7 +4112,8 @@ export {
   proposeRevision,
   proposalFilesOnDisk,
   advance,
-  waitForGateDecision,
+  resolveGateDecision,
+  isRunning,
   runPhase1,
   runPhase2,
   countRejections,
@@ -3141,12 +4121,9 @@ export {
   gateApproved,
   runGate,
   runPhase3,
-  runPhase4,
   runPhase5,
-  SCAFFOLD_MARKERS,
   scanScaffolding,
   stripLoaderRegion,
-  runPhase6,
   specFingerprint,
   noteStyleSpecChange,
   parseStyleSpecList,
@@ -3155,8 +4132,6 @@ export {
   recordAgentError,
   runLoop,
   kick,
-  sendJson,
-  clipMethodology,
   buildStageBrief,
   deepAffected,
   deepStartSeq,

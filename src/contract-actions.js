@@ -27,10 +27,18 @@ const ACTION_DEFINITIONS = [
 	['suggest-roles', 'wizard', 'no-book', 'callable', false, null, null],
 	['convert-start', 'convert', 'session-book', 'callable', false, null, null],
 	['retry-convert', 'convert', 'session-book', null, false, null, 'compatibility'],
+	// 票 `mineru-formats/03`（CONTEXT.md「材料缺口」）：材料不齐时书停在材料准备，用户对
+	// 每一份红源逐个表态——「补传」走既有的上传写面，「删掉这份」只有这一个动作。
+	// **只对 `failed` 的那一格开放**（判在 handler），所以它不是「随便删一份材料」的后门。
+	['source-remove', 'convert', 'session-book', 'callable', false, null, null],
 	['nudge', 'convert', 'session-book', 'callable', true, 'nudge', null],
 	['resume', 'convert', 'session-book', 'callable', true, 'resume', null],
 	['gate-decide', 'gates', 'session-book', 'callable', true, 'gate', null],
-	['explore-confirm', 'gates', 'session-book', 'callable', false, null, null],
+	// 走查票 09（2026-10-06 裁决①）：`explore-confirm` 是**挡在相位上的硬闸门**
+	// （`advance(project, 2, 3)`，`actions/gates.js`），同类兄弟 `outline-confirm` /
+	// `chapters-review-confirm` / `final-approve` 全是 `agentCallable: true`——它此前够不着
+	// 属于**漏登记**，不是「闸门不该给 AI」，所以补进 AI 闭包（agentInput 与规范名同名）。
+	['explore-confirm', 'gates', 'session-book', 'callable', true, 'explore-confirm', null],
 	['outline-confirm', 'gates', 'session-book', 'callable', true, 'outline-confirm', null],
 	['chapters-review-confirm', 'gates', 'session-book', 'callable', true, 'chapters-review-confirm', null],
 	['final-approve', 'gates', 'session-book', 'callable', true, 'final-approve', null],
@@ -40,7 +48,11 @@ const ACTION_DEFINITIONS = [
 	['gold-revise', 'gold', 'session-book', 'callable', true, 'gold-revise', null],
 	['gold-chapter-set', 'gold', 'session-book', null, true, 'gold-chapter-set', null],
 	['gold-target-words-set', 'gold', 'session-book', 'callable', false, null, null],
-	['gold-approve', 'gold', 'session-book', 'callable', false, null, null],
+	// 走查票 09（2026-10-06 裁决①）：`gold-approve` 是范例章定稿的**唯一放行键**，此前
+	// `agentCallable: false` ——与 `gold-opinion` / `gold-revise` / `gold-chapter-set` 那三个
+	// 兄弟不一致，且 `agent-tool.js` 的工具描述当时把「gold 定稿类」写成可调用（描述与闭包
+	// 不一致，AI 照描述调它却撞「未知操作」）⇒ 同样是**漏登记**，补进 AI 闭包。
+	['gold-approve', 'gold', 'session-book', 'callable', true, 'gold-approve', null],
 	['deep-modify', 'deep-modify', 'session-book', 'callable', true, 'deep-modify', null],
 	['deep-undo', 'deep-modify', 'session-book', 'callable', true, 'deep-undo', null],
 	['style-note', 'collab-signals', 'session-book', null, true, 'style-note', null],
@@ -53,6 +65,11 @@ const ACTION_DEFINITIONS = [
 	['review', 'chapters', 'session-book', 'callable', false, null, null],
 	['review-revoke', 'chapters', 'session-book', 'callable', false, null, null],
 	['audit-submit', 'chapters', 'session-book', null, true, 'audit-submit', null],
+	// 票 `walkthrough-2026-10/02`（走查 A10「同一文件多写者」的裁决）：**机器拼章正文**。
+	// 子助手只落分片（`工作区/分片/chapter-NN-MM.md`），这一步按分片号拼出 `工作区/chapter-NN.md`；
+	// 审计小助手读的就是机器拼出来的那一份（所以它必须在派审计**之前**被叫到）。
+	// 它不是用户按的键（`workbenchExposure: null`）：用户看到的是章正文本身，拼装是内务。
+	['chapter-assemble', 'chapters', 'session-book', null, true, 'chapter-assemble', null],
 	['stage-submit', 'chapters', 'session-book', null, true, 'stage-submit', null],
 	['stage-brief', 'chapters', 'session-book', null, true, 'stage-brief', null],
 	['progress', 'chapters', 'session-book', null, true, 'progress', null],

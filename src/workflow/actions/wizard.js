@@ -1,25 +1,38 @@
 /**
  * 动作族模块（架构评审候选 3，2026-09-01 拆分）：actWizard
- * 从 src/workflow.js 平移，接口 (ctx, req, res, action, sessionId, project, body) 不变。
  * 共享工具来自 ../engine.js。
+ *
+ * ⚠️ 票 `workflow-seams/03`：interface 已收窄成**一个请求对象**
+ * （`{ ctx, action, sessionId, project, body }`）并返回 `{status, json}`——
+ * `_req` 与 `res` 两个传输参数都已从 interface 上消失（`res` 由 `handleAction` 那一次
+ * `sendJson` 写出，落盘边界随它）。
+ *
+ * ⚠️ **本文件不许删、不许合、不许改名**：动作族 id ≡ 本文件名、`actWizard` 这个绑定名与
+ * `./workflow/actions/wizard.js` 这个路径，都被 `test-contract-action-catalog.mjs`
+ * 从**源码文本**锚定——**是承重件**。
+ * ⇒ 改完之后本文件会变得**近乎空壳**——**那是承重件不是忘了删**。
  */
 import {
   projectsRoot,
   projectDir,
   getParent,
-  sendJson,
 } from '../engine.js'
+import { familyOf, reject, accept } from '../action-runner.js'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { generateContent } from '../../content-lib.js'
 import { guessRoleFromName } from '../../domain-rules.js'
 
 
-/** 动作族 · 向导与素材识别：'wizard-suggest' / 'suggest-roles'。 */
-export async function actWizard(ctx, _req, res, action, sessionId, _project, body) {
+/** 动作族 · 向导与素材识别：'wizard-suggest' / 'suggest-roles'。
+ *  ⚠️ 这两族都不需要 `project`（无书的动作），所以签名里**不接**它——
+ *  原先写 `_project: _project` 是票 03 第 2 步留下的死绑定，与 `ActionRequest`
+ *  typedef 的 `project` 对不上；用不到就别解构。 */
+export const actWizard = familyOf('wizard', async ({ ctx: ctx, action: action, sessionId: sessionId, body: body }) => {
   switch (action) {
     case 'wizard-suggest': {
       // 向导建议：AI 推荐几个"造一本书"的起点，人类只做确认。
+      let reply
       let hint = typeof body.hint === 'string' ? body.hint.trim() : ''
       // F21（2026-08-20）：hint 为空时读会话首条用户消息当建议依据。
       if (hint === '') {
@@ -40,12 +53,11 @@ export async function actWizard(ctx, _req, res, action, sessionId, _project, bod
       }
       try {
         const result = await generateContent(runtime, 'wizard', { hint })
-        sendJson(res, 200, { ok: true, suggestions: result.suggestions })
+        reply = accept({ suggestions: result.suggestions })
       } catch (error) {
         // LLM 不可用时给内置建议（跟随背景），不让向导卡住。
         ctx.logger.warn(`textbook: wizard-suggest LLM 失败，使用内置建议: ${String(error instanceof Error ? error.message : error)}`)
-        sendJson(res, 200, {
-          ok: true,
+        reply = accept({
           fallback: true,
           suggestions: hint === ''
             ? [
@@ -60,16 +72,16 @@ export async function actWizard(ctx, _req, res, action, sessionId, _project, bod
               ],
         })
       }
-      return
+      return reply
     }
     case 'suggest-roles': {
       // 上传时 AI 识别每本 PDF 的角色，人类只确认；AI 失败按文件名规则兜底。
+      let reply
       const files = Array.isArray(body.files)
         ? body.files.filter((f) => typeof f === 'string' && f.trim() !== '').slice(0, 20)
         : []
       if (files.length === 0) {
-        sendJson(res, 400, { ok: false, error: '没有可识别的文件' })
-        return
+        return reject(400, '没有可识别的文件')
       }
       const wizardId = `wizard-${sessionId.replace(/[^a-z0-9-]/g, '-').slice(0, 40)}`
       mkdirSync(projectDir(wizardId), { recursive: true })
@@ -82,16 +94,15 @@ export async function actWizard(ctx, _req, res, action, sessionId, _project, bod
       }
       try {
         const result = await generateContent(runtime, 'roles', { files })
-        sendJson(res, 200, { ok: true, roles: result.roles })
+        reply = accept({ roles: result.roles })
       } catch (error) {
         ctx.logger.warn(`textbook: suggest-roles LLM 失败，使用文件名规则: ${String(error instanceof Error ? error.message : error)}`)
-        sendJson(res, 200, {
-          ok: true,
+        reply = accept({
           fallback: true,
           roles: files.map((file) => ({ file, role: guessRoleFromName(file) })),
         })
       }
-      return
+      return reply
     }
   }
-}
+})

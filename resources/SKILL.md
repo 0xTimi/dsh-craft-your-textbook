@@ -1,6 +1,6 @@
 ---
 name: dsh-craft-your-textbook
-description: 让你具备"亲手为自己造一本教材"的能力——把源材料（教材/考纲/讲义等）加工成 AI 苏格拉底老师能拿去上课的教学蓝本（pure-blueprint），或一本给人读的流畅教材（human-readable，AI 也能直接教）。适用任何学科。两条路线互斥选择，默认推荐给 AI 老师的版本。覆盖 PDF→MD、源探查、教学设计五步、金标准先行、模式选型、并行铺章、审计合并拆脚手架全流程。当用户说"造一本教学蓝本/做一本 XX 教材/按这套方法写一本书"时使用。
+description: 让你具备"亲手为自己造一本教材"的能力——把源材料（教材/考纲/讲义等）加工成 AI 苏格拉底老师能拿去上课的教学蓝本（pure-blueprint），或一本给人读的流畅教材（human-readable，AI 也能直接教）。适用任何学科。两条路线互斥选择，默认推荐给 AI 老师的版本。覆盖材料转换（原件→转换稿）、源探查、教学设计五步、金标准先行、模式选型、并行铺章、审计合并拆脚手架全流程。当用户说"造一本教学蓝本/做一本 XX 教材/按这套方法写一本书"时使用。
 ---
 
 # 亲手造属于你自己的教材（Craft Your Textbook）
@@ -44,7 +44,7 @@ description: 让你具备"亲手为自己造一本教材"的能力——把源�
 
 - 用户要把教材/领域知识做成 AI 能教的书或人读的教材
 - 用户说"造一本书""做一本教材""按这套方法写 XX"
-- 需要从 PDF 教材加工出结构化教学素材
+- 需要从上传的材料（原件或已转出的转换稿）加工出结构化教学素材
 
 **第一步：定路线**（触发后必须问，不替用户默认）：
 
@@ -120,7 +120,7 @@ digraph route {
 
 | 阶段 | 名称 | 做什么 | 产出 |
 | --- | --- | --- | --- |
-| **Phase 1** | 源材料准备 | PDF→MD（材料转换） | `sources-md/` |
+| **Phase 1** | 源材料准备 | 材料转换（原件 → 转换稿） | `材料/转换稿/` |
 | **Phase 2** | 源探查 | 所有有源书必走：摸源结构、角色标签、简码表、权威层级 | 源材料索引的第一层 |
 | **Phase 3** | 教学设计 | **核心阶段**：五步设计（见下）+ 三个用户确认关卡 | 写作规范 + 章节骨架 + 风格与语法 + 源材料索引（四件契约产物，各自落在哪个文件见 `references/file-contracts.md` 顶部的角色对照） |
 | **Phase 4** | 金标准验证 | 选一章按设计的语法写 → 四层审计 + 试教（条件触发）→ 通过后回填 style-spec | 金标准章 md |
@@ -193,6 +193,7 @@ Mode A（无源从零造）差异：Phase 2 跳过、幻觉 gate 更严，仅适
 | Phase 4-5 审计 | `references/audit-and-testing.md` |
 | Phase 5 写作 subagent prompt | `references/subagent-prompts/writing-agent-prompt.md` |
 | Phase 5 审计 subagent prompt | `references/subagent-prompts/audit-agent-prompt.md` |
+| Phase 5 合并前跨章审计 subagent prompt（四项核对判定词与判定口径的**唯一起处**） | `references/subagent-prompts/cross-audit-prompt.md` |
 | Phase 6 交付 | `references/delivery-checklist.md` |
 | 避坑 | `references/anti-patterns.md` |
 

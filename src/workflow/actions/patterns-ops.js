@@ -1,6 +1,18 @@
 /**
  * 动作族模块（架构评审候选 3，2026-09-01 拆分）：actPatternsOps
- * 从 src/workflow.js 平移，接口 (ctx, req, res, action, sessionId, project, body) 不变。
+ * 从 src/workflow.js 平移（架构评审候选 3，2026-09-01）。
+ *
+ * ⚠️ 票 `workflow-seams/03`：interface 已收窄成**一个请求对象**
+ * （`{ ctx, action, sessionId, project, body }`）并返回 `{status, json}`——
+ * `_req` 与 `res` 两个传输参数都已从 interface 上消失（`res` 由 `handleAction` 那一次
+ * `sendJson` 写出，落盘边界随它）。
+ *
+ * ⚠️ **本文件不许删、不许合、不许改名**：动作族 id ≡ 本文件名这一点被
+ * `test-contract-action-catalog.mjs` 从**源码文本**锚定（它正则抠 `workflow.js` 的
+ * `HANDLER_OF_FAMILY` 字面量表并要求 handler 绑定名匹配 `act[A-Z]\w*`）；
+ * 另有 `test-context-vocabulary.mjs` 把「探查」钉在 `gates.js`、
+ * `test-gate-write-points.mjs` 点名读本目录下的族文件。
+ * ⇒ 改完之后本文件会变得**近乎空壳**——**那是承重件不是忘了删**。
  * 共享工具来自 ../engine.js。
  */
 import {
@@ -22,26 +34,27 @@ import {
   workFile,
   goldN,
   kick,
-  sendJson,
 } from '../engine.js'
+import { familyOf, reject, accept } from '../action-runner.js'
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync } from 'node:fs'
 import { join, basename } from 'node:path'
 import { readSettings, writeSettings } from '../../mineru-lib.js'
 import { generateContent } from '../../content-lib.js'
-import { countHanzi } from '../../domain-rules.js'
+import { countHanzi, chapterName } from '../../domain-rules.js'
 
 
 /** 动作族 · 模式卡·运维：'suggest-words' / 'pattern-analyze' / 'pattern-list' / 'settings' / 'demo-run' / 'debug-spawn'。 */
-export async function actPatternsOps(ctx, _req, res, action, sessionId, project, body) {
+export const actPatternsOps = familyOf('patterns-ops', async ({ ctx: ctx, action: action, sessionId: sessionId, project: project, body: body }) => {
   switch (action) {
     case 'suggest-words': {
+      // ⚠️ `reply` 让 try/catch 两条路都只赋值、末尾统一 return（票 03 第 2 步）。
+      let reply
       // 逐章目标建议（AI）：把范例章盘上实测与现有逐章目标一并喂给小助手；
       // 返回只供界面预填，落盘必须另走 gold-target-words-set。
       assertSessionOwned(project, sessionId)
       const wordsMeta = readMeta(project)
       if (wordsMeta === null) {
-        sendJson(res, 404, { ok: false, error: '项目不存在' })
-        return
+        return reject(404, '项目不存在')
       }
       const goal = typeof body.goal === 'string' ? body.goal : wordsMeta.goal ?? ''
       const route = body.route === 'human' ? 'human' : wordsMeta.route ?? 'blueprint'
@@ -58,7 +71,9 @@ export async function actPatternsOps(ctx, _req, res, action, sessionId, project,
       const goldChapter = goldN(wordsMeta)
       let goldMeasuredHanzi = null
       try {
-        const goldPath = workFile(project, `chapter-${String(goldChapter).padStart(2, '0')}.md`)
+        // ⚠️ 要**基名**：`workFile` 自己拼 `工作区/`，喂相对路径会读成 `工作区/工作区/chapter-NN.md`。
+        // （与 `src/workflow.js` 那份读范例章实测汉字数的是同一件事的两份拷贝。）
+        const goldPath = workFile(project, chapterName(goldChapter))
         if (existsSync(goldPath)) goldMeasuredHanzi = countHanzi(readFileSync(goldPath, 'utf8'))
       } catch { /* 正文尚未生成时不编实测值 */ }
 
@@ -89,13 +104,11 @@ export async function actPatternsOps(ctx, _req, res, action, sessionId, project,
           goldMeasuredHanzi,
           currentTargets,
         })
-        sendJson(res, 200, {
-          ok: true,
+        reply = accept({
           suggestion: { ...result, perChapter: toResponsePerChapter(result.perChapter) },
         })
       } catch (error) {
-        sendJson(res, 200, {
-          ok: true,
+        reply = accept({
           fallback: true,
           suggestion: {
             suggested: 6000,
@@ -105,7 +118,7 @@ export async function actPatternsOps(ctx, _req, res, action, sessionId, project,
           },
         })
       }
-      return
+      return reply
     }
     case 'pattern-analyze': {
       // 用户粘贴一段教学/结构描述 → AI 分析成「模式卡」→ 加入本书自定义模式库
@@ -113,13 +126,11 @@ export async function actPatternsOps(ctx, _req, res, action, sessionId, project,
       assertSessionOwned(project, sessionId)
       const patternMeta = readMeta(project)
       if (patternMeta === null) {
-        sendJson(res, 404, { ok: false, error: '项目不存在' })
-        return
+        return reject(404, '项目不存在')
       }
       const patternText = typeof body.text === 'string' ? body.text.trim() : ''
       if (patternText === '') {
-        sendJson(res, 400, { ok: false, error: '请先粘贴要分析的文本' })
-        return
+        return reject(400, '请先粘贴要分析的文本')
       }
       const patternRuntime = projectRuntime(ctx, project, patternMeta)
       let card
@@ -131,8 +142,7 @@ export async function actPatternsOps(ctx, _req, res, action, sessionId, project,
         card = null
       }
       if (card === null || typeof card !== 'object' || typeof card.name !== 'string' || card.name.trim() === '') {
-        sendJson(res, 500, { ok: false, error: 'AI 没能从这段描述里分析出有效模式，请换一段更具体的描述再试' })
-        return
+        return reject(500, 'AI 没能从这段描述里分析出有效模式，请换一段更具体的描述再试')
       }
       const patternDir = customPatternsDir(project)
       const baseName = sanitizeFolderName(card.name.trim()) || '自定义模式'
@@ -148,15 +158,13 @@ export async function actPatternsOps(ctx, _req, res, action, sessionId, project,
       appendFileSync(patternIndex, `\n- [${card.name}](${cardFile}) — ${card.problem || ''}\n`, 'utf8')
       appendEvent(project, 'textbook/pattern-added', { name: card.name, file: cardFile })
       ctx.logger.info(`textbook: 项目 ${project} 新增自定义模式「${card.name}」（${cardFile}）`)
-      sendJson(res, 200, { ok: true, card, file: cardFile })
-      return
+      return accept({ card, file: cardFile })
     }
     case 'pattern-list': {
       // 本书自定义模式卡清单（工作台面板展示用）。
       assertSessionOwned(project, sessionId)
       const list = listCustomPatterns(project)
-      sendJson(res, 200, { ok: true, patterns: list })
-      return
+      return accept({ patterns: list })
     }
     case 'settings': {
       // 设置：MinerU Token 等
@@ -166,22 +174,30 @@ export async function actPatternsOps(ctx, _req, res, action, sessionId, project,
         const trimmed = mineruToken.trim()
         if (trimmed === '') {
           // F42（2026-08-20）：空/空白 token 不覆盖已配置值（HTTP 直发曾把真实 token 清空）。
-          sendJson(res, 400, { ok: false, error: 'MinerU Token 不能为空' })
-          return
+          return reject(400, 'MinerU Token 不能为空')
         }
         settings.mineruToken = trimmed
       }
       writeSettings(settings)
-      sendJson(res, 200, { ok: true, settings: { mineruTokenSet: typeof settings.mineruToken === 'string' && settings.mineruToken !== '' } })
-      return
+      return accept({ settings: { mineruTokenSet: typeof settings.mineruToken === 'string' && settings.mineruToken !== '' } })
     }
     case 'demo-run': {
+      // ── 阶段一（材料准备）在演示书里**为什么不真做**（票 `demo-flow-fidelity` 的 01 Q4，
+      //    2026-10-07 裁决：**维持**下面这个「伪造已完成态」的做法）────────────────────────────
+      // ① 演示书的源是一条**占位**（`sources` 只有 `{file:'示例教材.pdf', …}` 这一项，
+      //    见下面 `createMeta`），盘上压根没有 `sources/` 目录，也没有任何可转换的真文件。
+      // ② 真跑一次转换要 MinerU Token、要时间，还要处理失败态与重试——这与演示入口的语义
+      //    （不花模型额度、几步走完给人看流程）正面冲突。
+      // ③ 所以阶段一在演示书里是「已完成」的**展示态**，不是「没做」：下面补写的
+      //    `phase-start`／`phase-end` 两条事件让阶段片显示为已完成，用户点开阶段片仍能看到
+      //    材料行与那张已完成卡。这条豁免登记在 `src/demo-exemptions.js` 的
+      //    `phase1-no-real-conversion`（声明面只是登记，不放行任何东西）。
+      //
       // 开发/演示：创建演示书并全流程跑一遍（demo 模式，产出明确标注）
       // 会话唯一书守卫：一个会话至多一本（和 book-create 同一套约束），
       // 防止界面入口在同会话连开两本演示书。
       if (listProjects(sessionId).length > 0) {
-        sendJson(res, 409, { ok: false, error: '这个会话已经有一本书了：先完成它、删除它，或者新建一个会话再开演示书' })
-        return
+        return reject(409, '这个会话已经有一本书了：先完成它、删除它，或者新建一个会话再开演示书')
       }
       const id = `demo-${Date.now().toString(36)}`
       // 书夹位置：优先会话的工作区目录，文件夹名用演示书名；拿不到工作区就退回默认目录（与 book-create 一致）。
@@ -193,7 +209,7 @@ export async function actPatternsOps(ctx, _req, res, action, sessionId, project,
         id, name: '演示书（示例流程）', goal: '学会基础运算，能独立做对配套练习',
         route: 'blueprint', science: false, demo: true, session: sessionId,
         folder: basename(dir),
-        sources: [{ file: '示例教材.pdf', role: '学生用书', converted: true }],
+        sources: [{ file: '示例教材.pdf', role: '学生用书', converted: 'ok' }],
         phase: 2, status: 'running',
         createdAt: Date.now(), updatedAt: Date.now(), eventCount: 0,
       }
@@ -202,11 +218,17 @@ export async function actPatternsOps(ctx, _req, res, action, sessionId, project,
       appendEvent(id, 'textbook/phase-end', { phase: 1, label: PHASE_LABELS[1] })
       appendEvent(id, 'textbook/phase-start', { phase: 2, label: PHASE_LABELS[2] })
       void kick(ctx, id)
-      sendJson(res, 200, { ok: true, project: id, demo: true })
-      return
+      return accept({ project: id, demo: true })
     }
     case 'debug-spawn': {
       // 临时调试动作：最小子代理派发，返回完整结果（验证后移除）。
+      //
+      // ⚠️ 归属守卫（票 `deep-module-scan/02`）：目录 `contract-actions.js` 把本动作的
+      // `projectScope` 标成 `session-book`，**意思就是「要守归属」**（`:18` 那行注释逐字写着
+      // 「只作事实，不执行 ownership」——事实是对的，只是过去没有人消费它）。本 case 此前
+      // **没守**，`getParent(ctx, project, meta)` 会拿着别人的 project 去 `ctx.agents.create`，
+      // 派子代理进别人的会话与别人的书夹。与同族另三处（`:54`/`:124`/`:163`）同形补上。
+      assertSessionOwned(project, sessionId)
       const meta = readMeta(project)
       if (meta === null) throw new Error(`unknown project ${JSON.stringify(project)}`)
       const parent = await getParent(ctx, project, meta)
@@ -227,13 +249,9 @@ export async function actPatternsOps(ctx, _req, res, action, sessionId, project,
         offError()
         offRetry()
       }
-      sendJson(res, 200, {
-        ok: true,
-        stopReason: result.stopReason,
+      return accept({ stopReason: result.stopReason,
         output: result.output.map((block) => block.text ?? '').join('').slice(0, 300),
-        captured,
-      })
-      return
+        captured })
     }
   }
-}
+})
