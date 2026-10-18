@@ -141,6 +141,29 @@ npx dsh-craft-your-textbook --upgrade
 
 1. **大模型接口**：右上角 **设置 → 模型** → 添加你自己的模型接口（任何兼容 OpenAI 的都行，比如 DeepSeek 官方 key）。
 2. **MinerU Token**：PDF 转换要用。去 <https://mineru.net> 注册并申请免费 Token，然后在造书工作台里粘贴保存（转换 PDF 时如果没填，界面会提示）。
+   自己部署了 MinerU 的话，可以改用自建服务，不需要 Token（见下一节）。
+
+## 用自己部署的 MinerU 解析（可选）
+
+有 NVIDIA GPU（8GB 显存以上）的机器，可以自己跑 MinerU 4，不占官网额度、材料也不出你的网络：
+
+1. 在那台机器上装 MinerU 4 并启动 V1 服务：
+   ```
+   uv pip install "mineru[full]>=4.0,<5"
+   mineru-kit models download --tier standard
+   mineru-kit api-server --host 127.0.0.1 --port 18765 --tier standard
+   ```
+   服务默认只监听本机。要从别的电脑用，推荐 SSH 隧道：`ssh -N -L 18765:127.0.0.1:18765 <服务器>`；
+   直接对外开放（`--host 0.0.0.0`）时务必加 `--api-key <密钥>`。
+2. 造书工作台顶部「材料解析」选 **自建服务**，填地址（如 `http://127.0.0.1:18765`；开了 `--api-key` 就把密钥也填上），点「保存并测试连接」。
+3. 之后上传、转换照常。长书会按 100 页一段提交（界面显示「第几段」），解析完自动合并成一份正文；
+   中途网络断了几十秒也不要紧，任务在服务端继续跑，连上后接着等结果。
+
+**服务没开时自动拉起（可选）**：在 `~/.dsh/textbook/settings.json` 里加一项 `mineruServerStartCommand`，
+写一条能把服务启动起来的命令（例如 `ssh <服务器> /path/to/start-mineru.sh`）。转换前发现服务连不上，
+工作台会先执行它，再等服务就绪（最多 `mineruServerStartWaitSeconds` 秒，默认 600）。
+这一项**只能在文件里改**、界面上不提供——它是一条会在你电脑上执行的命令。
+解析档位默认 `standard`；只读文字层、更快的 `flash` 会把表格变成纯文本块，可在同一文件里用 `mineruTier` 改。
 
 ## 你的数据
 
@@ -197,7 +220,7 @@ npx dsh-craft-your-textbook --upgrade
 要搬的话，这两处**一起**复制走，缺一不可：
 
 - **书文件夹**——在工作区里，一本书一个文件夹
-- **`~/.dsh/textbook/` 整个目录**——里面是登记（`registry.json`）和 MinerU token（`settings.json`）
+- **`~/.dsh/textbook/` 整个目录**——里面是登记（`registry.json`）和 MinerU token、自建服务设置（`settings.json`）
 
 > `settings.json` 里的 token 是明文存的，备份时别放进公开的地方或随手发给别人。
 

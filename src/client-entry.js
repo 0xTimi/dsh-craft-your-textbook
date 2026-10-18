@@ -637,6 +637,15 @@ export function WorkbenchView(props) {
 	// 三件、对话台两件与两个 ref、根高度与外层布局、宿主状态。
 	const [mineruSet, setMineruSet] = useState(true);
 	const [mineruToken, setMineruToken] = useState("");
+	// 解析方式（官网 / 自建服务）与自建服务那几格。`mineruConfigured` 是「当前方式能不能开工」，
+	// 由服务端 `mineruSettingsView` 算好下发——缺省 true，与 `mineruSet` 同理：读到之前不亮红卡。
+	const [mineruMode, setMineruMode] = useState("cloud");
+	const [mineruConfigured, setMineruConfigured] = useState(true);
+	const [mineruServerUrl, setMineruServerUrl] = useState("");
+	const [mineruServerKeySet, setMineruServerKeySet] = useState(false);
+	const [mineruServerUrlDraft, setMineruServerUrlDraft] = useState("");
+	const [mineruServerKeyDraft, setMineruServerKeyDraft] = useState("");
+	const [mineruProbe, setMineruProbe] = useState(null);
 	// 票 10：本机**真探到**了自动切分能力（Python + PyMuPDF）吗？上传前那道预检要靠它决定
 	// 「PDF 超 200MB 时能不能说『会先切开』」。⚠️ 缺省 **false**：探不到就不许承诺——
 	// 写反了等于给每一台没装 PyMuPDF 的机器发一句没人验过的承诺（比说错更坏：它会让人不再拆）。
@@ -939,6 +948,7 @@ export function WorkbenchView(props) {
 			.then((settings) => {
 				if (alive) {
 					setMineruSet(settings.settings?.mineruTokenSet === true);
+					applyMineruSettings(settings.settings);
 					// 票 10：切分能力与 Token 同一次读取下发（同一台机器的事实，不另发一次请求）。
 					// 读不到 / 字段缺席一律落 `false`——「探不到」不是「有」。
 					setAutoSplit(settings.settings?.autoSplitAvailable === true);
@@ -1361,16 +1371,72 @@ export function WorkbenchView(props) {
 		void postAction({ action: "pause" });
 	};
 
+	// 服务端回来的设置快照（`mineruSettingsView` 那份）落到界面状态；字段缺席按老宿主口径（官网档）。
+	function applyMineruSettings(view) {
+		if (view === null || typeof view !== "object") return;
+		const mode = view.mineruMode === "self-hosted" ? "self-hosted" : "cloud";
+		setMineruMode(mode);
+		setMineruServerUrl(typeof view.mineruServerUrl === "string" ? view.mineruServerUrl : "");
+		setMineruServerKeySet(view.mineruServerKeySet === true);
+		setMineruConfigured(
+			typeof view.mineruConfigured === "boolean" ? view.mineruConfigured : view.mineruTokenSet === true,
+		);
+	}
+
+	// 切换解析方式。切到自建但还没存过地址时只在本地切过去（展开填地址的表单），
+	// 等「保存并测试连接」再一起落盘——服务端不收「自建但没地址」这种设置。
+	const changeMineruMode = (mode) => {
+		setMineruProbe(null);
+		if (mode === "self-hosted" && mineruServerUrl === "") {
+			setMineruMode("self-hosted");
+			setMineruConfigured(false);
+			return;
+		}
+		void postAction({ action: "settings", mineruMode: mode }).then((reply) => {
+			applyMineruSettings(reply?.settings);
+			if (reply?.probe) setMineruProbe(reply.probe);
+		});
+	};
+
+	const saveMineruServer = () => {
+		const url = mineruServerUrlDraft.trim();
+		if (url === "") return;
+		const payload = { action: "settings", mineruMode: "self-hosted", mineruServerUrl: url };
+		if (mineruServerKeyDraft.trim() !== "") payload.mineruServerKey = mineruServerKeyDraft.trim();
+		void postAction(payload).then((reply) => {
+			if (reply?.settings === undefined) return;
+			applyMineruSettings(reply.settings);
+			setMineruProbe(reply.probe ?? null);
+			setMineruResetOpen(false);
+			setMineruServerKeyDraft("");
+		});
+	};
+
 	const saveMineruToken = () => {
 		if (mineruToken.trim() === "") return;
 		void postAction({
 			action: "settings",
 			mineruToken: mineruToken.trim(),
-		}).then(() => {
+		}).then((reply) => {
 			setMineruSet(true);
+			if (reply?.settings !== undefined) applyMineruSettings(reply.settings);
 			setMineruResetOpen(false); // F20：保存成功后回到掩码态
 			setMineruToken("");
 		});
+	};
+
+	// 解析方式那几格（两处卡片共用一份，不各抄一遍）。
+	const mineruModeProps = {
+		mode: mineruMode,
+		onModeChange: changeMineruMode,
+		serverUrl: mineruServerUrl,
+		serverUrlDraft: mineruServerUrlDraft,
+		serverKeyDraft: mineruServerKeyDraft,
+		serverKeySet: mineruServerKeySet,
+		probe: mineruProbe,
+		onServerUrlChange: (e) => setMineruServerUrlDraft(e.target.value),
+		onServerKeyChange: (e) => setMineruServerKeyDraft(e.target.value),
+		onSaveServer: saveMineruServer,
 	};
 
 	// 成品预览（交付卡/终检认可卡）：整本走右栏，不再把全文灌进卡片 <pre>
@@ -1547,7 +1613,11 @@ export function WorkbenchView(props) {
 				onTokenChange: (e) => setMineruToken(e.target.value),
 				onSave: saveMineruToken,
 				resetOpen: mineruResetOpen,
-				onToggleReset: () => setMineruResetOpen((v) => !v),
+				onToggleReset: () => {
+					setMineruServerUrlDraft(mineruServerUrl);
+					setMineruResetOpen((v) => !v);
+				},
+				...mineruModeProps,
 			}),
 			visibleError(ui) !== null
 				? createElement("p", { style: S.error }, `⚠️ ${visibleError(ui)}`)
@@ -1986,7 +2056,7 @@ export function WorkbenchView(props) {
 						// 票 21 · P4：转换一落终态（`conversionSettled`）也让这张卡退场——转换成功本身
 						// 就是「服务端读得到 token」的证明（`resolveMineruToken` 那条路），而客户端那份
 						// 开机快照会话内从不刷新，再等它就是让一句**假警报**在屏上挂几十分钟。
-						mineruSet === false && !conversionSettled
+						mineruConfigured === false && !conversionSettled
 							? createElement(MineruTokenCard, {
 									mineruSet,
 									mineruToken,
@@ -1995,6 +2065,7 @@ export function WorkbenchView(props) {
 									onSave: saveMineruToken,
 									resetOpen: mineruResetOpen,
 									onToggleReset: () => setMineruResetOpen((v) => !v),
+									...mineruModeProps,
 								})
 							: null,
 						visibleError(ui) !== null

@@ -25,7 +25,9 @@ const execFileAsync = promisify(execFileCb)
 /**
  * ── 本文件对外的形状（票 `deep-module-scan/21`）──
  *
- * package 侧只 import **八个**符号：真正干活的那个 `convertPdfBatch`，加 `readSettings` /
+ * package 侧只 import **八个**符号（自建服务支持之后再加四个：`mineruModeOf`、`normalizeServerUrl`、
+ * `mineruSettingsView`、`probeMineruServer`——设置动作、设置快照与「测试连接」各有生产消费者）：
+ * 真正干活的那个 `convertPdfBatch`，加 `readSettings` /
  * `writeSettings`、`stripKnownExtension`、`autoSplitAvailable`、`humanizeMineruError`
  * （它**唯一**一个「测试 import、生产零消费者」却仍然导出的，理由在它自己的 JSDoc里），
  * 再加两份**原样再导出**的单一真相源（`MINERU_MAX_BYTES` / `MINERU_KNOWN_EXTENSIONS`
@@ -124,13 +126,25 @@ function countPdfPages(pdfPath) {
   } catch {
     return null
   }
-  const head = bytes.subarray(0, 4 * 1024 * 1024).toString('latin1')
-  const countMatch = /\/Count\s+(\d+)/.exec(head)
-  if (countMatch !== null) {
-    const n = Number(countMatch[1])
-    if (Number.isFinite(n) && n >= 1) return n
+  // ⚠️ 2026-10-18 修：原来取「前 4MB 里**第一个** `/Count`」——而 `/Count` 不只长在页树上，
+  // 书签树（`/Outlines`）与页树的**子节点**也有。实测 Lewis《Human Genetics》13 版（497 页）
+  // 第一个 `/Count` 是 18，于是 >200 页的书被当成 18 页、不拆段就整本提交（官网直接 -60006 拒收，
+  // 而人话还说「会先自动拆」）。现在只认**所在字典带 `/Type /Pages`** 的那些 `/Count`，取最大值：
+  // 页树根节点的计数就是全书页数，任何子树都不会比它大。
+  const text = bytes.toString('latin1')
+  let best = 0
+  for (const match of text.matchAll(/\/Count\s+(\d+)/g)) {
+    const open = text.lastIndexOf('<<', match.index)
+    const close = text.indexOf('>>', match.index)
+    if (open === -1 || close === -1) continue
+    const dict = text.slice(open, close)
+    if (!/\/Type\s*\/Pages\b/.test(dict)) continue
+    const n = Number(match[1])
+    if (Number.isFinite(n) && n > best) best = n
   }
-  const pageLeaves = (bytes.toString('latin1').match(/\/Type\s*\/Page[^s]/g) ?? []).length
+  if (best >= 1) return best
+  // 页树字典在压缩的对象流里时上面认不到：退回数页叶子（同样只在未压缩时有效，认不到就 null＝不拆）。
+  const pageLeaves = (text.match(/\/Type\s*\/Page[^s]/g) ?? []).length
   return pageLeaves >= 1 ? pageLeaves : null
 }
 
@@ -528,6 +542,48 @@ export function writeSettings(settings) {
   writeFileSync(join(dir, 'settings.json'), JSON.stringify(settings, null, 2) + '\n')
 }
 
+/**
+ * 解析方式（自建服务支持）：`'cloud'`＝MinerU 官网 v4 API（要 Token）；
+ * `'self-hosted'`＝自己部署的 MinerU 4 V1 服务（`mineru-kit api-server`，**不要官网 Token**）。
+ * 设置里没写或写了别的一律按 `'cloud'`——老用户的 settings.json 里没有这个键，行为一字不变。
+ */
+export function mineruModeOf(settings) {
+  return settings?.mineruMode === 'self-hosted' ? 'self-hosted' : 'cloud'
+}
+
+/**
+ * 自建服务地址归一：去空白、去末尾斜杠、去末尾 `/v1`（MinerU 文档口径：`api_url` 是 `/v1` 之前的根）。
+ * 只收 `http://` / `https://` 且带主机名的地址；其余返回 null（调用方据此拒收，不存一个用不了的地址）。
+ */
+export function normalizeServerUrl(raw) {
+  let text = String(raw ?? '').trim()
+  if (text === '') return null
+  text = text.replace(/\/+$/, '').replace(/\/v1$/i, '').replace(/\/+$/, '')
+  let url
+  try { url = new URL(text) } catch { return null }
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.hostname === '') return null
+  if (url.search !== '' || url.hash !== '') return null
+  return text
+}
+
+/**
+ * 设置快照里**给界面看**的那几格（`/textbook/settings` 与 `settings` 动作共用这一份，不各算各的）。
+ * ⚠️ 密钥与 Token 只报「设没设」，原文永不回传。
+ * `mineruConfigured` 是「当前解析方式能不能开工」：官网看 Token，自建看地址（密钥可选）。
+ */
+export function mineruSettingsView(settings) {
+  const mode = mineruModeOf(settings)
+  const tokenSet = typeof settings?.mineruToken === 'string' && settings.mineruToken !== ''
+  const serverUrl = normalizeServerUrl(settings?.mineruServerUrl) ?? ''
+  return {
+    mineruMode: mode,
+    mineruTokenSet: tokenSet,
+    mineruServerUrl: serverUrl,
+    mineruServerKeySet: typeof settings?.mineruServerKey === 'string' && settings.mineruServerKey !== '',
+    mineruConfigured: mode === 'cloud' ? tokenSet : serverUrl !== '',
+  }
+}
+
 function resolveHome() {
   const fromEnv = process.env.DSH_HOME
   if (fromEnv !== undefined && fromEnv.trim() !== '') return fromEnv
@@ -672,6 +728,370 @@ function describeMissingResult(name, backNames, namelessCount) {
     + '③ 这一条还在解析、轮询先结束了。请重跑一次转换；若一直这样，把它改名或单独试一次。'
 }
 
+// ── 自建服务（MinerU 4 V1 API，`mineru-kit api-server`）──────────────────────────────
+//
+// ⚠️ **它与官网 v4 不是同一套接口**，换 URL 用不了（2026-10-18 对 4.0.12 实测，OpenAPI 与真请求都核过）：
+//   - 没有 `/api/v4/file-urls/batch` 那套「申请签名地址 → PUT → 批量轮询」；
+//     这里是 `POST /v1/tasks`（multipart 直传，或 JSON 引用已上传的 `file_id`）→ `GET /v1/tasks/{id}`
+//     → `GET /v1/files/{zip 的 file_id}/content`；
+//   - 结果 zip 根目录的正文叫 **`markdown.md`**，不叫 `full.md`（图片同样在 `images/`）——
+//     本流程下游只认 `full.md`，所以落盘时改名；`model_output.json` 等中间件（单份可达数 MB）不落盘；
+//   - 进度只按**文件**计数（没有页级进度），所以长书**按页分段**提交，界面才看得到「第几段」；
+//     分段共用一次上传（第一段 multipart，之后用 `file_id` + `page_range`）；
+//   - 报错两种形态：HTTP 层 `{error:{type,code,message}}`（空文件 400、file_id 不存在 404），
+//     解析层 `status:'failed'` + `files[i].error`（如 `Unsupported file type: txt`）；
+//   - 单份上限 200MiB（`Content-Length` 上限 209715200），没有页数上限。
+// 不要官网 Token；服务开了 `--api-key` 时才带 `Authorization: Bearer`（只发给同源地址）。
+
+/** 自建服务可选的解析档位（`GET /v1/tiers` 实测四档）。默认 standard：flash 只读文字层，表格会退化成等宽文本块。 */
+const SELF_HOSTED_TIERS = ['flash', 'basic', 'standard', 'advanced']
+/** 自建服务单份上限（OpenAPI：`Content-Length` maximum 209715200）。 */
+const SELF_HOSTED_MAX_BYTES = 200 * 1024 * 1024
+/** 长书分段的每段页数：只为看得见进度、失败可只重跑一段（服务端本身没有页数上限）。 */
+const SELF_HOSTED_CHUNK_PAGES = 100
+
+/** 连不上自建服务时的人话（**不含「Token」二字**：界面见到它会把人引去重设官网 Token）。 */
+function serverDownText(baseUrl, extra = '') {
+  return `连不上自建 MinerU 服务（${baseUrl}）${extra}。请确认：① 解析服务器上的服务开着；② 本机到服务器的端口映射（SSH 隧道）开着；`
+    + '③ 工作台「材料解析」里填的地址没写错。也可以先切回「MinerU 官网」解析。'
+}
+
+/** 自建服务的错误体 → 人话。认不出的原样透出（不替上游编原因）。 */
+function humanizeSelfHostedError(error, fileName = '') {
+  const code = String(error?.code ?? '')
+  const message = String(error?.message ?? '')
+  const who = fileName === '' ? '这份文件' : `《${fileName}》`
+  if (/unsupported file type/i.test(message)) {
+    return `自建 MinerU 服务认不出${who}的格式（${message}）。请确认后缀与文件真实内容一致，或先另存为 PDF 再上传。`
+  }
+  if (/empty file/i.test(message)) return `${who}是空的（0 字节，没有内容），换一份有内容的文件再上传。`
+  if (code === 'file_too_large' || /too large|exceeds/i.test(message)) {
+    return `${who}超过自建服务单份 200MB 的上限。请把它拆成几份后分别上传，或压缩后再试。`
+  }
+  if (code === 'model_preload_failed' || error?.type === 'engine_error' && /initializ/i.test(message)) {
+    return `自建 MinerU 服务的模型没加载起来（${message}）。请到解析服务器上看服务日志，修好后重试。`
+  }
+  return message === '' ? `自建 MinerU 服务返回了错误（${code || '未知'}）` : `自建 MinerU 服务：${message}`
+}
+
+/** 读自建服务的连接参数（地址、可选密钥、档位）。地址非法就抛人话。 */
+function selfHostedConfig(settings) {
+  const baseUrl = normalizeServerUrl(settings.mineruServerUrl)
+  if (baseUrl === null) throw new Error('选了自建 MinerU 服务，但还没填服务地址：请在工作台「材料解析」里填写')
+  const fromEnv = process.env.MINERU_API_KEY
+  const apiKey = typeof settings.mineruServerKey === 'string' && settings.mineruServerKey !== ''
+    ? settings.mineruServerKey
+    : (fromEnv !== undefined && fromEnv.trim() !== '' ? fromEnv.trim() : '')
+  const tier = SELF_HOSTED_TIERS.includes(settings.mineruTier) ? settings.mineruTier : 'standard'
+  return { baseUrl, apiKey, tier }
+}
+
+function selfHostedHeaders(cfg, extra = {}) {
+  return cfg.apiKey === '' ? { ...extra } : { ...extra, Authorization: `Bearer ${cfg.apiKey}` }
+}
+
+/** 调自建服务的一个 V1 路由；HTTP 非 2xx 抛人话（带上游 `error.code`），连不上抛「连不上」那句。 */
+async function selfHostedJson(cfg, path, options = {}) {
+  let res
+  try {
+    res = await fetch(`${cfg.baseUrl}${path}`, { ...options, headers: selfHostedHeaders(cfg, options.headers) })
+  } catch (error) {
+    const cause = error?.cause?.code ?? error?.name ?? ''
+    throw new Error(serverDownText(cfg.baseUrl, cause === '' ? '' : `（${cause}）`))
+  }
+  let json = null
+  try { json = await res.json() } catch { json = null }
+  if (!res.ok) {
+    if (AUTH_HTTP_STATUS.has(res.status)) {
+      throw new Error(`自建 MinerU 服务拒绝访问（HTTP ${res.status}）：访问密钥没填或不对，请在工作台「材料解析」里检查。`)
+    }
+    throw new Error(`${humanizeSelfHostedError(json?.error)}（HTTP ${res.status}）`)
+  }
+  return json
+}
+
+/**
+ * 探一次 `/v1/health`：`{ ok, detail }`。连不上、503（模型没加载起来）都如实说，不抛。
+ * 超时给 20 秒：经 SSH 隧道时，隧道正被大文件（上传原件／下载结果包）占着，几秒内回不来是常态
+ * （2026-10-18 实测：下载整本书结果包期间 5 秒超时，误判成「服务没开」）。
+ */
+async function healthOf(cfg) {
+  try {
+    const health = await selfHostedJson(cfg, '/v1/health', { signal: AbortSignal.timeout(20_000) })
+    if (health?.status !== 'ok') return { ok: false, detail: `服务在，但状态是 ${String(health?.status)}` }
+    return { ok: true, detail: `MinerU ${health.version ?? '?'}，解析档位 ${cfg.tier}` }
+  } catch (error) {
+    return { ok: false, detail: String(error instanceof Error ? error.message : error) }
+  }
+}
+
+/**
+ * 设置页「保存并测试连接」用：探一次健康状态（不启动服务，只看）。
+ * @returns {Promise<{ok: boolean, detail: string}>}
+ */
+export async function probeMineruServer(settings) {
+  let cfg
+  try { cfg = selfHostedConfig(settings) } catch (error) { return { ok: false, detail: error.message } }
+  return healthOf(cfg)
+}
+
+/**
+ * 开工前确认服务在线；不在线且配了**启动命令**就执行它，再等服务就绪。
+ *
+ * 启动命令（`mineruServerStartCommand`）**只能写在本机 settings.json 里**，工作台的 settings 动作
+ * 不收这一格：它是一条在本机执行的 shell 命令，能从网页上改就等于谁能打开工作台谁就能在本机跑命令。
+ * 典型写法：`ssh 解析服务器 /path/to/mineru-ctl.sh start`（命令自己负责「已经在跑就什么都不做」）。
+ * 等待上限 `mineruServerStartWaitSeconds`（默认 600 秒：首次加载模型要几分钟）。
+ */
+async function ensureSelfHostedUp(cfg, settings, onStage, pollIntervalMs) {
+  let first = await healthOf(cfg)
+  if (!first.ok) first = await healthOf(cfg) // 再问一次：一次超时多半是链路忙，不是服务没开
+  if (first.ok) return
+  const command = typeof settings.mineruServerStartCommand === 'string' ? settings.mineruServerStartCommand.trim() : ''
+  if (command === '') throw new Error(first.detail)
+  onStage('自建 MinerU 服务没响应，正在按设置里的启动命令把它启动起来…')
+  try {
+    await execFileAsync('/bin/sh', ['-c', command], { timeout: 180_000 })
+  } catch (error) {
+    // 不回显整条命令（那是本机配置，不是用户要看的）；给退出码与输出的最后两行。
+    const output = `${String(error?.stdout ?? '')}\n${String(error?.stderr ?? '')}`.trim().split('\n').filter(Boolean).slice(-2).join(' ／ ')
+    const code = error?.killed === true ? '超时被终止' : `退出码 ${String(error?.code ?? '?')}`
+    throw new Error(`自建 MinerU 服务连不上，按设置里的启动命令去启动也失败了（${code}${output === '' ? '' : `：${output}`}）。${serverDownText(cfg.baseUrl)}`)
+  }
+  const waitSeconds = Number.isFinite(settings.mineruServerStartWaitSeconds) ? settings.mineruServerStartWaitSeconds : 600
+  const deadline = Date.now() + waitSeconds * 1000
+  let last = first
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, Math.max(pollIntervalMs, 1000)))
+    last = await healthOf(cfg)
+    if (last.ok) { onStage('自建 MinerU 服务已就绪'); return }
+    onStage('自建 MinerU 服务启动中（首次加载模型要几分钟）…')
+  }
+  throw new Error(`自建 MinerU 服务启动后 ${waitSeconds} 秒仍没就绪：${last.detail}`)
+}
+
+/** 提交一段解析任务：第一段 multipart 直传（拿到 `file_id`），之后的段用 JSON 引用同一份文件。 */
+async function submitSelfHostedTask(cfg, chunk, fileId) {
+  if (fileId !== null) {
+    return selfHostedJson(cfg, '/v1/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        files: [{ source: { type: 'file_id', file_id: fileId }, page_range: chunk.pageRange ?? null }],
+        tier: cfg.tier,
+        output_formats: ['zip'],
+      }),
+      signal: AbortSignal.timeout(60_000),
+    })
+  }
+  const form = new FormData()
+  form.append('files', new Blob([readFileSync(chunk.file)]), chunk.uploadName)
+  const query = new URLSearchParams({ tier: cfg.tier, output_formats: 'zip' })
+  if (typeof chunk.pageRange === 'string') query.set('page_range', chunk.pageRange)
+  return selfHostedJson(cfg, `/v1/tasks?${query}`, { method: 'POST', body: form, signal: AbortSignal.timeout(600_000) })
+}
+
+/** 轮询时允许的最长连续断线（毫秒）：超过才判失败。 */
+const POLL_OUTAGE_MS = 180_000
+
+/**
+ * 下载一个结果文件。结果在服务端保留（默认 24 小时），断线就重下：最多 3 次，间隔 10/20 秒。
+ * 一份整本书的结果包可达 100MB+，经 SSH 隧道要几分钟，所以单次超时给 15 分钟。
+ */
+async function downloadSelfHostedFile(cfg, fileId, fileName) {
+  let lastError = null
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const res = await fetch(`${cfg.baseUrl}/v1/files/${encodeURIComponent(fileId)}/content`, {
+        headers: selfHostedHeaders(cfg),
+        redirect: 'manual', // 302 去别的源时不跟（密钥不送给别的源）；自建服务实测直接 200
+        signal: AbortSignal.timeout(900_000),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      return Buffer.from(await res.arrayBuffer())
+    } catch (error) {
+      lastError = error
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 10_000))
+    }
+  }
+  throw new Error(`下载《${fileName}》的解析结果失败（重试 3 次）：${String(lastError?.cause?.code ?? lastError?.message ?? lastError)}`)
+}
+
+/**
+ * 提交一段；遇到「连不上」（隧道断线重连中）就隔 10 秒再提交，连续断线超过 {@link POLL_OUTAGE_MS} 才放弃。
+ * 请求其实到了服务端、只是回包丢了时，最坏是服务端多一个重复任务（多耗一点算力），结果只用新拿到的那个 id。
+ */
+async function submitWithRetry(cfg, chunk, fileId, onStage) {
+  const since = Date.now()
+  for (;;) {
+    try {
+      return await submitSelfHostedTask(cfg, chunk, fileId)
+    } catch (error) {
+      if (!String(error?.message ?? '').startsWith('连不上自建 MinerU 服务')) throw error
+      if (Date.now() - since > POLL_OUTAGE_MS) throw error
+      onStage(`与自建服务的连接中断，等 10 秒重新提交（已断 ${Math.round((Date.now() - since) / 1000)} 秒）`)
+      await new Promise((resolve) => setTimeout(resolve, 10_000))
+    }
+  }
+}
+
+/**
+ * 把一份自建服务结果 zip 落到 outDir：`markdown.md` → `full.md`，`images/` 原样（路径守卫照旧）。
+ * 判据与官网那条同源：根目录没有正文 ⇒ 失败；正文去空白为零 ⇒ 失败（票 04，只问有没有，不问多少）。
+ */
+function writeSelfHostedZip(zipBytes, outDir, fileName) {
+  const zip = new AdmZip(zipBytes)
+  let markdown = null
+  mkdirSync(outDir, { recursive: true })
+  for (const entry of zip.getEntries()) {
+    if (entry.isDirectory) continue
+    if (entry.entryName === 'markdown.md') { markdown = entry.getData(); continue }
+    if (!entry.entryName.startsWith('images/')) continue
+    const target = join(outDir, entry.entryName)
+    if (!isWithin(outDir, target)) continue
+    mkdirSync(join(target, '..'), { recursive: true })
+    writeFileSync(target, entry.getData())
+  }
+  if (markdown === null) {
+    const top = zip.getEntries().filter((e) => !e.entryName.includes('/')).map((e) => e.entryName)
+    throw new Error(`《${fileName}》的自建服务结果里没有正文（markdown.md），只有 ${top.slice(0, 4).join('、') || '空包'}。请重跑一次转换。`)
+  }
+  if (isEmptyConvertedMd(markdown)) {
+    throw new Error(`《${fileName}》解析出来一个字都没有（扫描件识别不出字、纯图片无字、文件损坏都可能）。请换一份材料或重跑一次转换。`)
+  }
+  writeFileSync(join(outDir, 'full.md'), markdown)
+  return join(outDir, 'full.md')
+}
+
+/**
+ * 自建服务版的批量转换：入参、回调、返回形状与 {@link convertPdfBatch} 官网那条**逐项相同**
+ * （`[{ name, ok, mdPath?, error?, splitParts? }]`，单本失败不抛），下游一行不用改。
+ * 分段书的落盘布局也与官网那条一致（各段在 `_cN/`，合并后父目录 `full.md`，图片引用改写到段子目录）。
+ */
+async function convertPdfBatchSelfHosted(items, opts, onStage) {
+  const settings = readSettings()
+  const cfg = selfHostedConfig(settings)
+  const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) ? opts.pollIntervalMs : 3000
+  const maxBytes = Number.isFinite(opts.maxBytes) ? opts.maxBytes : SELF_HOSTED_MAX_BYTES
+  const chunkPages = Number.isFinite(opts.chunkPages) ? opts.chunkPages : SELF_HOSTED_CHUNK_PAGES
+  await ensureSelfHostedUp(cfg, settings, onStage, pollIntervalMs)
+  const results = []
+  const sizeTmpDirs = []
+  try {
+    for (const item of items) {
+      try {
+        // 「物理文件」：通常就是原件；>200MB 的 PDF 先在本地切开（与官网那条同一个切法）。
+        const isPdf = isPdfPath(item.file)
+        const pageCount = isPdf ? countPdfPages(item.file) : null
+        const sizeSplit = isPdf ? await splitPdfBySize(item.file, pageCount, maxBytes) : null
+        if (sizeSplit !== null) sizeTmpDirs.push(sizeSplit.tmpDir)
+        const physical = sizeSplit === null
+          ? [{ file: item.file, pages: pageCount }]
+          : sizeSplit.parts.map((file, i) => ({ file, pages: sizeSplit.ranges[i].to - sizeSplit.ranges[i].from + 1 }))
+        if (sizeSplit === null && isPdf && statSync(item.file).size > maxBytes) {
+          throw new Error(humanizeSelfHostedError({ code: 'file_too_large' }, item.name))
+        }
+        // 段：每个物理文件按 chunkPages 页一段（短书/非 PDF 就一段、不带 page_range）。
+        const chunks = []
+        physical.forEach((part, partIdx) => {
+          const ranges = isPdf && part.pages !== null && part.pages > chunkPages ? planPageChunks(part.pages, chunkPages) : [null]
+          for (const range of ranges) {
+            chunks.push({
+              file: part.file,
+              partIdx,
+              uploadName: physical.length === 1 ? item.name : splitPartName(item.name, partIdx),
+              pageRange: range === null ? undefined : `${range.from}-${range.to}`,
+            })
+          }
+        })
+        const total = chunks.length
+        if (total > 1) onStage(`《${item.name}》${pageCount ?? '?'} 页：分成 ${total} 段交给自建服务解析（完成后自动合并）`)
+
+        // 逐段提交（同一物理文件只上传一次）；服务端按 --concurrency 排队并行。
+        const fileIds = new Map()
+        const tasks = []
+        for (let i = 0; i < chunks.length; i += 1) {
+          const chunk = chunks[i]
+          onStage(total > 1 ? `上传并提交《${item.name}》第 ${i + 1}/${total} 段` : `上传《${item.name}》到自建服务`)
+          const submitted = await submitWithRetry(cfg, chunk, fileIds.get(chunk.partIdx) ?? null, onStage)
+          const fileId = submitted?.files?.[0]?.file_id
+          if (typeof submitted?.task_id !== 'string' || typeof fileId !== 'string') {
+            throw new Error(`自建 MinerU 服务的回包不完整（缺 task_id/file_id）：${JSON.stringify(submitted).slice(0, 200)}`)
+          }
+          fileIds.set(chunk.partIdx, fileId)
+          tasks.push({ ...chunk, idx: i + 1, taskId: submitted.task_id, done: null })
+        }
+
+        // 轮询到每一段都落定。任务状态：queued / running / completed / partial / failed / canceled。
+        const startedAt = Date.now()
+        let lastStage = ''
+        let failingSince = null
+        const deadline = startedAt + Math.max(30, 6 * total) * 60_000 // 每段最多约 6 分钟的预算，至少 30 分钟
+        while (tasks.some((t) => t.done === null)) {
+          if (Date.now() > deadline) throw new Error(`《${item.name}》自建服务解析超时（${Math.round((Date.now() - startedAt) / 60_000)} 分钟仍没解析完）`)
+          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+          // 任务在服务端照跑（断开 HTTP 不取消任务），所以轮询遇到网络错误**不放弃**：
+          // 连续失败 3 分钟以内只当「连接中断、重试中」（隧道断线自动重连要十几秒）。
+          try {
+            for (const task of tasks.filter((t) => t.done === null)) {
+              const status = await selfHostedJson(cfg, `/v1/tasks/${encodeURIComponent(task.taskId)}`, { signal: AbortSignal.timeout(30_000) })
+              if (['completed', 'partial', 'failed', 'canceled'].includes(status?.status)) task.done = status
+            }
+            failingSince = null
+          } catch (error) {
+            if (!String(error?.message ?? '').startsWith('连不上自建 MinerU 服务')) throw error
+            failingSince ??= Date.now()
+            if (Date.now() - failingSince > POLL_OUTAGE_MS) throw error
+            const stage = '与自建服务的连接中断，重试中（任务在服务端继续跑，连上后接着等结果）'
+            if (stage !== lastStage) { onStage(stage); lastStage = stage }
+            continue
+          }
+          const finished = tasks.filter((t) => t.done !== null).length
+          const minutes = Math.round((Date.now() - startedAt) / 60_000)
+          const stage = total > 1
+            ? `自建服务解析中：《${item.name}》${finished}/${total} 段完成（已用 ${minutes} 分钟）`
+            : `自建服务解析中：《${item.name}》（已用 ${minutes} 分钟）`
+          // 每一句进度都会落进书的账本（timeline）：只在话变了时才报，不然 3 秒一条、十几分钟几百行一样的。
+          if (stage !== lastStage) { onStage(stage); lastStage = stage }
+        }
+
+        // 下载落盘；任何一段失败，这本书判失败（不拿半本书往下走）。
+        const parts = []
+        for (const task of tasks) {
+          const file = task.done.files?.[0]
+          if (task.done.status !== 'completed' || file?.status !== 'completed') {
+            throw new Error(humanizeSelfHostedError(file?.error ?? { message: `任务状态 ${task.done.status}` }, item.name)
+              + (total > 1 ? `（第 ${task.idx}/${total} 段${task.pageRange ? `，第 ${task.pageRange} 页` : ''}）` : ''))
+          }
+          const zipId = file.output_files?.zip?.file_id
+          if (typeof zipId !== 'string') throw new Error(`《${item.name}》解析完成但没有结果包`)
+          onStage(total > 1 ? `下载结果（《${item.name}》第 ${task.idx}/${total} 段）` : `下载结果（${item.name}）`)
+          const zipBytes = await downloadSelfHostedFile(cfg, zipId, item.name)
+          const outDir = total > 1 ? join(item.outDir, `_c${task.idx}`) : item.outDir
+          const mdPath = writeSelfHostedZip(zipBytes, outDir, item.name)
+          parts.push({ idx: task.idx, mdPath, outDir })
+        }
+        if (total === 1) {
+          results.push({ name: item.name, ok: true, mdPath: parts[0].mdPath })
+          continue
+        }
+        const mdPath = join(item.outDir, 'full.md')
+        writeFileSync(mdPath, `<!-- 本书较大，已自动拆成 ${total} 段解析后合并 -->\n\n${mergeSplitParts(parts)}\n`)
+        results.push({ name: item.name, ok: true, mdPath, splitParts: total })
+      } catch (error) {
+        const message = String(error instanceof Error ? error.message : error)
+        // 连不上服务是整批的事：后面的材料也一样连不上，整批抛（调用方给一条错误，而不是 N 条一样的）。
+        if (message.startsWith('连不上自建 MinerU 服务')) throw error
+        results.push({ name: item.name, ok: false, error: message })
+      }
+    }
+    onStage('完成')
+    return results
+  } finally {
+    for (const d of sizeTmpDirs) cleanupTmpDir(d)
+  }
+}
+
 /**
  * 批量转换多份 PDF（MinerU v4 批量接口）。
  * 一次申请全部上传链接 → 逐个 PUT → 批量轮询（响应带 file_name，可一一对应）
@@ -703,6 +1123,8 @@ function describeMissingResult(name, backNames, namelessCount) {
  *   机器永不按字数/篇幅判成败——两处不许合并成一条阈值判据。
  */
 export async function convertPdfBatch(items, opts = {}, onStage = () => {}) {
+  // 解析方式分流：自建服务走 V1 API（不要 Token）；没选或选了官网，下面这条原路一字不变。
+  if (mineruModeOf(readSettings()) === 'self-hosted') return convertPdfBatchSelfHosted(items, opts, onStage)
   const token = resolveMineruToken()
   const formula = opts.formula === true
   const table = opts.table !== false

@@ -2224,12 +2224,17 @@ export function GatePanel(props) {
 	);
 }
 
-// ── MinerU Token 常驻入口（F20）─────────────────────────────────────────────
-// 未设置（mineruSet=false）：原「还差一步」输入卡，现状不变；
-// 已设置：常驻显示掩码（••••）+「重新设置」入口，点开（resetOpen）才展开输入框；
-// 保存走父级 onSave（既有 settings 动作，后端支持覆盖），保存成功后父级关回掩码态。
+// ── MinerU 解析方式 ＋ Token 常驻入口（F20）────────────────────────────────────
+// 解析方式两档：官网（要 Token）／自建服务（填地址，不要 Token）。顶上一行切换（选中的实心、另一个描边——
+// 不用 `bigBtn(false)`：那是红底，看着像报错），下面按档显示：
+//   官网档：与原来逐字一致——未设置（mineruSet=false）是「还差一步」输入卡；
+//          已设置常驻掩码（••••）+「重新设置」，点开（resetOpen）才展开输入框；
+//   自建档：未填地址是「还差一步」输入卡（地址 + 可选密钥）；已填常驻地址 +「修改」+ 最近一次连接测试结果。
+// 保存都走父级回调（既有 settings 动作），保存成功后父级关回常驻态。
+// ⚠️ 自建档的文案**不出现「Token」这个词**：`isTokenIssueOf` 认的就是它，出现了会把用户引去重设官网 Token。
 export function MineruTokenCard(props) {
 	const {
+		mode = "cloud",
 		mineruSet,
 		mineruToken,
 		busy,
@@ -2237,11 +2242,107 @@ export function MineruTokenCard(props) {
 		onSave,
 		resetOpen,
 		onToggleReset,
+		onModeChange,
+		serverUrl = "",
+		serverUrlDraft = "",
+		serverKeyDraft = "",
+		serverKeySet = false,
+		probe = null,
+		onServerUrlChange,
+		onServerKeyChange,
+		onSaveServer,
 	} = props;
+	const modeSwitch =
+		typeof onModeChange === "function"
+			? createElement(
+					"div",
+					{ style: { display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap", marginBottom: "6px" } },
+					createElement("span", { style: { fontSize: "13px" } }, "材料解析："),
+					createElement(
+						"button",
+						{ style: mode === "cloud" ? S.bigBtn(true) : S.ghostBtn(false), disabled: busy, onClick: () => onModeChange("cloud") },
+						"MinerU 官网",
+					),
+					createElement(
+						"button",
+						{ style: mode === "self-hosted" ? S.bigBtn(true) : S.ghostBtn(false), disabled: busy, onClick: () => onModeChange("self-hosted") },
+						"自建服务",
+					),
+				)
+			: null;
+	if (mode === "self-hosted") {
+		const serverForm = (title) =>
+			createElement(
+				"div",
+				{ style: { marginTop: "6px" } },
+				createElement("p", { style: { margin: "4px 0" } }, title),
+				createElement("input", {
+					style: S.input,
+					placeholder: "服务地址，例如 http://127.0.0.1:18765",
+					value: serverUrlDraft,
+					onChange: onServerUrlChange,
+				}),
+				createElement("input", {
+					style: S.input,
+					type: "password",
+					placeholder: serverKeySet ? "访问密钥（已设置；留空则不改）" : "访问密钥（服务没设密钥就留空）",
+					value: serverKeyDraft,
+					onChange: onServerKeyChange,
+				}),
+				createElement(
+					"button",
+					{ style: S.bigBtn(true), onClick: onSaveServer, disabled: busy || serverUrlDraft.trim() === "" },
+					"保存并测试连接",
+				),
+			);
+		const probeLine =
+			probe === null
+				? null
+				: createElement(
+						"p",
+						{
+							style: {
+								margin: "4px 0",
+								color: probe.ok
+									? "var(--dsw-alias-state-success-primary)"
+									: "var(--dsw-alias-state-error-primary)",
+							},
+						},
+						probe.ok ? `连接正常：${probe.detail}` : `连不上：${probe.detail}`,
+					);
+		if (serverUrl === "") {
+			return createElement(
+				"div",
+				{ style: { ...S.card, borderColor: "var(--dsw-alias-state-error-primary)" } },
+				modeSwitch,
+				createElement(
+					"strong",
+					{ style: { color: "var(--dsw-alias-state-error-primary)" } },
+					"🔌 还差一步：自建 MinerU 服务地址",
+				),
+				serverForm("材料会上传到你自己部署的 MinerU（4.x，mineru-kit api-server）解析，不用官网额度。填服务地址即可："),
+				probeLine,
+			);
+		}
+		return createElement(
+			"div",
+			{ style: { ...S.card, borderColor: "var(--dsw-alias-state-success-primary)" } },
+			modeSwitch,
+			createElement(
+				"div",
+				{ style: { display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" } },
+				createElement("strong", {}, `✅ 自建 MinerU 服务：${serverUrl}${serverKeySet ? "（带密钥）" : ""}`),
+				createElement("button", { style: S.smallLink, onClick: onToggleReset }, "修改"),
+			),
+			probeLine,
+			resetOpen ? serverForm("改成新的地址（密钥留空则不改）：") : null,
+		);
+	}
 	if (mineruSet === false) {
 		return createElement(
 			"div",
 			{ style: { ...S.card, borderColor: "var(--dsw-alias-state-error-primary)" } },
+			modeSwitch,
 			createElement(
 				"strong",
 				{ style: { color: "var(--dsw-alias-state-error-primary)" } },
@@ -2268,6 +2369,7 @@ export function MineruTokenCard(props) {
 	return createElement(
 		"div",
 		{ style: { ...S.card, borderColor: "var(--dsw-alias-state-success-primary)" } },
+		modeSwitch,
 		createElement(
 			"div",
 			{

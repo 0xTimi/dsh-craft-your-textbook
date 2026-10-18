@@ -38,7 +38,7 @@ import {
 import { familyOf, reject, accept } from '../action-runner.js'
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync } from 'node:fs'
 import { join, basename } from 'node:path'
-import { readSettings, writeSettings } from '../../mineru-lib.js'
+import { readSettings, writeSettings, mineruModeOf, mineruSettingsView, normalizeServerUrl, probeMineruServer } from '../../mineru-lib.js'
 import { generateContent } from '../../content-lib.js'
 import { countHanzi, chapterName } from '../../domain-rules.js'
 
@@ -167,8 +167,9 @@ export const actPatternsOps = familyOf('patterns-ops', async ({ ctx: ctx, action
       return accept({ patterns: list })
     }
     case 'settings': {
-      // 设置：MinerU Token 等
-      const { mineruToken } = body
+      // 设置：MinerU Token、解析方式（官网 / 自建服务）与自建服务地址、密钥。
+      // 每一格都是「请求体里带了才改」：只发 Token 的老客户端不会碰到解析方式那几格。
+      const { mineruToken, mineruMode, mineruServerUrl, mineruServerKey } = body
       const settings = readSettings()
       if (typeof mineruToken === 'string') {
         const trimmed = mineruToken.trim()
@@ -178,8 +179,36 @@ export const actPatternsOps = familyOf('patterns-ops', async ({ ctx: ctx, action
         }
         settings.mineruToken = trimmed
       }
+      if (mineruMode !== undefined) {
+        if (mineruMode !== 'cloud' && mineruMode !== 'self-hosted') {
+          return reject(400, `解析方式只能是 cloud（MinerU 官网）或 self-hosted（自建服务），收到 ${JSON.stringify(mineruMode)}`)
+        }
+        settings.mineruMode = mineruMode
+      }
+      if (typeof mineruServerUrl === 'string') {
+        const normalized = normalizeServerUrl(mineruServerUrl)
+        if (normalized === null) {
+          return reject(400, '自建服务地址要写成 http://主机:端口 的样子（例如 http://127.0.0.1:18000），不带路径和参数')
+        }
+        settings.mineruServerUrl = normalized
+      }
+      // 密钥可选（服务没开 --api-key 就不用填）；显式发 null 是「清掉」，空串同理——
+      // 与 Token 那格不同：Token 空了官网就不能用，密钥空了正是「匿名访问」这一档的合法值。
+      if (mineruServerKey === null || typeof mineruServerKey === 'string') {
+        const trimmed = typeof mineruServerKey === 'string' ? mineruServerKey.trim() : ''
+        if (trimmed === '') delete settings.mineruServerKey
+        else settings.mineruServerKey = trimmed
+      }
+      if (mineruModeOf(settings) === 'self-hosted' && normalizeServerUrl(settings.mineruServerUrl) === null) {
+        return reject(400, '选了自建服务，但还没填服务地址')
+      }
       writeSettings(settings)
-      return accept({ settings: { mineruTokenSet: typeof settings.mineruToken === 'string' && settings.mineruToken !== '' } })
+      // 自建服务：顺手探一次 /v1/health，把「连得上吗、支持哪些档位」如实回给界面。
+      // 探不通**不拦保存**（隧道可能还没开），只是如实说。
+      const probe = mineruModeOf(settings) === 'self-hosted' && body.probe !== false
+        ? await probeMineruServer(settings)
+        : null
+      return accept({ settings: mineruSettingsView(settings), probe })
     }
     case 'demo-run': {
       // ── 阶段一（材料准备）在演示书里**为什么不真做**（票 `demo-flow-fidelity` 的 01 Q4，

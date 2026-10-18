@@ -61,7 +61,7 @@ import { bookShapeReport, refreshArtifactRegistry } from './workflow/book-shape.
 import { readFileSync, readdirSync, writeFileSync, existsSync, statSync, mkdirSync, renameSync, rmSync, realpathSync } from 'node:fs'
 import { join, resolve, basename } from 'node:path'
 import { isWithin } from './path-guard.js'
-import { readSettings, autoSplitAvailable } from './mineru-lib.js'
+import { readSettings, autoSplitAvailable, mineruSettingsView } from './mineru-lib.js'
 import { MAX_UPLOAD_BYTES, uploadTooLargeMessage, productOpenMode, artifactKind, SEGMENT_PHASE, countHanzi, contextOccupancyPercent, convertedState, ROLES, guessRoleFromName, isAcceptedMaterialFormat, unsupportedMaterialFormatMessage, chapterRel, chapterName } from './domain-rules.js'
 
 
@@ -1041,7 +1041,7 @@ async function handleSettings(_req, res) {
     sendJson(res, 200, {
       ok: true,
       settings: {
-        mineruTokenSet: typeof settings.mineruToken === 'string' && settings.mineruToken !== '',
+        ...mineruSettingsView(settings),
         autoSplitAvailable: await autoSplitAvailable(),
       },
     })
